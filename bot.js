@@ -1,4 +1,4 @@
-Ota tästä koodista mallia pliis käytä tän koodin logiikoita const {
+const {
   Client,
   GatewayIntentBits,
   ActionRowBuilder,
