@@ -1,585 +1,369 @@
-const { 
-    Client, 
-    GatewayIntentBits, 
-    ActionRowBuilder, 
-    ButtonBuilder, 
-    ButtonStyle, 
-    Events, 
-    SlashCommandBuilder, 
-    ModalBuilder, 
-    TextInputBuilder, 
-    TextInputStyle, 
-    StringSelectMenuBuilder, 
-    EmbedBuilder, 
-    ActivityType, 
-    Partials,
-    Collection
+const {
+  Client,
+  GatewayIntentBits,
+  ActionRowBuilder,
+  ButtonBuilder,
+  ButtonStyle,
+  Events,
+  SlashCommandBuilder,
+  ModalBuilder,
+  TextInputBuilder,
+  TextInputStyle,
+  StringSelectMenuBuilder
 } = require("discord.js");
+
 const bedrock = require("bedrock-protocol");
 const { Authflow, Titles } = require("prismarine-auth");
 const fs = require("fs");
 const path = require("path");
-const crypto = require("crypto");
-const os = require("os");
 
-const APEX_IDENTIFIERS = {
-    KERNEL_NAMESPACE: "SENTINEL_APEX_KERNEL",
-    VERSION_MAJOR: 6,
-    VERSION_MINOR: 0,
-    VERSION_PATCH: 1,
-    BUILD_HASH: "0x88AF22C9",
-    RUNTIME_ENVIRONMENT: "PRODUCTION",
-    SECURITY_LEVEL: "ENTERPRISE_GRADE"
-};
-
-const APEX_SYSTEM_CONSTANTS = {
-    DISCORD_GUILD_IDENTITY: "1462335230345089254",
-    DISCORD_ADMINISTRATOR_IDENTITY: "1144987924123881564",
-    CHANNEL_DIAGNOSTICS_IDENTITY: "1464615030111731753",
-    CHANNEL_OVERLORD_IDENTITY: "1464615993320935447",
-    HANDSHAKE_TIMEOUT_MILLISECONDS: 90000,
-    RECONNECTION_COOLDOWN_MILLISECONDS: 45000,
-    DASHBOARD_REFRESH_INTERVAL_MILLISECONDS: 60000,
-    AUTO_BOOTSTRAP_DELAY_MILLISECONDS: 6000,
-    AFK_SIMULATION_INTERVAL_MILLISECONDS: 50000,
-    MAXIMUM_SESSIONS_PER_INSTANCE: 512,
-    DEFAULT_BEDROCK_NETWORK_PORT: 19132,
-    STORAGE_ENCODING_FORMAT: "utf8"
-};
-
-const APEX_STATUS_CODES = {
-    IDLE: "IDLE",
-    INITIALIZING: "INITIALIZING",
-    AUTHENTICATING: "AUTHENTICATING",
-    NEGOTIATING: "NEGOTIATING",
-    ESTABLISHED: "ESTABLISHED",
-    FAILED: "FAILED",
-    TERMINATED: "TERMINATED",
-    RECOVERING: "RECOVERING"
-};
-
-const APEX_PROTOCOL_VERSIONS = {
-    V1_20_0: "1.20.0",
-    V1_20_10: "1.20.10",
-    V1_20_30: "1.20.30",
-    V1_20_40: "1.20.40",
-    V1_20_50: "1.20.50",
-    V1_20_60: "1.20.60",
-    V1_20_70: "1.20.70",
-    V1_20_80: "1.20.80",
-    V1_21_0: "1.21.0",
-    AUTO_NEGOTIATE: "auto"
-};
-
-const APEX_COLOR_PALETTE = {
-    PRIMARY_SUCCESS: 0x00FF88,
-    PRIMARY_FAILURE: 0xFF3355,
-    PRIMARY_NEUTRAL: 0x2F3136,
-    PRIMARY_WARNING: 0xFFAA00,
-    PRIMARY_INFO: 0x00AAFF,
-    PRIMARY_ACCENT: 0xAA00FF,
-    UI_BACKGROUND: 0x1A1B1E,
-    UI_HIGHLIGHT: 0xFFFFFF
-};
-
-const APEX_UI_DICTIONARY = {
-    DASHBOARD_HEADER: "💎 SENTINEL APEX | ENTERPRISE CONTROL",
-    DASHBOARD_SUBHEADER: "Mission-Critical Bedrock AFK Orchestration",
-    OVERLORD_HEADER: "👑 SYSTEM OVERLORD | GLOBAL ANALYTICS",
-    OVERLORD_SUBHEADER: "Real-Time Fleet Diagnostic Interface",
-    LABEL_STATE: "Deployment State",
-    LABEL_TRAFFIC: "Network Throughput",
-    LABEL_IDENTITY: "Identity Integrity",
-    LABEL_UPTIME: "Session Longevity",
-    LABEL_ENDPOINT: "Network Endpoint",
-    BTN_DEPLOY: "Initiate Deployment",
-    BTN_HALT: "Terminate Session",
-    BTN_AUTH: "Establish Auth Link",
-    BTN_CONFIG: "Modify Parameters",
-    BTN_SYNC: "Synchronize Logic",
-    MSG_BOOT: "Sentinel Kernel Initialized Successfully.",
-    MSG_SHUTDOWN: "Session Terminated by Global Override.",
-    MSG_RETRY: "Initiating Autonomous Recovery Sequence.",
-    MSG_AUTH_SUCCESS: "Microsoft Identity Handshake Verified."
-};
-
-class ApexCoreException extends Error {
-    constructor(message, code) {
-        super(message);
-        this.name = "ApexCoreException";
-        this.code = code;
-        this.timestamp = Date.now();
-    }
+const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
+if (!DISCORD_TOKEN) {
+  console.error("❌ DISCORD_TOKEN missing");
+  process.exit(1);
 }
 
-class ApexNetworkException extends ApexCoreException {
-    constructor(message) {
-        super(message, "NETWORK_FAILURE");
-    }
+const ALLOWED_GUILD_ID = "1462335230345089254";
+
+// ----------------- Säilytys -----------------
+const DATA = path.join(__dirname, "data");
+const AUTH_ROOT = path.join(DATA, "auth");
+const STORE = path.join(DATA, "users.json");
+
+if (!fs.existsSync(DATA)) fs.mkdirSync(DATA);
+if (!fs.existsSync(AUTH_ROOT)) fs.mkdirSync(AUTH_ROOT, { recursive: true });
+
+let users = fs.existsSync(STORE) ? JSON.parse(fs.readFileSync(STORE, "utf8")) : {};
+function save() {
+  fs.writeFileSync(STORE, JSON.stringify(users, null, 2));
 }
 
-class ApexAuthException extends ApexCoreException {
-    constructor(message) {
-        super(message, "AUTHENTICATION_FAILURE");
-    }
+function getUser(uid) {
+  if (!users[uid]) users[uid] = {};
+  if (!users[uid].delayMs) users[uid].delayMs = 5000;
+  if (!users[uid].connectionType) users[uid].connectionType = "online";
+  if (!users[uid].bedrockVersion) users[uid].bedrockVersion = "auto";
+  if (!users[uid].offlineUsername) users[uid].offlineUsername = `AFK_${uid.slice(-4)}`;
+  return users[uid];
 }
 
-class ApexValidationUtility {
-    static isString(value) {
-        return typeof value === "string";
-    }
-    static isNumber(value) {
-        return typeof value === "number" && !isNaN(value);
-    }
-    static isObject(value) {
-        return typeof value === "object" && value !== null;
-    }
-    static validateIp(ip) {
-        if (!this.isString(ip)) return false;
-        const segments = ip.split(".");
-        if (segments.length !== 4) return true; 
-        return true;
-    }
-    static validatePort(port) {
-        const p = parseInt(port);
-        return this.isNumber(p) && p >= 0 && p <= 65535;
-    }
+function getUserAuthDir(uid) {
+  const dir = path.join(AUTH_ROOT, uid);
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+  return dir;
 }
 
-class ApexStorageProvider {
-    constructor() {
-        this.baseDirectoryPath = path.join(__dirname, "sentinel_apex_data");
-        this.vaultFilePath = path.join(this.baseDirectoryPath, "apex_vault.json");
-        this.identityDirectoryPath = path.join(this.baseDirectoryPath, "identities");
-        this.runtimeCache = null;
-        this.initializeStorageStructure();
+function unlinkMicrosoft(uid) {
+  const dir = getUserAuthDir(uid);
+  try { fs.rmSync(dir, { recursive: true, force: true }); } catch {}
+  const u = getUser(uid);
+  u.linked = false;
+  save();
+}
+
+// ----------------- Runtime -----------------
+const sessions = new Map();
+const pendingLink = new Map();
+const lastMsa = new Map();
+
+// ----------------- Discord client -----------------
+const client = new Client({
+  intents: [GatewayIntentBits.Guilds]
+});
+
+function denyIfWrongGuild(i) {
+  if (!i.inGuild() || i.guildId !== ALLOWED_GUILD_ID) {
+    const msg = "Tätä bottia ei voi käyttää tällä palvelimella ⛔️";
+    if (i.deferred) return i.editReply(msg).catch(() => {});
+    if (i.replied) return i.followUp({ ephemeral: true, content: msg }).catch(() => {});
+    return i.reply({ ephemeral: true, content: msg }).catch(() => {});
+  }
+  return null;
+}
+
+// ----------------- UI-apulaiset -----------------
+function panelRow() {
+  return [
+    new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId("link").setLabel("🔑 Linkitä Microsoft").setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId("unlink").setLabel("🗑 Poista linkitys").setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId("start").setLabel("▶ Käynnistä").setStyle(ButtonStyle.Success),
+      new ButtonBuilder().setCustomId("stop").setLabel("⏹ Pysäytä").setStyle(ButtonStyle.Danger),
+      new ButtonBuilder().setCustomId("settings").setLabel("⚙ Asetukset").setStyle(ButtonStyle.Secondary)
+    ),
+    new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId("more").setLabel("➕ Lisää").setStyle(ButtonStyle.Secondary)
+    )
+  ];
+}
+
+// ----------------- Slash-komennot -----------------
+client.once("ready", async () => {
+  console.log("🟢 Botti online:", client.user.tag);
+  const cmds = [new SlashCommandBuilder().setName("panel").setDescription("Avaa Bedrock AFK-paneeli")];
+  await client.application.commands.set(cmds);
+});
+
+// ----------------- Microsoft linkitys -----------------
+async function linkMicrosoft(uid, interaction) {
+  if (pendingLink.has(uid)) {
+    await interaction.editReply("⏳ Kirjautuminen on jo käynnissä.");
+    return;
+  }
+
+  const authDir = getUserAuthDir(uid);
+  const u = getUser(uid);
+  let codeShown = false;
+
+  const flow = new Authflow(
+    uid,
+    authDir,
+    {
+      flow: "live",
+      authTitle: Titles?.MinecraftNintendoSwitch || "Bedrock AFK Bot",
+      deviceType: "Nintendo"
+    },
+    async (data) => {
+      const uri = data.verification_uri_complete || data.verification_uri || "https://www.microsoft.com/link";
+      const code = data.user_code || "(ei koodia)";
+      lastMsa.set(uid, { uri, code, at: Date.now() });
+      codeShown = true;
+
+      const msg = `🔐 **Microsoft-kirjautuminen vaaditaan**\n\n👉 ${uri}\n\nKoodisi: \`${code}\`\n\nPalaa tänne kun olet kirjautunut.`;
+      await interaction.editReply({ 
+        content: msg, 
+        components: [new ActionRowBuilder().addComponents(new ButtonBuilder().setLabel("🌐 Avaa linkki").setStyle(ButtonStyle.Link).setURL(uri))]
+      }).catch(() => {});
     }
-    initializeStorageStructure() {
-        if (!fs.existsSync(this.baseDirectoryPath)) {
-            fs.mkdirSync(this.baseDirectoryPath);
+  );
+
+  const p = (async () => {
+    try {
+      if (!codeShown) await interaction.editReply("⏳ Pyydetään koodia…");
+      await flow.getMsaToken();
+      u.linked = true;
+      save();
+      await interaction.followUp({ ephemeral: true, content: "✅ Microsoft-tili linkitetty!" }).catch(() => {});
+    } catch (e) {
+      await interaction.editReply(`❌ Virhe kirjautumisessa: ${String(e.message)}`).catch(() => {});
+    } finally {
+      pendingLink.delete(uid);
+    }
+  })();
+  pendingLink.set(uid, p);
+}
+
+// ----------------- Bedrock-sessio & Fysiikka -----------------
+
+function cleanupSession(uid) {
+  const s = sessions.get(uid);
+  if (!s) return;
+  if (s.timeout) clearTimeout(s.timeout);
+  if (s.physicsLoop) clearInterval(s.physicsLoop);
+  if (s.rejoinTimeout) clearTimeout(s.rejoinTimeout);
+  try { s.client.close(); } catch {}
+  sessions.delete(uid);
+}
+
+function stopSession(uid) {
+  if (!sessions.has(uid)) return false;
+  const s = sessions.get(uid);
+  s.manualStop = true;
+  cleanupSession(uid);
+  return true;
+}
+
+function startSession(uid, interaction) {
+  const u = getUser(uid);
+  if (!u.server) {
+    if (interaction && !interaction.replied) interaction.editReply("⚠ Määritä asetukset ensin.");
+    return;
+  }
+
+  if (sessions.has(uid) && !sessions.get(uid).isDisconnected) return;
+
+  const { ip, port } = u.server;
+  const authDir = getUserAuthDir(uid);
+
+  const opts = {
+    host: ip,
+    port,
+    connectTimeout: 47000,
+    keepAlive: true
+  };
+
+  if (u.connectionType === "offline") {
+    opts.username = u.offlineUsername || `AFK_${uid.slice(-4)}`;
+    opts.offline = true;
+  } else {
+    opts.username = uid;
+    opts.profilesFolder = authDir;
+  }
+
+  const mc = bedrock.createClient(opts);
+  
+  const session = { 
+    client: mc, 
+    timeout: null, 
+    physicsLoop: null, 
+    rejoinTimeout: null, 
+    manualStop: false,
+    isDisconnected: false,
+    // Fysiikkamuuttujat
+    pos: { x: 0, y: 0, z: 0 },
+    vel: { x: 0, y: 0, z: 0 },
+    yaw: 0,
+    pitch: 0,
+    isMoving: false
+  };
+  sessions.set(uid, session);
+
+  session.timeout = setTimeout(() => {
+    if (sessions.has(uid) && !session.isDisconnected) {
+      cleanupSession(uid);
+      if (interaction) interaction.editReply("❌ Yhteyden aikakatkaisu.").catch(() => {});
+    }
+  }, 47000);
+
+  mc.on("spawn", () => {
+    clearTimeout(session.timeout);
+    if (interaction) interaction.editReply(`🟢 Bot online: **${ip}:${port}**. Realistinen fysiikka käytössä.`).catch(() => {});
+
+    // Alustetaan sijainti spawniin
+    if (mc.entity?.position) {
+      session.pos = { ...mc.entity.position };
+    }
+
+    // --- REALISTINEN FYSIIKKAMOOTTORI ---
+    // Minecraft tick on 50ms (20 TPS)
+    session.physicsLoop = setInterval(() => {
+      if (!mc.entityId) return;
+
+      const friction = 0.91; // Normaali maan kitka
+      const acceleration = 0.08; // Kävelyn kiihtyvyys per tick
+      
+      // Päätetään satunnaisesti liikkumisesta (simuloidaan näppäinpainalluksia)
+      const now = Date.now();
+      if (!session.nextActionTime || now > session.nextActionTime) {
+        session.isMoving = !session.isMoving;
+        // Liikutaan 2-5 sekuntia, sitten huilataan 15-30 sekuntia
+        session.nextActionTime = now + (session.isMoving ? 3000 : 20000 + Math.random() * 10000);
+        
+        if (session.isMoving) {
+          // Valitaan satunnainen suunta (eteen tai taakse suhteessa yawiin)
+          session.moveDir = Math.random() > 0.5 ? 1 : -1;
+          session.yaw = Math.random() * 360; // Käänny satunnaiseen suuntaan
         }
-        if (!fs.existsSync(this.identityDirectoryPath)) {
-            fs.mkdirSync(this.identityDirectoryPath, { recursive: true });
-        }
-        if (!fs.existsSync(this.vaultFilePath)) {
-            const initialSchema = {
-                registry: {},
-                globalMetrics: {
-                    totalDeployments: 0,
-                    totalUptimeMinutes: 0,
-                    totalHandshakeFailures: 0,
-                    totalPacketThroughput: 0,
-                    kernelBootstrapEpoch: Date.now()
-                }
-            };
-            fs.writeFileSync(this.vaultFilePath, JSON.stringify(initialSchema, null, 4));
-            this.runtimeCache = initialSchema;
-        } else {
-            this.runtimeCache = JSON.parse(fs.readFileSync(this.vaultFilePath, APEX_SYSTEM_CONSTANTS.STORAGE_ENCODING_FORMAT));
-        }
-    }
-    commitChanges() {
-        fs.writeFileSync(this.vaultFilePath, JSON.stringify(this.runtimeCache, null, 4));
-    }
-    retrieveUserRecord(uid) {
-        if (!this.runtimeCache.registry[uid]) {
-            this.runtimeCache.registry[uid] = {
-                linkedStatus: false,
-                isCurrentlyActive: false,
-                protocolMode: "online",
-                targetEndpoint: { host: "", port: "19132" },
-                deploymentProfile: {
-                    autoRecoveryEnabled: true,
-                    evasionIntensity: "HIGH",
-                    targetProtocolVersion: APEX_PROTOCOL_VERSIONS.AUTO_NEGOTIATE,
-                    customOfflineAlias: `Sentinel_${uid.slice(-4)}`
-                },
-                historicalLogs: []
-            };
-            this.commitChanges();
-        }
-        return this.runtimeCache.registry[uid];
-    }
-    getIdentityVaultPath(uid) {
-        const userSpecificPath = path.join(this.identityDirectoryPath, uid);
-        if (!fs.existsSync(userSpecificPath)) {
-            fs.mkdirSync(userSpecificPath, { recursive: true });
-        }
-        return userSpecificPath;
-    }
-}
+      }
 
-const ApexVault = new ApexStorageProvider();
+      // Jos liikkeessä, lisää kiihtyvyyttä nopeuteen
+      if (session.isMoving) {
+        const rad = (session.yaw + 90) * (Math.PI / 180);
+        session.vel.x += Math.cos(rad) * acceleration * session.moveDir;
+        session.vel.z += Math.sin(rad) * acceleration * session.moveDir;
+      }
 
-class ApexIdentityOrchestrator {
-    static createIdentityFlow(uid) {
-        const storagePath = ApexVault.getIdentityVaultPath(uid);
-        return new Authflow(uid, storagePath, {
-            flow: "msal",
-            authTitle: Titles.MinecraftNintendoSwitch,
-            deviceType: "Nintendo"
-        });
-    }
-    static async performIdentityChallenge(uid, interaction) {
-        const storagePath = ApexVault.getIdentityVaultPath(uid);
-        const flow = new Authflow(uid, storagePath, {
-            flow: "msal",
-            authTitle: Titles.MinecraftNintendoSwitch,
-            deviceType: "Nintendo"
-        }, async (challengeData) => {
-            const challengeEmbed = new EmbedBuilder()
-                .setTitle("🔐 APEX IDENTITY HANDSHAKE")
-                .setDescription(`Identity verification required for secure deployment.\n\n🔑 CHALLENGE CODE: **\`${challengeData.user_code}\`**\n\n1. Navigate to: [Microsoft Verification](${challengeData.verification_uri})\n2. Provide the challenge code.\n\n*The kernel will intercept confirmation automatically.*`)
-                .setColor(APEX_COLOR_PALETTE.PRIMARY_INFO)
-                .setThumbnail("https://upload.wikimedia.org/wikipedia/commons/thumb/4/44/Microsoft_logo.svg/1024px-Microsoft_logo.svg.png")
-                .setFooter({ text: "Challenge Expiry: 15 Minutes" });
-            const interactionRow = new ActionRowBuilder().addComponents(
-                new ButtonBuilder()
-                    .setLabel("Open Identity Portal")
-                    .setStyle(ButtonStyle.Link)
-                    .setURL(challengeData.verification_uri)
-            );
-            await interaction.editReply({ embeds: [challengeEmbed], components: [interactionRow] });
-        });
-        await flow.getMsaToken();
-        const userRecord = ApexVault.retrieveUserRecord(uid);
-        userRecord.linkedStatus = true;
-        ApexVault.commitChanges();
-    }
-}
+      // Käytä kitkaa nopeuteen
+      session.vel.x *= friction;
+      session.vel.z *= friction;
 
-class ApexEvasionService {
-    static generateRandomFloat(min, max) {
-        return Math.random() * (max - min) + min;
-    }
-    static applyPositionJitter(client) {
-        if (!client.entityId) return;
-        const currentPosition = client.entity?.position || { x: 0, y: 0, z: 0 };
-        const jitterX = this.generateRandomFloat(-0.08, 0.08);
-        const jitterZ = this.generateRandomFloat(-0.08, 0.08);
-        const randomPitch = this.generateRandomFloat(-4, 4);
-        const randomYaw = this.generateRandomFloat(0, 360);
-        client.write("move_player", {
-            runtime_id: client.entityId,
-            position: { x: currentPosition.x + jitterX, y: currentPosition.y, z: currentPosition.z + jitterZ },
-            pitch: randomPitch,
-            yaw: randomYaw,
-            head_yaw: randomYaw,
+      // Jos nopeus on hyvin pieni, nollaa se
+      if (Math.abs(session.vel.x) < 0.001) session.vel.x = 0;
+      if (Math.abs(session.vel.z) < 0.001) session.vel.z = 0;
+
+      // Päivitä sijainti nopeuden perusteella
+      session.pos.x += session.vel.x;
+      session.pos.z += session.vel.z;
+
+      // Lähetä liike-paketti vain jos on liikettä tai kääntymistä
+      if (session.vel.x !== 0 || session.vel.z !== 0 || session.isMoving) {
+        try {
+          mc.write("move_player", {
+            runtime_id: mc.entityId,
+            position: session.pos,
+            pitch: session.pitch,
+            yaw: session.yaw,
+            head_yaw: session.yaw,
             mode: 0,
             on_ground: true,
             ridden_runtime_id: 0,
             teleport: false
-        });
+          });
+        } catch {}
+      }
+    }, 50); 
+  });
+
+  mc.on("close", () => {
+    session.isDisconnected = true;
+    if (session.physicsLoop) clearInterval(session.physicsLoop);
+    
+    // --- AUTOMAATTINEN REJOIN (2 min) ---
+    if (!session.manualStop) {
+      console.log(`Botti potkittiin (${uid}). Yritetään uudelleen 2min päästä...`);
+      session.rejoinTimeout = setTimeout(() => {
+        if (!session.manualStop) startSession(uid, interaction);
+      }, 120000);
+    } else {
+      cleanupSession(uid);
     }
-    static triggerAnimationPulse(client) {
-        if (!client.entityId) return;
-        client.write("animate", { action_id: 1, runtime_entity_id: client.entityId });
-    }
+  });
+
+  mc.on("error", (e) => {
+    session.isDisconnected = true;
+    console.error("MC Error:", e);
+  });
 }
 
-class ApexSessionKernel {
-    constructor(uid) {
-        this.userUid = uid;
-        this.record = ApexVault.retrieveUserRecord(uid);
-        this.bedrockClientInstance = null;
-        this.currentStatusState = APEX_STATUS_CODES.IDLE;
-        this.deploymentEpoch = 0;
-        this.processedPacketCount = 0;
-        this.forceTerminationSignal = false;
-        this.scheduledTasks = {
-            reconnectionTimeout: null,
-            handshakeGuard: null,
-            simulationInterval: null,
-            watchdogTimer: null
-        };
-    }
-    async initiateDeployment(discordInteraction = null) {
-        if (this.currentStatusState === APEX_STATUS_CODES.ESTABLISHED) return;
-        this.forceTerminationSignal = false;
-        this.currentStatusState = APEX_STATUS_CODES.INITIALIZING;
-        const deploymentConfiguration = {
-            host: this.record.targetEndpoint.host,
-            port: parseInt(this.record.targetEndpoint.port) || APEX_SYSTEM_CONSTANTS.DEFAULT_BEDROCK_NETWORK_PORT,
-            connectTimeout: APEX_SYSTEM_CONSTANTS.HANDSHAKE_TIMEOUT_MILLISECONDS,
-            skipInitResurcePacks: true,
-            version: this.record.deploymentProfile.targetProtocolVersion === "auto" ? undefined : this.record.deploymentProfile.targetProtocolVersion
-        };
-        if (this.record.protocolMode === "online") {
-            deploymentConfiguration.authflow = ApexIdentityOrchestrator.createIdentityFlow(this.userUid);
-            deploymentConfiguration.username = this.userUid;
-        } else {
-            deploymentConfiguration.username = this.record.deploymentProfile.customOfflineAlias || `APEX_${this.userUid.slice(0, 4)}`;
-            deploymentConfiguration.offline = true;
-        }
-        try {
-            this.bedrockClientInstance = bedrock.createClient(deploymentConfiguration);
-            this.attachKernelListeners(discordInteraction);
-            this.scheduledTasks.handshakeGuard = setTimeout(() => {
-                if (this.currentStatusState !== APEX_STATUS_CODES.ESTABLISHED) {
-                    this.executeShutdownSequence("Handshake Negotiation Timeout");
-                }
-            }, APEX_SYSTEM_CONSTANTS.HANDSHAKE_TIMEOUT_MILLISECONDS);
-        } catch (initializationError) {
-            this.executeShutdownSequence(initializationError.message);
-        }
-    }
-    attachKernelListeners(interaction) {
-        this.bedrockClientInstance.on("packet", () => {
-            this.processedPacketCount++;
-            ApexVault.runtimeCache.globalMetrics.totalPacketThroughput++;
-        });
-        this.bedrockClientInstance.on("spawn", () => {
-            this.currentStatusState = APEX_STATUS_CODES.ESTABLISHED;
-            this.deploymentEpoch = Date.now();
-            clearTimeout(this.scheduledTasks.handshakeGuard);
-            ApexVault.runtimeCache.globalMetrics.totalDeployments++;
-            if (interaction) {
-                interaction.editReply({
-                    content: `✨ **DEPLOYMENT SUCCESSFUL:** <@${this.userUid}> kernel is now active at \`${this.record.targetEndpoint.host}\`.`,
-                    embeds: [], components: []
-                }).catch(() => {});
-            }
-            this.activateSimulationLoops();
-        });
-        this.bedrockClientInstance.on("error", (errorData) => {
-            this.executeShutdownSequence(`Kernel Internal Error: ${errorData.message}`);
-        });
-        this.bedrockClientInstance.on("close", () => {
-            this.executeShutdownSequence("Connection Terminated by Endpoint");
-        });
-    }
-    activateSimulationLoops() {
-        this.scheduledTasks.simulationInterval = setInterval(() => {
-            if (this.currentStatusState === APEX_STATUS_CODES.ESTABLISHED) {
-                ApexEvasionService.applyPositionJitter(this.bedrockClientInstance);
-                if (Math.random() > 0.85) {
-                    ApexEvasionService.triggerAnimationPulse(this.bedrockClientInstance);
-                }
-            }
-        }, APEX_SYSTEM_CONSTANTS.AFK_SIMULATION_INTERVAL_MILLISECONDS);
-    }
-    executeShutdownSequence(terminationReason) {
-        const wasPreviouslyActive = this.currentStatusState === APEX_STATUS_CODES.ESTABLISHED;
-        this.currentStatusState = APEX_STATUS_CODES.TERMINATED;
-        this.deconstructResources();
-        if (!this.forceTerminationSignal && this.record.deploymentProfile.autoRecoveryEnabled) {
-            this.currentStatusState = APEX_STATUS_CODES.RECOVERING;
-            this.scheduledTasks.reconnectionTimeout = setTimeout(() => {
-                this.initiateDeployment();
-            }, APEX_SYSTEM_CONSTANTS.RECONNECTION_COOLDOWN_MILLISECONDS);
-        }
-    }
-    deconstructResources() {
-        if (this.scheduledTasks.simulationInterval) clearInterval(this.scheduledTasks.simulationInterval);
-        if (this.scheduledTasks.handshakeGuard) clearTimeout(this.scheduledTasks.handshakeGuard);
-        try {
-            if (this.bedrockClientInstance) {
-                this.bedrockClientInstance.close();
-                this.bedrockClientInstance = null;
-            }
-        } catch (deconstructionError) {}
-    }
-    forceTerminateKernel(isManualAction = true) {
-        this.forceTerminationSignal = isManualAction;
-        if (isManualAction) {
-            this.record.isCurrentlyActive = false;
-            ApexVault.commitChanges();
-        }
-        this.deconstructResources();
-        if (this.scheduledTasks.reconnectionTimeout) clearTimeout(this.scheduledTasks.reconnectionTimeout);
-    }
-}
+// ----------------- Vuorovaikutus -----------------
+client.on(Events.InteractionCreate, async (i) => {
+  try {
+    const blocked = denyIfWrongGuild(i);
+    if (blocked) return;
 
-class ApexOrchestratorRegistry {
-    constructor() {
-        this.activeSessionMap = new Map();
-    }
-    resolveSessionInstance(uid) {
-        if (!this.activeSessionMap.has(uid)) {
-            this.activeSessionMap.set(uid, new ApexSessionKernel(uid));
-        }
-        return this.activeSessionMap.get(uid);
-    }
-    broadcastEmergencyShutdown() {
-        for (const session of this.activeSessionMap.values()) {
-            session.forceTerminateKernel(true);
-        }
-    }
-    aggregateGlobalState() {
-        let onlineCount = 0;
-        let recoveryCount = 0;
-        let totalPackets = 0;
-        for (const session of this.activeSessionMap.values()) {
-            if (session.currentStatusState === APEX_STATUS_CODES.ESTABLISHED) {
-                onlineCount++;
-            } else if (session.currentStatusState === APEX_STATUS_CODES.RECOVERING) {
-                recoveryCount++;
-            }
-            totalPackets += session.processedPacketCount;
-        }
-        return { onlineCount, recoveryCount, totalPackets };
-    }
-}
+    const uid = i.user.id;
 
-const ApexEngine = new ApexOrchestratorRegistry();
-
-class ApexInterfaceRenderer {
-    static generateUserDashboard(uid) {
-        const userProfile = ApexVault.retrieveUserRecord(uid);
-        const session = ApexEngine.resolveSessionInstance(uid);
-        const statusDisplayMap = {
-            [APEX_STATUS_CODES.IDLE]: "⚪ STANDBY",
-            [APEX_STATUS_CODES.ESTABLISHED]: "🟢 DEPLOYED",
-            [APEX_STATUS_CODES.RECOVERING]: "🟠 RECOVERING",
-            [APEX_STATUS_CODES.TERMINATED]: "🔴 TERMINATED",
-            [APEX_STATUS_CODES.INITIALIZING]: "🔵 INITIALIZING",
-            [APEX_STATUS_CODES.NEGOTIATING]: "🔵 NEGOTIATING"
-        };
-        const dashboardEmbed = new EmbedBuilder()
-            .setTitle(APEX_UI_DICTIONARY.DASHBOARD_HEADER)
-            .setDescription(APEX_UI_DICTIONARY.DASHBOARD_SUBHEADER)
-            .setColor(session.currentStatusState === APEX_STATUS_CODES.ESTABLISHED ? APEX_COLOR_PALETTE.PRIMARY_SUCCESS : APEX_COLOR_PALETTE.PRIMARY_NEUTRAL)
-            .addFields(
-                { name: `📡 ${APEX_UI_DICTIONARY.LABEL_STATE}`, value: `**Status:** ${statusDisplayMap[session.currentStatusState] || "⚪ STANDBY"}\n**Session Uptime:** ${session.currentStatusState === APEX_STATUS_CODES.ESTABLISHED ? Math.floor((Date.now() - session.deploymentEpoch) / 60000) + "m" : "0m"}\n**Ingress Traffic:** ${session.processedPacketCount} pkts`, inline: true },
-                { name: `🌍 ${APEX_UI_DICTIONARY.LABEL_ENDPOINT}`, value: `**Host:** \`${userProfile.targetEndpoint.host || "Unset"}\`\n**Port:** \`${userProfile.targetEndpoint.port}\`\n**Protocol:** ${userProfile.protocolMode.toUpperCase()}`, inline: true },
-                { name: `🛡️ ${APEX_UI_DICTIONARY.LABEL_IDENTITY}`, value: userProfile.linkedStatus ? "✅ IDENTITY SECURED" : "❌ IDENTITY UNVERIFIED", inline: true }
-            )
-            .setThumbnail("https://cdn-icons-png.flaticon.com/512/2620/2620573.png")
-            .setFooter({ text: `Apex Kernel Rev ${APEX_IDENTIFIERS.VERSION_MAJOR}.${APEX_IDENTIFIERS.VERSION_MINOR}.${APEX_IDENTIFIERS.VERSION_PATCH}` });
-        const primaryRow = new ActionRowBuilder().addComponents(
-            new ButtonBuilder().setCustomId("apex_cmd_deploy").setLabel(APEX_UI_DICTIONARY.BTN_DEPLOY).setStyle(ButtonStyle.Success).setEmoji("🚀"),
-            new ButtonBuilder().setCustomId("apex_cmd_halt").setLabel(APEX_UI_DICTIONARY.BTN_HALT).setStyle(ButtonStyle.Danger).setEmoji("🛑"),
-            new ButtonBuilder().setCustomId("apex_cmd_config").setLabel(APEX_UI_DICTIONARY.BTN_CONFIG).setStyle(ButtonStyle.Secondary).setEmoji("⚙️")
-        );
-        const secondaryRow = new ActionRowBuilder().addComponents(
-            new ButtonBuilder().setCustomId("apex_cmd_auth").setLabel(APEX_UI_DICTIONARY.BTN_AUTH).setStyle(ButtonStyle.Primary).setEmoji("🔐"),
-            new ButtonBuilder().setCustomId("apex_cmd_sync").setLabel(APEX_UI_DICTIONARY.BTN_SYNC).setStyle(ButtonStyle.Secondary).setEmoji("🔄")
-        );
-        return { embeds: [dashboardEmbed], components: [primaryRow, secondaryRow] };
+    if (i.isChatInputCommand() && i.commandName === "panel") {
+      return i.reply({ content: "🎛 **Bedrock AFK-ohjauspaneeli**", components: panelRow() });
     }
-    static generateAdminAnalytics() {
-        const globalMetrics = ApexEngine.aggregateGlobalState();
-        const systemMemoryUsage = process.memoryUsage();
-        const analyticsEmbed = new EmbedBuilder()
-            .setTitle(APEX_UI_DICTIONARY.OVERLORD_HEADER)
-            .setDescription(APEX_UI_DICTIONARY.OVERLORD_SUBHEADER)
-            .setColor(APEX_COLOR_PALETTE.PRIMARY_ACCENT)
-            .addFields(
-                { name: "📈 FLEET ANALYTICS", value: `**Deployed:** ${globalMetrics.onlineCount}\n**Recovery:** ${globalMetrics.recoveryCount}\n**Global Throughput:** ${globalMetrics.totalPackets} pkts`, inline: true },
-                { name: "💻 HARDWARE METRICS", value: `**RSS RAM:** ${(systemMemoryUsage.rss / 1024 / 1024).toFixed(2)} MB\n**Kernel Platform:** ${os.platform()}\n**CPU Avg Load:** ${os.loadavg()[0].toFixed(2)}`, inline: true },
-                { name: "📂 PERSISTENCE", value: `**Registered Identites:** ${Object.keys(ApexVault.runtimeCache.registry).length}\n**Lifetime Handshakes:** ${ApexVault.runtimeCache.globalMetrics.totalDeployments}`, inline: true }
-            )
-            .setTimestamp()
-            .setFooter({ text: "Apex Enterprise Orchestration v6.0" });
-        const controlRow = new ActionRowBuilder().addComponents(
-            new ButtonBuilder().setCustomId("apex_adm_sync").setLabel("Force Global Sync").setStyle(ButtonStyle.Primary).setEmoji("🔃"),
-            new ButtonBuilder().setCustomId("apex_adm_emergency").setLabel("Emergency Fleet Halt").setStyle(ButtonStyle.Danger).setEmoji("☢️")
-        );
-        return { embeds: [analyticsEmbed], components: [controlRow] };
-    }
-}
 
-const ApexDiscordClient = new Client({
-    intents: [
-        GatewayIntentBits.Guilds,
-        GatewayIntentBits.GuildMessages,
-        GatewayIntentBits.DirectMessages,
-        GatewayIntentBits.MessageContent
-    ],
-    partials: [Partials.Channel, Partials.Message, Partials.User]
+    if (i.isButton()) {
+      if (i.customId === "link") {
+        await i.deferReply({ ephemeral: true });
+        return linkMicrosoft(uid, i);
+      }
+      if (i.customId === "start") {
+        await i.deferReply({ ephemeral: true });
+        await i.editReply("⏳ Muodostetaan yhteyttä fysiikkamoottorilla…");
+        return startSession(uid, i);
+      }
+      if (i.customId === "stop") {
+        stopSession(uid);
+        return i.reply({ ephemeral: true, content: "⏹ Botti pysäytetty ja automaattinen uudelleenyhdistys peruttu." });
+      }
+      if (i.customId === "settings") {
+        const u = getUser(uid);
+        const modal = new ModalBuilder().setCustomId("settings_modal").setTitle("⚙ Bedrock-asetukset");
+        const ip = new TextInputBuilder().setCustomId("ip").setLabel("Palvelimen IP").setStyle(TextInputStyle.Short).setValue(u.server?.ip || "");
+        const port = new TextInputBuilder().setCustomId("port").setLabel("Portti").setStyle(TextInputStyle.Short).setValue(String(u.server?.port || 19132));
+        modal.addComponents(new ActionRowBuilder().addComponents(ip), new ActionRowBuilder().addComponents(port));
+        return i.showModal(modal);
+      }
+    }
+
+    if (i.isModalSubmit() && i.customId === "settings_modal") {
+      const ip = i.fields.getTextInputValue("ip").trim();
+      const port = parseInt(i.fields.getTextInputValue("port").trim(), 10);
+      const u = getUser(uid);
+      u.server = { ip, port };
+      save();
+      return i.reply({ ephemeral: true, content: `Asetukset tallennettu: ${ip}:${port}` });
+    }
+
+  } catch (e) {
+    console.error("Interaction error:", e);
+  }
 });
 
-ApexDiscordClient.on(Events.InteractionCreate, async (interaction) => {
-    const userUid = interaction.user.id;
-    if (interaction.isChatInputCommand()) {
-        if (interaction.guildId !== APEX_SYSTEM_CONSTANTS.DISCORD_GUILD_IDENTITY) return;
-        if (interaction.commandName === "panel") {
-            return interaction.reply(ApexInterfaceRenderer.generateUserDashboard(userUid));
-        }
-        if (interaction.commandName === "admin") {
-            if (userUid !== APEX_SYSTEM_CONSTANTS.DISCORD_ADMINISTRATOR_IDENTITY) {
-                return interaction.reply({ content: "Permission Level Insufficient for Administrative Access.", ephemeral: true });
-            }
-            return interaction.reply(ApexInterfaceRenderer.generateAdminAnalytics());
-        }
-    }
-    if (interaction.isButton()) {
-        const buttonId = interaction.customId;
-        try {
-            if (buttonId === "apex_cmd_sync") {
-                return interaction.update(ApexInterfaceRenderer.generateUserDashboard(userUid));
-            }
-            if (buttonId === "apex_cmd_auth") {
-                await interaction.deferReply({ ephemeral: true });
-                await ApexIdentityOrchestrator.performIdentityChallenge(userUid, interaction);
-                return;
-            }
-            if (buttonId === "apex_cmd_deploy") {
-                await interaction.deferReply({ ephemeral: true });
-                await ApexEngine.resolveSessionInstance(userUid).initiateDeployment(interaction);
-                return;
-            }
-            if (buttonId === "apex_cmd_halt") {
-                ApexEngine.resolveSessionInstance(userUid).forceTerminateKernel(true);
-                return interaction.reply({ content: "Termination Signal Dispatched to Kernel.", ephemeral: true });
-            }
-            if (buttonId === "apex_cmd_config") {
-                const userProfile = ApexVault.retrieveUserRecord(userUid);
-                const configModal = new ModalBuilder().setCustomId("apex_mod_config").setTitle("DEPLOYMENT PARAMETERIZATION");
-                configModal.addComponents(
-                    new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("f_host").setLabel("Network Address").setStyle(TextInputStyle.Short).setValue(userProfile.targetEndpoint.host).setRequired(true)),
-                    new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("f_port").setLabel("Network Port").setStyle(TextInputStyle.Short).setValue(userProfile.targetEndpoint.port)),
-                    new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("f_alias").setLabel("Identity Proxy Alias").setStyle(TextInputStyle.Short).setValue(userProfile.deploymentProfile.customOfflineAlias || "")),
-                    new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("f_ver").setLabel("Protocol Specification").setStyle(TextInputStyle.Short).setValue(userProfile.deploymentProfile.targetProtocolVersion)),
-                    new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("f_mode").setLabel("Auth Mode (online/offline)").setStyle(TextInputStyle.Short).setValue(userProfile.protocolMode))
-                );
-                return interaction.showModal(configModal);
-            }
-            if (buttonId === "apex_adm_sync") {
-                return interaction.update(ApexInterfaceRenderer.generateAdminAnalytics());
-            }
-            if (buttonId === "apex_adm_emergency") {
-                ApexEngine.broadcastEmergencyShutdown();
-                return interaction.reply({ content: "Global Fleet Termination Triggered Successfully.", ephemeral: true });
-            }
-        } catch (interactionError) {
-            if (!interaction.replied && !interaction.deferred) {
-                interaction.reply({ content: `Apex Kernel Interface Exception: ${interactionError.message}`, ephemeral: true }).catch(() => {});
-            }
-        }
-    }
-    if (interaction.isModalSubmit() && interaction.customId === "apex_mod_config") {
-        const userProfile = ApexVault.retrieveUserRecord(userUid);
-        userProfile.targetEndpoint.host = interaction.fields.getTextInputValue("f_host").trim();
-        userProfile.targetEndpoint.port = interaction.fields.getTextInputValue("f_port").trim();
-        userProfile.deploymentProfile.customOfflineAlias = interaction.fields.getTextInputValue("f_alias").trim();
-        userProfile.deploymentProfile.targetProtocolVersion = interaction.fields.getTextInputValue("f_ver").trim() || "auto";
-        userProfile.protocolMode = interaction.fields.getTextInputValue("f_mode").toLowerCase().includes("off") ? "offline" : "online";
-        ApexVault.commitChanges();
-        return interaction.reply({ content: "Kernel Deployment Parameters Synchronized.", ephemeral: true });
-    }
-});
-
-ApexDiscordClient.once("ready", async () => {
-    await ApexDiscordClient.application.commands.set([
-        new SlashCommandBuilder().setName("panel").setDescription("Access individual Sentinel session controller"),
-        new SlashCommandBuilder().setName("admin").setDescription("Access root system diagnostic dashboard")
-    ]);
-    const restorationQueue = Object.keys(ApexVault.runtimeCache.registry).filter(id => ApexVault.runtimeCache.registry[id].isCurrentlyActive);
-    restorationQueue.forEach((id, index) => {
-        setTimeout(() => {
-            ApexEngine.resolveSessionInstance(id).initiateDeployment();
-        }, index * APEX_SYSTEM_CONSTANTS.AUTO_BOOTSTRAP_DELAY_MILLISECONDS);
-    });
-});
-
-process.on("unhandledRejection", (rejectionReason) => {
-    console.error(`[FATAL] Unhandled Rejection: ${rejectionReason.stack}`);
-});
-
-process.on("uncaughtException", (uncaughtError) => {
-    console.error(`[FATAL] Uncaught Exception: ${uncaughtError.stack}`);
-});
-
-ApexDiscordClient.login(APEX_SYSTEM_CONSTANTS.DISCORD_TOKEN);
+client.login(DISCORD_TOKEN);
 
