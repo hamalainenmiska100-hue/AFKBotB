@@ -1,7 +1,7 @@
 /**
  * Bedrock AFK Bot - "Divine Physics" v4
- * Integroitu LootLabs.gg Creator API:n kanssa.
- * Sisältää teknisen virheraportoinnin vianmääritystä varten.
+ * Korjattu LootLabs.gg API-integraatio (Array-parsing fix)
+ * Sisältää teknisen virheraportoinnin ja kaikki aiemmat logiikat.
  */
 
 const {
@@ -118,11 +118,12 @@ async function linkMicrosoft(uid, interaction) {
 
 /**
  * Luodaan dynaaminen LootLabs-linkki ja palautetaan virhetiedot jos epäonnistuu
+ * KORJAUS: Käsittelee nyt 'message' kentän taulukkona!
  */
 async function createLootLabsLink(userId) {
   try {
     const response = await axios.post('https://creators.lootlabs.gg/api/public/content_locker', {
-      title: "AFKBot-Auth-Wall",
+      title: `AFKBot-Auth-${userId.slice(-4)}`,
       url: `https://discord.com/users/${userId}`,
       tier_id: 1, 
       number_of_tasks: 3,
@@ -134,12 +135,17 @@ async function createLootLabsLink(userId) {
       }
     });
 
-    if (response.data?.message?.loot_url) {
+    // Tarkistetaan onko vastaus taulukko (kuten kuvassa näkyi)
+    if (response.data?.message && Array.isArray(response.data.message) && response.data.message[0]?.loot_url) {
+      return { url: response.data.message[0].loot_url };
+    } 
+    // Tai onko se suora objekti (dokumentaation mukaan)
+    else if (response.data?.message?.loot_url) {
       return { url: response.data.message.loot_url };
     }
+    
     return { error: "Unknown response format", data: response.data };
   } catch (err) {
-    // Palautetaan raaka tekninen virhedata
     return { 
       error: err.message, 
       data: err.response?.data || "No response data from server" 
