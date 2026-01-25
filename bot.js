@@ -26,7 +26,7 @@ if (!DISCORD_TOKEN) {
 
 // --- ADMIN CONFIGURATION ---
 // VAIHDA TÄHÄN OMA DISCORD ID:SI
-const ADMIN_IDS = ["YOUR_DISCORD_ID_HERE"];
+const ADMIN_IDS = ["1144987924123881564"];
 const ALLOWED_GUILD_ID = "1462335230345089254";
 
 // ----------------- Storage (Fly.io Volume & Persistence) -----------------
@@ -119,7 +119,7 @@ function patreonRow() {
     new ButtonBuilder()
       .setLabel("Donate 💸")
       .setStyle(ButtonStyle.Link)
-      .setURL("https://www.patreon.com/your_patreon_link")
+      .setURL("https://patreon.com/AFKBot396?utm_medium=unknown&utm_source=join_link&utm_campaign=creatorshare_creator&utm_content=copyLink")
   );
 }
 
