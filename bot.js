@@ -111,7 +111,7 @@ function patreonRow() {
     new ButtonBuilder()
       .setLabel("Donate 💸")
       .setStyle(ButtonStyle.Link)
-      .setURL("https://www.patreon.com/your_patreon_link") // Replace with actual link
+      .setURL("https://patreon.com/AFKBot396?utm_medium=unknown&utm_source=join_link&utm_campaign=creatorshare_creator&utm_content=copyLink") // Replace with actual link
   );
 }
 
