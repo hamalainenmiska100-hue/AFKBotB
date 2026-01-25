@@ -26,7 +26,7 @@ if (!DISCORD_TOKEN) {
 
 // --- ADMIN CONFIGURATION ---
 // VAIHDA TÄHÄN OMA DISCORD ID:SI
-const ADMIN_IDS = ["YOUR_DISCORD_ID_HERE"];
+const ADMIN_IDS = ["1144987924123881564"];
 const ALLOWED_GUILD_ID = "1462335230345089254";
 
 // ----------------- Storage (Fly.io Volume & Persistence) -----------------
