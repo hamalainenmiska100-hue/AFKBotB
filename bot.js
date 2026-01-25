@@ -105,6 +105,16 @@ function msaComponents(uri) {
   ];
 }
 
+// Patreon helper function
+function patreonRow() {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setLabel("Donate 💸")
+      .setStyle(ButtonStyle.Link)
+      .setURL("https://www.patreon.com/your_patreon_link") // Replace with your actual link
+  );
+}
+
 function versionRow(current = "auto") {
   const menu = new StringSelectMenuBuilder()
     .setCustomId("set_version")
@@ -304,7 +314,15 @@ function startSession(uid, interaction) {
     if (interaction && !interaction.replied && !interaction.deferred) {
         // Ensimmäinen yhteys
     } else if (interaction) {
-        interaction.editReply(`🟢 Connected to **${ip}:${port}** (Auto-move active)` ).catch(() => {});
+        // Occasional Patreon reminder on success
+        if (Math.random() < 0.4) {
+          interaction.editReply({ 
+            content: `🟢 Connected to **${ip}:${port}** (Auto-move active)\n\nHelp us keep AFKBot up by donating through Patreon!`,
+            components: [patreonRow()]
+          }).catch(() => {});
+        } else {
+          interaction.editReply(`🟢 Connected to **${ip}:${port}** (Auto-move active)` ).catch(() => {});
+        }
     }
   });
 
@@ -366,6 +384,14 @@ client.on(Events.InteractionCreate, async (i) => {
 
       if (i.customId === "unlink") {
         unlinkMicrosoft(uid);
+        // Sometimes show Patreon message here
+        if (Math.random() < 0.3) {
+          return i.reply({ 
+            ephemeral: true, 
+            content: "🗑 Microsoft account unlinked for your user.\n\nHelp us keep AFKBot up by donating through Patreon!",
+            components: [patreonRow()]
+          });
+        }
         return i.reply({ ephemeral: true, content: "🗑 Microsoft account unlinked for your user." });
       }
 
@@ -457,11 +483,25 @@ client.on(Events.InteractionCreate, async (i) => {
       if (i.customId === "set_version") {
         u.bedrockVersion = i.values[0];
         save();
+        if (Math.random() < 0.4) {
+          return i.reply({ 
+            ephemeral: true, 
+            content: `Version set to ${u.bedrockVersion}\n\nHelp us keep AFKBot up by donating through Patreon!`,
+            components: [patreonRow()]
+          });
+        }
         return i.reply({ ephemeral: true, content: `Version set to ${u.bedrockVersion}` });
       }
       if (i.customId === "set_conn") {
         u.connectionType = i.values[0];
         save();
+        if (Math.random() < 0.4) {
+          return i.reply({ 
+            ephemeral: true, 
+            content: `Connection set to ${u.connectionType}\n\nHelp us keep AFKBot up by donating through Patreon!`,
+            components: [patreonRow()]
+          });
+        }
         return i.reply({ ephemeral: true, content: `Connection set to ${u.connectionType}` });
       }
     }
@@ -480,6 +520,14 @@ client.on(Events.InteractionCreate, async (i) => {
       if (offline) u.offlineUsername = offline;
       save();
 
+      // Sometimes show Patreon after saving settings
+      if (Math.random() < 0.5) {
+        return i.reply({ 
+          ephemeral: true, 
+          content: `Saved ${ip}:${port}\n\nHelp us keep AFKBot up by donating through Patreon!`,
+          components: [patreonRow()]
+        });
+      }
       return i.reply({ ephemeral: true, content: `Saved ${ip}:${port}` });
     }
 
@@ -497,3 +545,4 @@ process.on("unhandledRejection", (e) => console.error("unhandledRejection:", e))
 process.on("uncaughtException", (e) => console.error("uncaughtException:", e));
 
 client.login(DISCORD_TOKEN);
+
