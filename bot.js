@@ -26,11 +26,10 @@ if (!DISCORD_TOKEN) {
 
 // --- ADMIN CONFIGURATION ---
 // VAIHDA TÄHÄN OMA DISCORD ID:SI
-const ADMIN_IDS = ["1144987924123881564"];
+const ADMIN_IDS = ["YOUR_DISCORD_ID_HERE"];
 const ALLOWED_GUILD_ID = "1462335230345089254";
 
 // ----------------- Storage (Fly.io Volume & Persistence) -----------------
-// Tarkistetaan onko /data volume olemassa, jotta tokenit pysyvät deployn yli
 const DATA = fs.existsSync("/data") ? "/data" : path.join(__dirname, "data");
 const AUTH_ROOT = path.join(DATA, "auth");
 const STORE = path.join(DATA, "users.json");
@@ -119,12 +118,12 @@ function patreonRow() {
     new ButtonBuilder()
       .setLabel("Donate 💸")
       .setStyle(ButtonStyle.Link)
-      .setURL("https://patreon.com/AFKBot396?utm_medium=unknown&utm_source=join_link&utm_campaign=creatorshare_creator&utm_content=copyLink")
+      .setURL("https://www.patreon.com/your_patreon_link")
   );
 }
 
 function shouldShowPatreon() {
-  return Math.random() < 0.7; // ~70% mahdollisuus
+  return Math.random() < 0.7; // ~70% chance
 }
 
 function versionRow(current = "auto") {
@@ -151,7 +150,7 @@ function connRow(current = "online") {
   return new ActionRowBuilder().addComponents(menu);
 }
 
-// ----------------- Admin Panel Logic -----------------
+// ----------------- Admin Panel Logic (Finnish) -----------------
 function buildAdminEmbed() {
     const activeSessions = sessions.size;
     const totalUsersInDb = Object.keys(users).length;
@@ -171,21 +170,22 @@ function buildAdminEmbed() {
     }
 
     return new EmbedBuilder()
-        .setTitle("🛡️ AFKBot Admin Control Panel")
+        .setTitle("🛡️ AFKBot Hallintapaneeli")
+        .setDescription("Reaaliaikainen palvelimen seuranta.")
         .setColor("#ff0000")
         .addFields(
-            { name: "📊 Tilastot", value: `Käyttäjiä: \`${totalUsersInDb}\` | Aktiivisia: \`${activeSessions}\``, inline: false },
-            { name: "🤖 Aktiiviset botit", value: activeBotsText || "Ei tietoja", inline: false }
+            { name: "📊 Globaalit Tilastot", value: `Käyttäjiä tietokannassa: \`${totalUsersInDb}\`\nAktiivisia sessioita: \`${activeSessions}\``, inline: false },
+            { name: "🤖 Aktiiviset Botit", value: activeBotsText || "Ei tietoja", inline: false }
         )
         .setTimestamp()
-        .setFooter({ text: "Päivittyy automaattisesti 30s välein" });
+        .setFooter({ text: "Päivittyy automaattisesti 30 sekunnin välein" });
 }
 
 function buildAdminComponents() {
     const rows = [];
     const buttonRow = new ActionRowBuilder().addComponents(
-        new ButtonBuilder().setCustomId("admin_refresh").setLabel("🔄 Refresh Now").setStyle(ButtonStyle.Secondary),
-        new ButtonBuilder().setCustomId("admin_stop_all").setLabel("☢️ Force Stop All").setStyle(ButtonStyle.Danger)
+        new ButtonBuilder().setCustomId("admin_refresh").setLabel("🔄 Päivitä nyt").setStyle(ButtonStyle.Secondary),
+        new ButtonBuilder().setCustomId("admin_stop_all").setLabel("☢️ Pysäytä kaikki").setStyle(ButtonStyle.Danger)
     );
     rows.push(buttonRow);
 
@@ -193,18 +193,33 @@ function buildAdminComponents() {
         const options = Array.from(sessions.keys()).map(uid => ({
             label: `Pysäytä käyttäjä ${uid}`,
             value: uid,
-            description: `Server: ${sessions.get(uid).client?.options?.host || "unknown"}`
+            description: `IP: ${sessions.get(uid).client?.options?.host || "tuntematon"}`
         }));
+
         const selectMenu = new StringSelectMenuBuilder()
             .setCustomId("admin_stop_user")
             .setPlaceholder("Valitse botti sammutettavaksi")
             .addOptions(options.slice(0, 25));
+
         rows.push(new ActionRowBuilder().addComponents(selectMenu));
     }
+
     return rows;
 }
 
-// ----------------- Microsoft link (EXACT ORIGINAL LOGIC) -----------------
+async function stopAndNotifyAdminAction(uid) {
+    stopSession(uid);
+    try {
+        const user = await client.users.fetch(uid);
+        if (user) {
+            await user.send("Your bot has been stopped by the owner ⚠️").catch(() => {});
+        }
+    } catch (e) {
+        console.error(`DM notification failed for user ${uid}`);
+    }
+}
+
+// ----------------- Microsoft link (Original Logic) -----------------
 async function linkMicrosoft(uid, interaction) {
   if (pendingLink.has(uid)) {
     await interaction.editReply("⏳ Login already in progress. Use the last code.");
@@ -286,7 +301,11 @@ async function startSession(uid, interaction) {
   // Jos sessio on jo käynnissä eikä se ole uudelleenkytkentävaiheessa, estetään tuplakäynnistys
   const existing = sessions.get(uid);
   if (existing && !existing.isReconnecting) {
-    if (interaction && !interaction.replied) interaction.editReply("⚠ You already have a running bot.");
+    if (interaction && !interaction.replied) {
+        // Professional error message for already running bot
+        const msg = "⚠️ **Active Session Detected**\nYour AFK bot is already operational. To restart or change settings, please terminate the current session by tapping the **Stop** button first.";
+        interaction.editReply(msg);
+    }
     return;
   }
 
@@ -392,9 +411,13 @@ async function startSession(uid, interaction) {
   mc.on("error", (e) => {
     clearTimeout(currentSession.timeout);
     let errorMsg = e.message || String(e);
-    if (errorMsg.toLowerCase().includes("timeout") && interaction) {
-        interaction.editReply("⚠️ **Ping Timed Out!** Connection lost, retrying in 30s...").catch(() => {});
+    const isTimeout = errorMsg.toLowerCase().includes("timeout") || errorMsg.toLowerCase().includes("etimedout");
+    
+    if (isTimeout) {
+      console.log(`[${uid}] Connection error: Ping Timed Out.`);
+      if (interaction) interaction.editReply("⚠️ **Ping Timed Out!** Connection was lost, retrying in 30s...").catch(() => {});
     }
+
     if (!currentSession.manualStop) {
         console.log(`[${uid}] Virhe, yritetään uudelleen 30s päästä: ${errorMsg}`);
         handleAutoReconnect(uid, interaction);
@@ -432,9 +455,9 @@ client.on(Events.InteractionCreate, async (i) => {
     if (blocked) return;
     const uid = i.user.id;
 
-    // --- Admin Komento ---
+    // --- Admin Slash-komento ---
     if (i.isChatInputCommand() && i.commandName === "admin") {
-        if (!ADMIN_IDS.includes(uid)) return i.reply({ content: "Pääsy evätty. ⛔", ephemeral: true });
+        if (!ADMIN_IDS.includes(uid)) return i.reply({ content: "Pääsy evätty. Et ole järjestelmänvalvoja. ⛔", ephemeral: true });
         
         await i.deferReply({ ephemeral: false });
         await i.editReply({ embeds: [buildAdminEmbed()], components: buildAdminComponents() });
@@ -447,36 +470,26 @@ client.on(Events.InteractionCreate, async (i) => {
         return;
     }
 
-    // --- Admin Napit & Valikot ---
+    // --- Admin-napit ja alasvetovalikko ---
     if (i.customId?.startsWith("admin_")) {
-        if (!ADMIN_IDS.includes(uid)) return i.reply({ content: "Restricted access. ⛔", ephemeral: true });
+        if (!ADMIN_IDS.includes(uid)) return i.reply({ content: "Pääsy evätty. ⛔", ephemeral: true });
         
         if (i.customId === "admin_refresh") {
             return i.update({ embeds: [buildAdminEmbed()], components: buildAdminComponents() });
         }
         if (i.customId === "admin_stop_all") {
             const uids = Array.from(sessions.keys());
-            for (const id of uids) {
-                stopSession(id);
-                try {
-                    const user = await client.users.fetch(id);
-                    if (user) await user.send("Your bot has been stopped by the owner ⚠️").catch(() => {});
-                } catch {}
-            }
+            for (const id of uids) await stopAndNotifyAdminAction(id);
             return i.update({ embeds: [buildAdminEmbed()], components: buildAdminComponents() });
         }
         if (i.customId === "admin_stop_user") {
             const target = i.values[0];
-            stopSession(target);
-            try {
-                const user = await client.users.fetch(target);
-                if (user) await user.send("Your bot has been stopped by the owner ⚠️").catch(() => {});
-            } catch {}
+            await stopAndNotifyAdminAction(target);
             return i.update({ embeds: [buildAdminEmbed()], components: buildAdminComponents() });
         }
     }
 
-    // --- Paneeli ---
+    // --- Käyttäjän paneeli ---
     if (i.isChatInputCommand() && i.commandName === "panel") {
       return i.reply({ content: "🎛 **Bedrock AFK Panel**", components: panelRow() });
     }
@@ -552,7 +565,7 @@ client.on(Events.InteractionCreate, async (i) => {
       }
     }
 
-    // --- Valikot & Modaalit ---
+    // --- Alasvetovalikot ja Modalit ---
     if (i.isStringSelectMenu()) {
       const u = getUser(uid);
       if (i.customId === "set_version" || i.customId === "set_conn") {
