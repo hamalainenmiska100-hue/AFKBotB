@@ -1,12 +1,3 @@
-/**
- * Bedrock AFK Bot - "Professional Sponsor" Edition
- * - Physics Engine v4 (Inhimillinen liike & painovoima)
- * - Steve Skin (Näkymättömyys-fix)
- * - Automaattinen uudelleenyhdistys (2 min välein)
- * - Dynaaminen kumppanuus/sponsorijärjestelmä
- * - Admin-hallinta lukitulla kanavalla
- */
-
 const {
   Client,
   GatewayIntentBits,
@@ -18,41 +9,23 @@ const {
   ModalBuilder,
   TextInputBuilder,
   TextInputStyle,
-  EmbedBuilder
+  StringSelectMenuBuilder
 } = require("discord.js");
 
 const bedrock = require("bedrock-protocol");
 const { Authflow, Titles } = require("prismarine-auth");
 const fs = require("fs");
 const path = require("path");
-const crypto = require("crypto");
 
-// ----------------- Asetukset -----------------
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
-const ALLOWED_GUILD_ID = "1462335230345089254";
-const ADMIN_CHANNEL_ID = "1464615993320935447";
-const PATREON_URL = "https://patreon.com/AFKBot396";
-
-// ----------------- Kumppanit & Sponsorit -----------------
-// Tähän voit helposti vaihtaa mainokset joista saat rahaa (Affiliate/Sponsorit)
-const PARTNERS = [
-  {
-    text: "🚀 Need a high-end MC Server? Get 25% OFF with code 'AFKBot'!",
-    label: "View Server Hosting",
-    url: "https://patreon.com/AFKBot396" // Lisää tähän affiliate-linkki
-  },
-  {
-    text: "💎 Help us keep AFKBot alive by supporting us on Patreon.",
-    label: "Support on Patreon",
-    url: PATREON_URL
-  }
-];
-
-function getPartner() {
-  return PARTNERS[Math.floor(Math.random() * PARTNERS.length)];
+if (!DISCORD_TOKEN) {
+  console.error("❌ DISCORD_TOKEN missing");
+  process.exit(1);
 }
 
-// ----------------- Tallennus -----------------
+const ALLOWED_GUILD_ID = "1462335230345089254";
+
+// ----------------- Storage -----------------
 const DATA = path.join(__dirname, "data");
 const AUTH_ROOT = path.join(DATA, "auth");
 const STORE = path.join(DATA, "users.json");
@@ -67,7 +40,10 @@ function save() {
 
 function getUser(uid) {
   if (!users[uid]) users[uid] = {};
+  if (!users[uid].delayMs) users[uid].delayMs = 5000;
   if (!users[uid].connectionType) users[uid].connectionType = "online";
+  if (!users[uid].bedrockVersion) users[uid].bedrockVersion = "auto";
+  if (!users[uid].offlineUsername) users[uid].offlineUsername = `AFK_${uid.slice(-4)}`;
   return users[uid];
 }
 
@@ -77,279 +53,447 @@ function getUserAuthDir(uid) {
   return dir;
 }
 
-// ----------------- Runtime Tila -----------------
+function unlinkMicrosoft(uid) {
+  const dir = getUserAuthDir(uid);
+  try { fs.rmSync(dir, { recursive: true, force: true }); } catch {}
+  const u = getUser(uid);
+  u.linked = false;
+  save();
+}
+
+// ----------------- Runtime -----------------
 const sessions = new Map();
 const pendingLink = new Map();
-const client = new Client({ intents: [GatewayIntentBits.Guilds] });
+const lastMsa = new Map();
 
-const lerp = (start, end, amt) => (1 - amt) * start + amt * end;
+// ----------------- Discord client -----------------
+const client = new Client({
+  intents: [GatewayIntentBits.Guilds]
+});
 
-// ----------------- UI-Rakentajat -----------------
+function denyIfWrongGuild(i) {
+  if (!i.inGuild() || i.guildId !== ALLOWED_GUILD_ID) {
+    const msg = "This bot cannot be used in this server ⛔️";
+    if (i.deferred) return i.editReply(msg).catch(() => {});
+    if (i.replied) return i.followUp({ ephemeral: true, content: msg }).catch(() => {});
+    return i.reply({ ephemeral: true, content: msg }).catch(() => {});
+  }
+  return null;
+}
+
+// ----------------- UI helpers -----------------
 function panelRow() {
   return [
     new ActionRowBuilder().addComponents(
       new ButtonBuilder().setCustomId("link").setLabel("🔑 Link Microsoft").setStyle(ButtonStyle.Primary),
-      new ButtonBuilder().setCustomId("unlink").setLabel("🗑 Unlink").setStyle(ButtonStyle.Secondary),
-      new ButtonBuilder().setCustomId("start").setLabel("▶ Start Bot").setStyle(ButtonStyle.Success),
-      new ButtonBuilder().setCustomId("stop").setLabel("⏹ Stop Bot").setStyle(ButtonStyle.Danger),
+      new ButtonBuilder().setCustomId("unlink").setLabel("🗑 Unlink Microsoft").setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId("start").setLabel("▶ Start").setStyle(ButtonStyle.Success),
+      new ButtonBuilder().setCustomId("stop").setLabel("⏹ Stop").setStyle(ButtonStyle.Danger),
       new ButtonBuilder().setCustomId("settings").setLabel("⚙ Settings").setStyle(ButtonStyle.Secondary)
+    ),
+    new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId("more").setLabel("➕ More").setStyle(ButtonStyle.Secondary)
     )
   ];
 }
 
-function partnerRow(p) {
-  return new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setLabel(p.label).setStyle(ButtonStyle.Link).setURL(p.url)
-  );
+function msaComponents(uri) {
+  return [
+    new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setLabel("🌐 Open link").setStyle(ButtonStyle.Link).setURL(uri)
+    )
+  ];
 }
 
-// ----------------- Microsoft Kirjautuminen -----------------
-async function linkMicrosoft(uid, interaction) {
-  if (pendingLink.has(uid)) return interaction.editReply("⏳ Login in progress. Check the previous code.");
-  const authDir = getUserAuthDir(uid);
-  
-  const flow = new Authflow(uid, authDir, {
-    flow: "live",
-    authTitle: Titles.MinecraftNintendoSwitch,
-    deviceType: "Nintendo"
-  }, async (data) => {
-    const uri = data.verification_uri_complete || data.verification_uri;
-    const code = data.user_code;
-    await interaction.editReply({
-      content: `🔐 **Microsoft Login Required**\nURL: ${uri}\nCode: \`${code}\``,
-      components: [new ActionRowBuilder().addComponents(new ButtonBuilder().setLabel("Open Link").setStyle(ButtonStyle.Link).setURL(uri))]
-    }).catch(() => {});
-  });
+function versionRow(current = "auto") {
+  const menu = new StringSelectMenuBuilder()
+    .setCustomId("set_version")
+    .setPlaceholder("🌐 Bedrock Version")
+    .addOptions(
+      { label: "Auto", value: "auto", default: current === "auto" },
+      { label: "1.21.x", value: "1.21.x", default: current === "1.21.x" },
+      { label: "1.20.x", value: "1.20.x", default: current === "1.20.x" },
+      { label: "1.19.x", value: "1.19.x", default: current === "1.19.x" }
+    );
+  return new ActionRowBuilder().addComponents(menu);
+}
 
-  const promise = (async () => {
+function connRow(current = "online") {
+  const menu = new StringSelectMenuBuilder()
+    .setCustomId("set_conn")
+    .setPlaceholder("🔌 Connection Type")
+    .addOptions(
+      { label: "Online (Microsoft)", value: "online", default: current === "online" },
+      { label: "Offline (Cracked)", value: "offline", default: current === "offline" }
+    );
+  return new ActionRowBuilder().addComponents(menu);
+}
+
+// ----------------- Slash commands -----------------
+client.once("ready", async () => {
+  console.log("🟢 Online as", client.user.tag);
+
+  const cmds = [
+    new SlashCommandBuilder().setName("panel").setDescription("Open Bedrock AFK panel")
+  ];
+
+  await client.application.commands.set(cmds);
+});
+
+// ----------------- Microsoft link -----------------
+async function linkMicrosoft(uid, interaction) {
+  if (pendingLink.has(uid)) {
+    await interaction.editReply("⏳ Login already in progress. Use the last code.");
+    return;
+  }
+
+  const authDir = getUserAuthDir(uid);
+  const u = getUser(uid);
+  let codeShown = false;
+
+  const flow = new Authflow(
+    uid,
+    authDir,
+    {
+      flow: "live",
+      authTitle: Titles?.MinecraftNintendoSwitch || "Bedrock AFK Bot",
+      deviceType: "Nintendo"
+    },
+    async (data) => {
+      const uri = data.verification_uri_complete || data.verification_uri || "https://www.microsoft.com/link";
+      const code = data.user_code || "(no code)";
+      lastMsa.set(uid, { uri, code, at: Date.now() });
+      codeShown = true;
+
+      const msg =
+        `🔐 **Microsoft login required**\n\n` +
+        `👉 ${uri}\n\n` +
+        `Your code: \`${code}\`\n\n` +
+        `⚠ **IMPORTANT:** Use a *second* Microsoft account.\n` +
+        `Do **NOT** use the account you normally play with.\n\n` +
+        `Come back here after login.`;
+
+      await interaction.editReply({ content: msg, components: msaComponents(uri) }).catch(() => {});
+    }
+  );
+
+  const p = (async () => {
     try {
+      if (!codeShown) await interaction.editReply("⏳ Requesting Microsoft login code…");
       await flow.getMsaToken();
-      getUser(uid).linked = true;
+      u.linked = true;
       save();
-      await interaction.followUp({ ephemeral: true, content: "✅ Linked successfully! 🥳" });
+      await interaction.followUp({ ephemeral: true, content: "✅ Microsoft account linked!" }).catch(() => {});
     } catch (e) {
-      await interaction.editReply(`❌ Login failed: ${e.message}`);
+      await interaction.editReply(`❌ Microsoft login failed:\n${String(e?.message || e)}`).catch(() => {});
     } finally {
       pendingLink.delete(uid);
     }
   })();
-  pendingLink.set(uid, promise);
+
+  pendingLink.set(uid, p);
 }
 
-// ----------------- Botin Hallinta -----------------
-
-function stopSession(uid) {
+// ----------------- Bedrock session -----------------
+function cleanupSession(uid) {
   const s = sessions.get(uid);
-  if (!s) return false;
-  s.manualStop = true;
-  if (s.physicsLoop) clearInterval(s.physicsLoop);
-  if (s.rejoinTimeout) clearTimeout(s.rejoinTimeout);
+  if (!s) return;
+  if (s.timeout) clearTimeout(s.timeout);
+  if (s.reconnectTimer) clearTimeout(s.reconnectTimer);
   try { s.client.close(); } catch {}
   sessions.delete(uid);
+}
+
+function stopSession(uid) {
+  if (!sessions.get(uid)) return false;
+  const s = sessions.get(uid);
+  s.manualStop = true; // Estää automaattisen rejoinaamisen
+  cleanupSession(uid);
   return true;
 }
 
-function actualConnect(uid, interaction) {
+function startSession(uid, interaction) {
   const u = getUser(uid);
-  const partner = getPartner();
+  if (!u.server) {
+    if (interaction && !interaction.replied) interaction.editReply("⚠ Set settings first.");
+    return;
+  }
   
-  // Välitön palaute käyttäjälle
-  interaction.editReply({
-    content: `⏳ Connecting to server... 🔌\n\n*${partner.text}*`,
-    components: [partnerRow(partner)]
-  }).catch(() => {});
+  // Jos sessio on jo käynnissä eikä se ole uudelleenkytkentävaiheessa, estetään tuplakäynnistys
+  const existing = sessions.get(uid);
+  if (existing && !existing.isReconnecting) {
+    if (interaction && !interaction.replied) interaction.editReply("⚠ You already have a running bot.");
+    return;
+  }
 
-  const mc = bedrock.createClient({
-    host: u.server.ip,
-    port: u.server.port || 19132,
-    profilesFolder: getUserAuthDir(uid),
-    username: uid,
-    offline: u.connectionType === "offline",
-    // --- SKINI-KORJAUS ---
-    skinData: { DeviceOS: 11, DeviceId: crypto.randomUUID(), SkinId: "Standard_Steve", UIProfile: 0 }
-  });
+  const { ip, port } = u.server;
+  const authDir = getUserAuthDir(uid);
 
-  const session = {
-    client: mc, manualStop: false, packetCount: 0, serverInfo: u.server,
-    pos: { x: 0, y: 0, z: 0 }, vel: { x: 0, y: 0, z: 0 },
-    yaw: 0, pitch: 0, targetYaw: 0, targetPitch: 0,
-    isMoving: false, onGround: true, tick: 0, nextThink: 0
+  const opts = {
+    host: ip,
+    port,
+    connectTimeout: 47000,
+    keepAlive: true
   };
-  sessions.set(uid, session);
 
-  mc.on('packet', () => session.packetCount++);
+  if (u.connectionType === "offline") {
+    opts.username = u.offlineUsername || `AFK_${uid.slice(-4)}`;
+    opts.offline = true;
+  } else {
+    opts.username = uid;
+    opts.offline = false;
+    opts.profilesFolder = authDir;
+  }
 
-  mc.on("spawn", () => {
-    const p = getPartner();
-    interaction.editReply({
-      content: `🟢 Connected to **${u.server.ip}** 🎮\n\n*${p.text}*`,
-      components: [partnerRow(p)]
-    }).catch(() => {});
-    
-    if (mc.entity?.position) session.pos = { ...mc.entity.position };
+  const mc = bedrock.createClient(opts);
+  
+  let currentSession = sessions.get(uid);
+  if (!currentSession) {
+    currentSession = { client: mc, timeout: null, startedAt: Date.now(), manualStop: false };
+    sessions.set(uid, currentSession);
+  } else {
+    currentSession.client = mc;
+    currentSession.isReconnecting = false;
+  }
 
-    // --- DIVINE PHYSICS ENGINE v4 (20 TPS) ---
-    session.physicsLoop = setInterval(() => {
-      if (!mc.entityId) return;
-      session.tick++;
+  const waitForEntity = setInterval(() => {
+    if (!mc.entity || !mc.entityId) return;
 
-      // Inhimillinen päätöksenteko
-      if (session.tick >= session.nextThink) {
-        const r = Math.random();
-        if (r < 0.4) {
-          session.isMoving = true;
-          session.targetYaw = (session.targetYaw + (Math.random() * 120 - 60)) % 360;
-          session.nextThink = session.tick + 70 + Math.random() * 100;
-        } else if (r < 0.6) {
-          session.isMoving = false;
-          session.targetPitch = Math.random() * 30 - 15;
-          session.nextThink = session.tick + 100 + Math.random() * 180;
-        } else {
-          session.targetYaw += Math.random() * 20 - 10;
-          session.nextThink = session.tick + 30 + Math.random() * 60;
-        }
-        if (session.isMoving && Math.random() < 0.06 && session.onGround) {
-          session.vel.y = 0.42; session.onGround = false;
-        }
-      }
+    clearInterval(waitForEntity);
 
-      // Kameran sulavuus
-      session.yaw = lerp(session.yaw, session.targetYaw, 0.12);
-      session.pitch = lerp(session.pitch, session.targetPitch, 0.08);
-
-      // Fysiikkalaskenta
-      const friction = session.onGround ? 0.91 : 0.98;
-      if (session.isMoving) {
-        const rad = (session.yaw + 90) * (Math.PI / 180);
-        session.vel.x += Math.cos(rad) * 0.085;
-        session.vel.z += Math.sin(rad) * 0.085;
-      }
-
-      session.vel.y -= 0.08; 
-      session.vel.x *= friction; session.vel.z *= friction; session.vel.y *= 0.98;
-      session.pos.x += session.vel.x; session.pos.y += session.vel.y; session.pos.z += session.vel.z;
-
-      // Maatörmäys
-      const ground = mc.entity?.position?.y || session.pos.y;
-      if (session.pos.y < ground - 0.1) {
-        session.pos.y = ground; session.vel.y = 0; session.onGround = true;
-      }
-
+    let moveToggle = false;
+    const afkInterval = setInterval(() => {
       try {
+        const pos = { ...mc.entity.position };
+        // Liikutetaan bottia hieman eteen tai taakse
+        if (moveToggle) {
+           pos.x += 0.5;
+        } else {
+           pos.x -= 0.5;
+        }
+        moveToggle = !moveToggle;
+
         mc.write("move_player", {
-          runtime_id: mc.entityId, position: session.pos, pitch: session.pitch,
-          yaw: session.yaw, head_yaw: session.yaw, mode: 0, on_ground: session.onGround,
-          ridden_runtime_id: 0, teleport: false
+          runtime_id: mc.entityId,
+          position: pos,
+          pitch: 0,
+          yaw: Math.random() * 360,
+          head_yaw: Math.random() * 360,
+          mode: 0,
+          on_ground: true,
+          ridden_runtime_id: 0,
+          teleport: false
         });
       } catch {}
-    }, 50);
-  });
+    }, 60 * 1000); // Liikkuu minuutin välein
 
-  mc.on("close", () => {
-    if (session.physicsLoop) clearInterval(session.physicsLoop);
-    // Automaattinen uudelleenyhdistys (2 min)
-    if (!session.manualStop) {
-      console.log(`[REJOIN] Bot for ${uid} disconnected. Rejoining in 120s...`);
-      session.rejoinTimeout = setTimeout(() => actualConnect(uid, interaction), 120000);
-    } else {
-      sessions.delete(uid);
+    mc.once("close", () => clearInterval(afkInterval));
+    mc.once("error", () => clearInterval(afkInterval));
+  }, 1000);
+
+  currentSession.timeout = setTimeout(() => {
+    if (sessions.has(uid) && !currentSession.connected) {
+      if (interaction && !interaction.replied) interaction.editReply("❌ Connection error ⛔ (timeout). Retrying in 2min...");
+      mc.close();
+    }
+  }, 47000);
+
+  mc.on("spawn", () => {
+    currentSession.connected = true;
+    clearTimeout(currentSession.timeout);
+    if (interaction && !interaction.replied && !interaction.deferred) {
+        // Ensimmäinen yhteys
+    } else if (interaction) {
+        interaction.editReply(`🟢 Connected to **${ip}:${port}** (Auto-move active)` ).catch(() => {});
     }
   });
 
   mc.on("error", (e) => {
-    const p = getPartner();
-    interaction.editReply({
-      content: `❌ Error: ${e.message}\n\n*${p.text}*`,
-      components: [partnerRow(p)]
-    }).catch(() => {});
-    stopSession(uid);
+    clearTimeout(currentSession.timeout);
+    if (!currentSession.manualStop) {
+        console.log(`[${uid}] Virhe, yritetään uudelleen 2min päästä: ${e.message}`);
+        handleAutoReconnect(uid, interaction);
+    }
+  });
+
+  mc.on("close", () => {
+    clearTimeout(currentSession.timeout);
+    if (!currentSession.manualStop) {
+        console.log(`[${uid}] Yhteys katkesi, yritetään uudelleen 2min päästä.`);
+        handleAutoReconnect(uid, interaction);
+    }
   });
 }
 
-// ----------------- Interactionit -----------------
-client.on(Events.InteractionCreate, async (i) => {
-  const uid = i.user.id;
-  if (i.guildId !== ALLOWED_GUILD_ID) return;
+function handleAutoReconnect(uid, interaction) {
+    const s = sessions.get(uid);
+    if (!s || s.manualStop || s.reconnectTimer) return;
 
-  if (i.isChatInputCommand()) {
-    if (i.commandName === "panel") {
-      const p = getPartner();
-      const embed = new EmbedBuilder()
-        .setTitle("🤖 AFK Bot Control Panel")
-        .setColor(0x5865F2)
-        .setDescription("Manage your AFK sessions here. ✨")
-        .setFooter({ text: p.text });
-
-      return i.reply({ embeds: [embed], components: panelRow() });
-    }
-
-    if (i.commandName === "admin" && i.channelId === ADMIN_CHANNEL_ID) {
-      const sub = i.options.getSubcommand();
-      if (sub === "info") {
-        const mem = process.memoryUsage().rss / 1024 / 1024;
-        let s = ""; sessions.forEach((v, k) => s += `👤 <@${k}> | IP: ${v.serverInfo.ip} | Pkts: ${v.packetCount}\n`);
-        const emb = new EmbedBuilder().setTitle("🖥 Admin Panel").setColor(0x00FF00)
-          .addFields({ name: "🧠 RAM", value: `${mem.toFixed(1)}MB`, inline: true }, { name: "🎮 Active", value: `${sessions.size}`, inline: true })
-          .setDescription(s || "No active bots.");
-        return i.reply({ embeds: [emb] });
-      }
-      if (sub === "stop-all") { sessions.forEach((_, id) => stopSession(id)); return i.reply("🛑 All bots terminated."); }
-    }
-  }
-
-  if (i.isButton()) {
-    if (i.customId === "link") { await i.deferReply({ ephemeral: true }); return linkMicrosoft(uid, i); }
+    s.isReconnecting = true;
+    s.connected = false;
     
-    if (i.customId === "start") {
-      await i.deferReply({ ephemeral: true });
+    s.reconnectTimer = setTimeout(() => {
+        if (sessions.has(uid) && !s.manualStop) {
+            s.reconnectTimer = null;
+            startSession(uid, interaction);
+        }
+    }, 30000);
+}
+
+// ----------------- Interactions -----------------
+client.on(Events.InteractionCreate, async (i) => {
+  try {
+    const blocked = denyIfWrongGuild(i);
+    if (blocked) return;
+
+    const uid = i.user.id;
+
+    if (i.isChatInputCommand()) {
+      if (i.commandName === "panel") {
+        return i.reply({
+          content: "🎛 **Bedrock AFK Panel**",
+          components: panelRow()
+        });
+      }
+    }
+
+    if (i.isButton()) {
+      if (i.customId === "link") {
+        await i.deferReply({ ephemeral: true });
+        await i.editReply("⏳ Requesting Microsoft login…");
+        return linkMicrosoft(uid, i);
+      }
+
+      if (i.customId === "unlink") {
+        unlinkMicrosoft(uid);
+        return i.reply({ ephemeral: true, content: "🗑 Microsoft account unlinked for your user." });
+      }
+
+      if (i.customId === "settings") {
+        const u = getUser(uid);
+        const pre = {
+          ip: u.server?.ip || "",
+          port: u.server?.port || 19132,
+          offlineUsername: u.offlineUsername || ""
+        };
+
+        const modal = new ModalBuilder().setCustomId("settings_modal").setTitle("⚙ Bedrock Settings");
+
+        const ip = new TextInputBuilder()
+          .setCustomId("ip")
+          .setLabel("Server IP")
+          .setStyle(TextInputStyle.Short)
+          .setRequired(true)
+          .setValue(pre.ip);
+
+        const port = new TextInputBuilder()
+          .setCustomId("port")
+          .setLabel("Port (19132)")
+          .setStyle(TextInputStyle.Short)
+          .setRequired(true)
+          .setValue(String(pre.port));
+
+        const offlineUser = new TextInputBuilder()
+          .setCustomId("offline")
+          .setLabel("Offline username (cracked)")
+          .setStyle(TextInputStyle.Short)
+          .setRequired(false)
+          .setValue(pre.offlineUsername);
+
+        modal.addComponents(
+          new ActionRowBuilder().addComponents(ip),
+          new ActionRowBuilder().addComponents(port),
+          new ActionRowBuilder().addComponents(offlineUser)
+        );
+
+        return i.showModal(modal);
+      }
+
+      if (i.customId === "start") {
+        await i.deferReply({ ephemeral: true });
+        await i.editReply("⏳ Connecting…");
+        return startSession(uid, i);
+      }
+
+      if (i.customId === "stop") {
+        const ok = stopSession(uid);
+        if (!ok) return i.reply({ ephemeral: true, content: "No bots running." });
+        return i.reply({ ephemeral: true, content: "⏹ Stopped." });
+      }
+
+      if (i.customId === "more") {
+        const u = getUser(uid);
+        return i.reply({
+          ephemeral: true,
+          content: "➕ **More options**",
+          components: [
+            new ActionRowBuilder().addComponents(
+              new ButtonBuilder().setCustomId("invisible").setLabel("👻 Make bot invisible").setStyle(ButtonStyle.Secondary)
+            ),
+            versionRow(u.bedrockVersion),
+            connRow(u.connectionType)
+          ]
+        });
+      }
+
+      if (i.customId === "invisible") {
+        const s = sessions.get(uid);
+        if (!s) return i.reply({ ephemeral: true, content: "Bot is not running." });
+        try {
+          s.client.write("command_request", {
+            command: "/gamemode survival @s",
+            internal: false,
+            version: 2
+          });
+          return i.reply({ ephemeral: true, content: "Attempted to hide bot." });
+        } catch {
+          return i.reply({ ephemeral: true, content: "Commands not allowed." });
+        }
+      }
+    }
+
+    if (i.isStringSelectMenu()) {
       const u = getUser(uid);
-      if (!u.server?.ip) return i.editReply("❌ Configure server in **Settings** first.");
-      if (u.connectionType === "online" && !u.linked) return i.editReply("❌ **Link Microsoft** account first.");
-      if (sessions.has(uid)) return i.editReply("❌ Bot is already running.");
-      return actualConnect(uid, i);
+      if (i.customId === "set_version") {
+        u.bedrockVersion = i.values[0];
+        save();
+        return i.reply({ ephemeral: true, content: `Version set to ${u.bedrockVersion}` });
+      }
+      if (i.customId === "set_conn") {
+        u.connectionType = i.values[0];
+        save();
+        return i.reply({ ephemeral: true, content: `Connection set to ${u.connectionType}` });
+      }
     }
 
-    if (i.customId === "stop") {
-      const ok = stopSession(uid);
-      const p = getPartner();
-      return i.reply({ 
-        ephemeral: true, 
-        content: ok ? `⏹ Bot stopped.\n\n*${p.text}*` : "❌ No bot running.",
-        components: ok ? [partnerRow(p)] : []
-      });
-    }
+    if (i.isModalSubmit() && i.customId === "settings_modal") {
+      const ip = i.fields.getTextInputValue("ip").trim();
+      const port = parseInt(i.fields.getTextInputValue("port").trim(), 10);
+      const offline = i.fields.getTextInputValue("offline").trim();
 
-    if (i.customId === "unlink") { getUser(uid).linked = false; save(); return i.reply({ ephemeral: true, content: "🗑 Account unlinked." }); }
+      if (!ip || !Number.isFinite(port)) {
+        return i.reply({ ephemeral: true, content: "Bad IP or port." });
+      }
 
-    if (i.customId === "settings") {
       const u = getUser(uid);
-      const mod = new ModalBuilder().setCustomId("sets").setTitle("Server Config");
-      const ip = new TextInputBuilder().setCustomId("ip").setLabel("IP").setStyle(TextInputStyle.Short).setValue(u.server?.ip || "");
-      const port = new TextInputBuilder().setCustomId("port").setLabel("Port").setStyle(TextInputStyle.Short).setValue(String(u.server?.port || 19132));
-      mod.addComponents(new ActionRowBuilder().addComponents(ip), new ActionRowBuilder().addComponents(port));
-      return i.showModal(mod);
-    }
-  }
+      u.server = { ip, port };
+      if (offline) u.offlineUsername = offline;
+      save();
 
-  if (i.isModalSubmit() && i.customId === "sets") {
-    const u = getUser(uid);
-    u.server = { ip: i.fields.getTextInputValue("ip"), port: parseInt(i.fields.getTextInputValue("port")) || 19132 };
-    save();
-    return i.reply({ ephemeral: true, content: "✅ Settings saved! 💾" });
+      return i.reply({ ephemeral: true, content: `Saved ${ip}:${port}` });
+    }
+
+  } catch (e) {
+    console.error("Interaction error:", e);
+    if (!i.replied && !i.deferred) {
+      await i.reply({ ephemeral: true, content: "Internal error." }).catch(() => {});
+    } else if (i.deferred) {
+      await i.editReply("Internal error.").catch(() => {});
+    }
   }
 });
 
-client.once("ready", () => {
-  client.application.commands.set([
-    new SlashCommandBuilder().setName("panel").setDescription("User Panel"),
-    new SlashCommandBuilder().setName("admin").setDescription("Admin Panel")
-      .addSubcommand(s => s.setName("info").setDescription("Stats"))
-      .addSubcommand(s => s.setName("stop-all").setDescription("Kill all"))
-  ]);
-  console.log(`✅ AFKBot Online: ${client.user.tag}`);
-});
-
-process.on("unhandledRejection", e => console.error(e));
+process.on("unhandledRejection", (e) => console.error("unhandledRejection:", e));
+process.on("uncaughtException", (e) => console.error("uncaughtException:", e));
 
 client.login(DISCORD_TOKEN);
-
