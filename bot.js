@@ -17,6 +17,9 @@ const { Authflow, Titles } = require("prismarine-auth");
 const fs = require("fs");
 const path = require("path");
 
+// Tuodaan admin-logiikka
+const adminHandler = require("./admin.js");
+
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
 if (!DISCORD_TOKEN) {
   console.error("❌ DISCORD_TOKEN missing");
@@ -68,8 +71,15 @@ const lastMsa = new Map();
 
 // ----------------- Discord client -----------------
 const client = new Client({
-  intents: [GatewayIntentBits.Guilds]
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.DirectMessages,
+    GatewayIntentBits.GuildMembers
+  ]
 });
+
+// Viedään exportteina admin-paneelia varten
+module.exports = { users, sessions, client, stopSession, startSession, save, getUser };
 
 function denyIfWrongGuild(i) {
   if (!i.inGuild() || i.guildId !== ALLOWED_GUILD_ID) {
@@ -105,17 +115,15 @@ function msaComponents(uri) {
   ];
 }
 
-// Patreon helper function
 function patreonRow() {
   return new ActionRowBuilder().addComponents(
     new ButtonBuilder()
       .setLabel("Donate 💸")
       .setStyle(ButtonStyle.Link)
-      .setURL("https://patreon.com/AFKBot396?utm_medium=unknown&utm_source=join_link&utm_campaign=creatorshare_creator&utm_content=copyLink")
+      .setURL("https://www.patreon.com/your_patreon_link")
   );
 }
 
-// 60-80% chance helper (using 0.7 for ~70%)
 function shouldShowPatreon() {
   return Math.random() < 0.7;
 }
@@ -149,7 +157,8 @@ client.once("ready", async () => {
   console.log("🟢 Online as", client.user.tag);
 
   const cmds = [
-    new SlashCommandBuilder().setName("panel").setDescription("Open Bedrock AFK panel")
+    new SlashCommandBuilder().setName("panel").setDescription("Open Bedrock AFK panel"),
+    new SlashCommandBuilder().setName("admin").setDescription("Open Admin Control Panel")
   ];
 
   await client.application.commands.set(cmds);
@@ -241,7 +250,7 @@ function cleanupSession(uid) {
 function stopSession(uid) {
   if (!sessions.get(uid)) return false;
   const s = sessions.get(uid);
-  s.manualStop = true; // Estää automaattisen rejoinaamisen
+  s.manualStop = true; 
   cleanupSession(uid);
   return true;
 }
@@ -253,7 +262,6 @@ async function startSession(uid, interaction) {
     return;
   }
   
-  // Jos sessio on jo käynnissä eikä se ole uudelleenkytkentävaiheessa, estetään tuplakäynnistys
   const existing = sessions.get(uid);
   if (existing && !existing.isReconnecting) {
     if (interaction && !interaction.replied) interaction.editReply("⚠ You already have a running bot.");
@@ -262,11 +270,9 @@ async function startSession(uid, interaction) {
 
   const { ip, port } = u.server;
 
-  // --- Aternos/Proxy Protection: Ping before connecting ---
   try {
     const pingData = await bedrock.ping({ host: ip, port: port });
     const motd = (pingData.motd || "").toLowerCase();
-    // Jos MOTD sanoo "offline", "starting" tai vastaavaa, älä liity
     if (motd.includes("offline") || motd.includes("starting") || motd.includes("queue")) {
         if (interaction) interaction.editReply(`❌ Server is currently **Offline** or **Starting**. Bot will not join the proxy lobby.`).catch(() => {});
         return;
@@ -277,7 +283,6 @@ async function startSession(uid, interaction) {
   }
 
   const authDir = getUserAuthDir(uid);
-
   const opts = {
     host: ip,
     port,
@@ -314,7 +319,6 @@ async function startSession(uid, interaction) {
     const afkInterval = setInterval(() => {
       try {
         const pos = { ...mc.entity.position };
-        // Liikutetaan bottia hieman eteen tai taakse
         if (moveToggle) {
            pos.x += 0.5;
         } else {
@@ -334,7 +338,7 @@ async function startSession(uid, interaction) {
           teleport: false
         });
       } catch {}
-    }, 60 * 1000); // Liikkuu minuutin välein
+    }, 60 * 1000);
 
     mc.once("close", () => clearInterval(afkInterval));
     mc.once("error", () => clearInterval(afkInterval));
@@ -372,7 +376,6 @@ async function startSession(uid, interaction) {
     }
 
     if (!currentSession.manualStop) {
-        console.log(`[${uid}] Virhe, yritetään uudelleen 30s päästä: ${errorMsg}`);
         handleAutoReconnect(uid, interaction);
     }
   });
@@ -380,7 +383,6 @@ async function startSession(uid, interaction) {
   mc.on("close", () => {
     clearTimeout(currentSession.timeout);
     if (!currentSession.manualStop) {
-        console.log(`[${uid}] Yhteys katkesi, yritetään uudelleen 30s päästä.`);
         handleAutoReconnect(uid, interaction);
     }
   });
@@ -408,6 +410,21 @@ client.on(Events.InteractionCreate, async (i) => {
     if (blocked) return;
 
     const uid = i.user.id;
+
+    // Admin Command delegation
+    if (i.isChatInputCommand() && i.commandName === "admin") {
+        return adminHandler.handleAdminCommand(i);
+    }
+
+    // Admin Button delegation
+    if (i.isButton() && i.customId.startsWith("admin_")) {
+        return adminHandler.handleAdminInteractions(i);
+    }
+
+    // Admin Select delegation
+    if (i.isStringSelectMenu() && i.customId === "admin_stop_user") {
+        return adminHandler.handleAdminInteractions(i);
+    }
 
     if (i.isChatInputCommand()) {
       if (i.commandName === "panel") {
