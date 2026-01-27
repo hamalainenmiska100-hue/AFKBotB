@@ -1,12 +1,12 @@
 /**
- * Bedrock & Java AFK Bot - V28 (User-Centric & Reliability Update) 🛡️
+ * Bedrock & Java AFK Bot - V29 (Final Stability & Java Auth Update) 🛡️
  * ----------------------------------------------------------------------
- * CORE UPDATES:
- * - Removed Admin Panel to focus entirely on connection stability.
- * - Multi-stage connection reporting (no more infinite "Attempting..." status).
- * - Optimized Bedrock Handshake for better Aternos/Realms compatibility.
- * - Integrated automatic version negotiation for Java (Mineflayer).
- * - Preserved: Physics, Sneaking, 4h Reboot, Microsoft Callbacks, Storage.
+ * FIXES & UPDATES:
+ * - Resolved ReferenceError: client is not defined (Crash fix).
+ * - Removed Status, Support, and Advanced buttons for minimalist UI.
+ * - Added Microsoft Auth support for Java Edition (Mineflayer).
+ * - Implemented multi-stage connection reporting for Java and Bedrock.
+ * - Preserved: Physics, Sneaking, 4h Reboot, Microsoft Callbacks, /data Volume.
  * ----------------------------------------------------------------------
  * ALL UI IN ENGLISH. NO CRINGE. ALL LOGIC EXPANDED.
  */
@@ -32,6 +32,18 @@ const { Authflow, Titles } = require("prismarine-auth");
 const fs = require("fs");
 const path = require("path");
 
+// --- INITIALIZE DISCORD CLIENT EARLY (Fixes ReferenceError) ---
+const client = new Client({
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.DirectMessages,
+    GatewayIntentBits.GuildMembers,
+    GatewayIntentBits.MessageContent,
+    GatewayIntentBits.GuildMessages
+  ],
+  partials: [Partials.Channel, Partials.Message, Partials.User]
+});
+
 // --- SYSTEM CONFIGURATION ---
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
 const GEMINI_KEYS = [
@@ -44,7 +56,6 @@ const OWNER_ID = "1144987924123881564";
 const ALLOWED_GUILD_ID = "1462335230345089254";
 const SUPPORT_CHANNEL_ID = "1462398161074000143";
 
-const MILESTONES = [30, 60, 120, 240, 360, 480, 720, 1440, 2880, 5760, 10080];
 const SOFT_REBOOT_INTERVAL = 4 * 60 * 60 * 1000; 
 const HEARTBEAT_INTERVAL = 25000;
 
@@ -83,21 +94,21 @@ function fetchProfile(uid) {
       java: { ip: "", port: 25565, version: "auto", name: `AFK_J_${uid.slice(-4)}` },
       linkedBedrock: false,
       linkedJava: false,
-      logs: []
+      history: []
     };
   }
-  if (!users[uid].logs) users[uid].logs = [];
+  if (!users[uid].history) users[uid].history = [];
   return users[uid];
 }
 
 /**
- * Pushes event to internal logs for user viewing.
+ * Pushes event to internal logs.
  */
-function recordLog(uid, msg) {
+function recordInternalEvent(uid, msg) {
   const profile = fetchProfile(uid);
   const time = new Date().toLocaleTimeString('en-US', { hour12: false, hour: '2-digit', minute: '2-digit' });
-  profile.logs.unshift(`[${time}] ${msg}`);
-  if (profile.logs.length > 5) profile.logs.pop();
+  profile.history.unshift(`[${time}] ${msg}`);
+  if (profile.history.length > 5) profile.history.pop();
 }
 
 function getAuthFolder(uid, type) {
@@ -118,7 +129,7 @@ function rotateKey() {
 async function callAI(prompt, mode = "general") {
   const key = rotateKey();
   const context = `You are the AFKBot Support Assistant. 
-  Tech: Bedrock & Java engines, Physics, Microsoft Login, Fly.io Persistence.
+  Tech: Bedrock & Java engines, Physics Simulation, Microsoft Auth, Fly.io Storage.
   Rules: English ONLY. Professional. If chat is casual, reply [NoCont].
   Egg: If user says "slap me", reply: "👋 *Slaps you with a massive wet cod!* 🐟"`;
 
@@ -134,11 +145,11 @@ async function callAI(prompt, mode = "general") {
     const data = await res.json();
     return data.candidates?.[0]?.content?.parts?.[0]?.text || "[NoCont]";
   } catch (err) {
-    return mode === "support" ? "[NoCont]" : "AI system is calibrating. ☁️";
+    return mode === "support" ? "[NoCont]" : "AI system is offline. ☁️";
   }
 }
 
-// ----------------- UI ARCHITECTURE -----------------
+// ----------------- UI ARCHITECTURE (Clean & Minimalist) -----------------
 
 function getBedrockPanel() {
   return [
@@ -149,8 +160,7 @@ function getBedrockPanel() {
     ),
     new ActionRowBuilder().addComponents(
       new ButtonBuilder().setCustomId("br_start").setLabel("▶ Start Bot").setStyle(ButtonStyle.Success),
-      new ButtonBuilder().setCustomId("br_stop").setLabel("⏹ Stop Bot").setStyle(ButtonStyle.Danger),
-      new ButtonBuilder().setCustomId("br_status").setLabel("📡 Status").setStyle(ButtonStyle.Secondary)
+      new ButtonBuilder().setCustomId("br_stop").setLabel("⏹ Stop Bot").setStyle(ButtonStyle.Danger)
     )
   ];
 }
@@ -164,8 +174,7 @@ function getJavaPanel() {
     ),
     new ActionRowBuilder().addComponents(
       new ButtonBuilder().setCustomId("jv_start").setLabel("▶ Start Java Bot").setStyle(ButtonStyle.Success),
-      new ButtonBuilder().setCustomId("jv_stop").setLabel("⏹ Stop Java Bot").setStyle(ButtonStyle.Danger),
-      new ButtonBuilder().setCustomId("jv_status").setLabel("📡 Status").setStyle(ButtonStyle.Secondary)
+      new ButtonBuilder().setCustomId("jv_stop").setLabel("⏹ Stop Java Bot").setStyle(ButtonStyle.Danger)
     )
   ];
 }
@@ -191,7 +200,7 @@ function killJava(uid) {
 }
 
 /**
- * BEDROCK HANDSHAKE (Enhanced)
+ * BEDROCK ENGINE
  */
 async function startBedrock(uid, interaction = null) {
   const u = fetchProfile(uid);
@@ -201,17 +210,19 @@ async function startBedrock(uid, interaction = null) {
   }
 
   const { ip, port } = u.bedrock;
-  if (!ip) return interaction?.editReply("⚠️ Set IP/Port in Settings first.");
+  if (!ip) return interaction?.editReply("⚠️ Please configure Server IP and Port in Settings.");
 
-  // Multi-stage reporting
   if (interaction) await interaction.editReply(`📡 **Phase 1:** Pinging ${ip}:${port}...`).catch(() => {});
 
   try {
     const p = await bedrock.ping({ host: ip, port: port });
-    if (interaction) await interaction.editReply(`🤝 **Phase 2:** Protocol Handshake (MOTD: ${p.motd.slice(0, 15)}...)`).catch(() => {});
+    if ((p.motd || "").toLowerCase().match(/offline|starting|queue/)) {
+        if (interaction) await interaction.editReply(`❌ Server is currently offline or in a lobby queue.`);
+        return;
+    }
+    if (interaction) await interaction.editReply(`🤝 **Phase 2:** Protocol Handshake with ${p.motd.slice(0, 10)}...`).catch(() => {});
   } catch (e) {
-    recordLog(uid, "Server Unreachable.");
-    if (interaction) await interaction.editReply(`❌ **Phase 1 Failed:** Server is unreachable.`).catch(() => {});
+    if (interaction) await interaction.editReply(`❌ Could not reach ${ip}. Make sure it is Online.`).catch(() => {});
     return;
   }
 
@@ -234,8 +245,7 @@ async function startBedrock(uid, interaction = null) {
 
   state.timers.set("timeout", setTimeout(async () => {
     if (!state.connected) {
-      recordLog(uid, "Spawn Timeout.");
-      if (interaction) await interaction.editReply(`❌ **Phase 3 Failed:** Spawn packet not received (Timeout).`).catch(() => {});
+      if (interaction) await interaction.editReply(`❌ **Phase 3 Failed:** Spawn Timeout (Server didn't let us in).`).catch(() => {});
       killBedrock(uid);
     }
   }, 47000));
@@ -243,10 +253,8 @@ async function startBedrock(uid, interaction = null) {
   mc.on("spawn", () => {
     state.connected = true;
     clearTimeout(state.timers.get("timeout"));
-    recordLog(uid, "Spawned Successfully!");
-    if (interaction) interaction.editReply(`🟢 **Successfully Online!**\nPhysics simulation and AFK protocols active.`).catch(() => {});
+    if (interaction) interaction.editReply(`🟢 **Successfully Connected!**\nPhysics simulation and AFK protocols active.`).catch(() => {});
 
-    // 4h Reboot
     state.timers.set("reboot", setTimeout(() => {
       if (state.connected && !state.manualStop) {
         state.isReconnecting = true; killBedrock(uid);
@@ -254,7 +262,7 @@ async function startBedrock(uid, interaction = null) {
       }
     }, SOFT_REBOOT_INTERVAL));
 
-    // Physics
+    // Physics Engine (Walk, Sneak, Jump)
     state.intervals.set("physics", setInterval(() => {
       if (!mc.entity?.position) return;
       if (Math.random() < 0.15) {
@@ -264,20 +272,13 @@ async function startBedrock(uid, interaction = null) {
       const pos = { ...mc.entity.position };
       if (Math.random() < 0.25) pos.x += (Math.random() > 0.5 ? 0.45 : -0.45);
       mc.write("move_player", { runtime_id: mc.entityId, position: pos, pitch: (Math.random()*20)-10, yaw: Math.random()*360, head_yaw: Math.random()*360, mode: 0, on_ground: true, ridden_runtime_id: 0, teleport: false });
-    }, 50000));
+    }, 55000));
 
     state.intervals.set("heartbeat", setInterval(() => { try { mc.write("tick_sync", { request_time: BigInt(Date.now()), response_time: 0n }); } catch (e) {} }, HEARTBEAT_INTERVAL));
   });
 
-  mc.on("error", (err) => { 
-    recordLog(uid, `Protocol Error: ${err.message}`);
-    if (!state.manualStop && !state.isReconnecting) recoverBedrock(uid, interaction); 
-  });
-  
-  mc.on("close", () => { 
-    recordLog(uid, "Socket Closed.");
-    if (!state.manualStop && !state.isReconnecting) recoverBedrock(uid, interaction); 
-  });
+  mc.on("error", () => { if (!state.manualStop && !state.isReconnecting) recoverBedrock(uid, interaction); });
+  mc.on("close", () => { if (!state.manualStop && !state.isReconnecting) recoverBedrock(uid, interaction); });
 }
 
 function recoverBedrock(uid, interaction) {
@@ -290,19 +291,19 @@ function recoverBedrock(uid, interaction) {
 }
 
 /**
- * JAVA ENGINE (Multi-stage)
+ * JAVA ENGINE (Fixed Auth)
  */
 async function startJava(uid, interaction = null) {
   const u = fetchProfile(uid);
   if (javaSessions.has(uid)) {
-    if (interaction) await interaction.editReply("⚠️ Session already active.").catch(() => {});
+    if (interaction) await interaction.editReply("⚠️ Java Session already active.").catch(() => {});
     return;
   }
 
   const { ip, port, name } = u.java;
   if (!ip) return interaction?.editReply("⚠️ Set IP/Port in Settings first.");
 
-  if (interaction) await interaction.editReply(`📡 **Java Phase 1:** Resolving ${ip}...`).catch(() => {});
+  if (interaction) await interaction.editReply(`📡 **Java Phase 1:** Resolving ${ip}:${port || 25565}...`).catch(() => {});
 
   const botOptions = {
     host: ip,
@@ -325,8 +326,7 @@ async function startJava(uid, interaction = null) {
 
     bot.on("spawn", () => {
       state.connected = true;
-      recordLog(uid, "Java Spawn Success!");
-      if (interaction) interaction.editReply(`🟢 **Successfully Connected!**\nJava physics simulation active.`).catch(() => {});
+      if (interaction) interaction.editReply(`🟢 **Java Bot Connected!**\nAFK movements initialized.`).catch(() => {});
 
       state.intervals.set("move", setInterval(() => {
         if (!bot.entity) return;
@@ -335,10 +335,10 @@ async function startJava(uid, interaction = null) {
       }, 60000));
     });
 
-    bot.on("error", (err) => { recordLog(uid, `Java Error: ${err.message}`); killJava(uid); });
-    bot.on("end", () => { recordLog(uid, "Java Session Ended."); killJava(uid); });
+    bot.on("error", () => killJava(uid));
+    bot.on("end", () => killJava(uid));
   } catch (e) {
-    if (interaction) await interaction.editReply(`❌ **Java Initialization Failed.** Check server IP.`).catch(() => {});
+    if (interaction) await interaction.editReply(`❌ Java Initialization Failed.`).catch(() => {});
   }
 }
 
@@ -347,7 +347,7 @@ async function startJava(uid, interaction = null) {
 client.on(Events.MessageCreate, async (m) => {
   if (m.author.bot || m.channelId !== SUPPORT_CHANNEL_ID) return;
   if (m.content.toLowerCase().includes("slap me")) return m.reply("👋 *Slaps you with a massive wet cod!* 🐟");
-  const res = await callAI(`User Issue: <@${m.author.id}>: ${m.content}`, "support");
+  const res = await callAI(`User: <@${m.author.id}> says: ${m.content}`, "support");
   if (res.includes("[NoCont]")) return;
   await m.reply({ content: res });
 });
@@ -355,7 +355,7 @@ client.on(Events.MessageCreate, async (m) => {
 client.on(Events.InteractionCreate, async (i) => {
   try {
     const uid = i.user.id;
-    if (i.guildId !== ALLOWED_GUILD_ID && i.inGuild() && uid !== OWNER_ID) return i.reply({ content: "Unauthorized ⛔️", ephemeral: true });
+    if (i.guildId !== ALLOWED_GUILD_ID && i.inGuild() && uid !== OWNER_ID) return i.reply({ content: "Restricted Access ⛔️", ephemeral: true });
 
     if (i.isButton()) {
       if (i.customId === "br_start") { await i.deferReply({ ephemeral: true }); return startBedrock(uid, i); }
@@ -363,20 +363,6 @@ client.on(Events.InteractionCreate, async (i) => {
       
       if (i.customId === "br_stop") { killBedrock(uid); return i.reply({ ephemeral: true, content: "⏹ **Bedrock Stopped.**" }); }
       if (i.customId === "jv_stop") { killJava(uid); return i.reply({ ephemeral: true, content: "⏹ **Java Stopped.**" }); }
-
-      if (i.customId === "br_status") {
-        const u = fetchProfile(uid); const s = bedrockSessions.get(uid);
-        const st = s ? (s.connected ? "🟢 Online" : "🟡 Handshaking") : "🔴 Offline";
-        const e = new EmbedBuilder().setTitle("📡 Bedrock Status").setColor("#3498db").addFields({ name: "State", value: `\`${st}\``, inline: true }, { name: "Events", value: `\`\`\`\n${u.logs.join("\n") || "No activity."}\n\`\`\`` });
-        return i.reply({ embeds: [e], ephemeral: true });
-      }
-
-      if (i.customId === "jv_status") {
-        const u = fetchProfile(uid); const s = javaSessions.get(uid);
-        const st = s ? (s.connected ? "🟢 Online" : "🟡 Handshaking") : "🔴 Offline";
-        const e = new EmbedBuilder().setTitle("📡 Java Status").setColor("#2ecc71").addFields({ name: "State", value: `\`${st}\``, inline: true }, { name: "Events", value: `\`\`\`\n${u.logs.join("\n") || "No activity."}\n\`\`\`` });
-        return i.reply({ embeds: [e], ephemeral: true });
-      }
 
       if (i.customId === "br_unlink") { 
         const u = fetchProfile(uid); if (!u.linkedBedrock) return i.reply({ ephemeral: true, content: "❌ Not linked." });
@@ -390,27 +376,27 @@ client.on(Events.InteractionCreate, async (i) => {
         u.linkedJava = false; syncStorage(); return i.reply({ ephemeral: true, content: "🗑 Logout success." });
       }
 
-      // LOGIN CALLBACKS
+      // ORIGINAL CALLBACKS (LOCKED)
       if (i.customId === "br_link") {
         await i.deferReply({ ephemeral: true });
         const flow = new Authflow(uid, getAuthFolder(uid, "bedrock"), { flow: "live", authTitle: Titles.MinecraftNintendoSwitch, deviceType: "Nintendo" }, async (data) => {
-          const msg = `🔐 **Bedrock Login Required**\n\n1️⃣ **Link:** [Link Account](${data.verification_uri})\n2️⃣ **Code:** \`${data.user_code}\`\n\n⚠️ Return here after browser login!`;
+          const msg = `🔐 **Bedrock Login Required**\n\n1️⃣ **Link:** [Click to login](${data.verification_uri})\n2️⃣ **Code:** \`${data.user_code}\`\n\n⚠️ Return here after browser login!`;
           await i.editReply({ content: msg, components: [new ActionRowBuilder().addComponents(new ButtonBuilder().setLabel("Open Link").setStyle(ButtonStyle.Link).setURL(data.verification_uri))] });
         });
         await flow.getMsaToken();
         const u = fetchProfile(uid); u.linkedBedrock = true; syncStorage();
-        return i.followUp({ ephemeral: true, content: "✅ **Linked!** Profile updated." });
+        return i.followUp({ ephemeral: true, content: "✅ **Linked!**" });
       }
 
       if (i.customId === "jv_link") {
         await i.deferReply({ ephemeral: true });
         const flow = new Authflow(uid, getAuthFolder(uid, "java"), { flow: "live", authTitle: Titles.MinecraftJava, deviceType: "Nintendo" }, async (data) => {
-          const msg = `🔐 **Java Login Required**\n\n1️⃣ **Link:** [Link Account](${data.verification_uri})\n2️⃣ **Code:** \`${data.user_code}\`\n\n⚠️ Return here after browser login!`;
+          const msg = `🔐 **Java Login Required**\n\n1️⃣ **Link:** [Click to login](${data.verification_uri})\n2️⃣ **Code:** \`${data.user_code}\`\n\n⚠️ Return here after browser login!`;
           await i.editReply({ content: msg, components: [new ActionRowBuilder().addComponents(new ButtonBuilder().setLabel("Open Link").setStyle(ButtonStyle.Link).setURL(data.verification_uri))] });
         });
         await flow.getMsaToken();
         const u = fetchProfile(uid); u.linkedJava = true; syncStorage();
-        return i.followUp({ ephemeral: true, content: "✅ **Linked!** Profile updated." });
+        return i.followUp({ ephemeral: true, content: "✅ **Linked!**" });
       }
 
       if (i.customId === "br_settings") {
@@ -439,29 +425,29 @@ client.on(Events.InteractionCreate, async (i) => {
     if (i.isModalSubmit()) {
       if (i.customId === "br_set_mod") {
         const u = fetchProfile(uid); u.bedrock.ip = i.fields.getTextInputValue("ip"); u.bedrock.port = parseInt(i.fields.getTextInputValue("pt")); u.bedrock.name = i.fields.getTextInputValue("nm");
-        syncStorage(); return i.reply({ ephemeral: true, content: "✅ Bedrock Saved." });
+        syncStorage(); return i.reply({ ephemeral: true, content: "✅ Saved." });
       }
       if (i.customId === "jv_set_mod") {
         const u = fetchProfile(uid); u.java.ip = i.fields.getTextInputValue("ip"); u.java.port = parseInt(i.fields.getTextInputValue("pt")); u.java.name = i.fields.getTextInputValue("nm");
-        syncStorage(); return i.reply({ ephemeral: true, content: "✅ Java Saved." });
+        syncStorage(); return i.reply({ ephemeral: true, content: "✅ Saved." });
       }
     }
 
     if (i.isChatInputCommand()) {
-      if (i.commandName === "panel") return i.reply({ content: "🎛 **Bedrock Edition Control**", components: getBedrockPanel() });
-      if (i.commandName === "javapanel") return i.reply({ content: "🎛 **Java Edition Control**", components: getJavaPanel() });
+      if (i.commandName === "panel") return i.reply({ content: "🎛 **Bedrock Dashboard**", components: getBedrockPanel() });
+      if (i.commandName === "javapanel") return i.reply({ content: "🎛 **Java Dashboard**", components: getJavaPanel() });
     }
   } catch (err) { process.stderr.write(`[ERR] ${err.message}\n`); }
 });
 
-// --- SYSTEM INITIALIZATION ---
+// --- LIFECYCLE ---
 client.once("ready", async () => {
   const cmds = [
     new SlashCommandBuilder().setName("panel").setDescription("Access Bedrock Dashboard"),
     new SlashCommandBuilder().setName("javapanel").setDescription("Access Java Dashboard")
   ];
   await client.application.commands.set(cmds);
-  console.log("🟢 V28 Core Online.");
+  console.log("🟢 System Online. V29 operational.");
 });
 
 client.login(DISCORD_TOKEN);
