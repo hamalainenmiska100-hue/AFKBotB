@@ -1,10 +1,23 @@
 app = "afkbot"
-primary_region = "arn"
-[build]
+primary_region = "ams"
+[processes]
+Ajetaan molemmat prosessit rinnakkain
+api = "node api.js"
+bot = "node bot.js"
+[http_service]
+internal_port = 3000
+force_https = true
+auto_stop_machines = false
+auto_start_machines = true
+min_machines_running = 1
+processes = ["api"]
 [[mounts]]
 source = "bot_data"
 destination = "/app/data"
-[vm]
+[env]
+API_PORT = "3000"
+NODE_ENV = "production"
+[[vm]]
 cpu_kind = "shared"
-cpus = 1
+cpus = 3
 memory_mb = 1024
