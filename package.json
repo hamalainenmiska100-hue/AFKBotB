@@ -1,18 +1,21 @@
 {
-  "name": "bedrock-java-afk-bot",
-  "version": "25.0.0",
-  "description": "Ultimate AFK bot for Bedrock and Java Edition with Physics and Persistence",
-  "main": "bot.js",
-  "dependencies": {
-    "discord.js": "^14.14.1",
-    "bedrock-protocol": "^3.26.0",
-    "mineflayer": "^4.20.0",
-    "prismarine-auth": "^2.3.0",
-    "fs": "^0.0.1-security",
-    "path": "^0.12.7"
-  },
-  "scripts": {
-    "start": "node bot.js"
-  }
+"name": "bedrock-java-afk-bot",
+"version": "25.0.0",
+"description": "Ultimate AFK bot for Bedrock and Java Edition with Physics and Persistence",
+"main": "bot.js",
+"dependencies": {
+"discord.js": "^14.14.1",
+"bedrock-protocol": "^3.26.0",
+"mineflayer": "^4.20.0",
+"prismarine-auth": "^2.3.0",
+"express": "^4.18.2",
+"cors": "^2.8.5",
+"body-parser": "^1.20.2",
+"fs": "^0.0.1-security",
+"path": "^0.12.7"
+},
+"scripts": {
+"start": "node bot.js",
+"api": "node api.js"
 }
-
+}
