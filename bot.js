@@ -15,6 +15,7 @@ const {
 
 const bedrock = require("bedrock-protocol");
 const mineflayer = require("mineflayer");
+// Tärkeää: Titles pitää tuoda prismarine-authista
 const { Authflow, Titles } = require("prismarine-auth");
 const fs = require("fs");
 const path = require("path");
@@ -207,7 +208,7 @@ function javaPanelRow() {
     ];
 }
 
-function technicalMenuRow(type) { // type = 'bedrock' or 'java'
+function technicalMenuRow(type) {
     const menu = new StringSelectMenuBuilder()
         .setCustomId(type === 'bedrock' ? "tech_actions" : "java_tech_actions")
         .setPlaceholder("🛠 Select Technical Action")
@@ -217,6 +218,53 @@ function technicalMenuRow(type) { // type = 'bedrock' or 'java'
             { label: "Force Reconnect", value: "reconnect", description: "Forcefully restart the session" }
         );
     return new ActionRowBuilder().addComponents(menu);
+}
+
+// ----------------- AUTHENTICATION LOGIC (RESTORED) -----------------
+
+async function linkMicrosoft(uid, interaction) {
+  if (pendingLink.has(uid)) {
+    return safeReply(interaction, "⏳ Login is already in progress. Check previous messages.");
+  }
+
+  const authDir = getUserAuthDir(uid);
+  const u = getUser(uid);
+  
+  // ALKUPERÄINEN TOIMIVA AUTHFLOW
+  // Titles.MinecraftNintendoSwitch on tärkeä "device code" -virheen välttämiseksi
+  const flow = new Authflow(uid, authDir, {
+    flow: "live",
+    authTitle: Titles.MinecraftNintendoSwitch,
+    deviceType: "Nintendo" 
+  }, async (data) => {
+    // Callback kun koodi saadaan
+    const uri = data.verification_uri_complete || data.verification_uri || "https://www.microsoft.com/link";
+    const code = data.user_code;
+    
+    const content = `🔐 **Microsoft Account Linking**\n\n1. Visit: [Microsoft Link](${uri})\n2. Enter code: \`${code}\`\n\n*Follow the steps on the website and return here.*`;
+    
+    // Nappi helpottamaan mobiilikäyttöä
+    const row = new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setLabel("🌐 Open Login Page").setStyle(ButtonStyle.Link).setURL(uri)
+    );
+
+    await safeReply(interaction, { content: content, components: [row], ephemeral: true });
+  });
+
+  const p = (async () => {
+    try {
+      await flow.getMsaToken();
+      u.linked = true;
+      save();
+      await interaction.followUp({ ephemeral: true, content: "✅ **Microsoft account linked successfully!**" }).catch(() => {});
+    } catch (e) {
+      console.error("Link Error:", e);
+      await safeReply(interaction, `❌ **Login failed:** ${e.message}`);
+    } finally {
+      pendingLink.delete(uid);
+    }
+  })();
+  pendingLink.set(uid, p);
 }
 
 // ----------------- BEDROCK LOGIC -----------------
@@ -244,6 +292,10 @@ async function startSession(uid, interaction) {
     opts.username = u.offlineUsername || `AFK_${uid.slice(-4)}`;
     opts.offline = true;
   } else {
+    // Tarkista onko käyttäjä linkittänyt tilin
+    if (!u.linked) {
+        return safeReply(interaction, "❌ **Account not linked!** Use 'Link Xbox' first or switch to offline mode in options.");
+    }
     opts.username = uid;
     opts.offline = false;
     opts.profilesFolder = authDir;
@@ -268,7 +320,7 @@ function createBedrockClient(uid, opts, interaction = null) {
       startedAt: Date.now(), 
       manualStop: false, 
       connected: false, 
-      opts: opts, // Save opts for reconnection
+      opts: opts, 
       pos: { x: 0, y: 0, z: 0 },
       afkInterval: null
     };
@@ -306,7 +358,6 @@ function createBedrockClient(uid, opts, interaction = null) {
     if (currentSession.afkInterval) clearInterval(currentSession.afkInterval);
     
     if (!currentSession.manualStop) {
-        // Auto Reconnect Logic
         console.log(`[Bedrock] Disconnected ${uid}. Reconnecting in 30s...`);
         setTimeout(() => {
             if (sessions.has(uid) && !sessions.get(uid).manualStop) {
@@ -323,7 +374,7 @@ function createBedrockClient(uid, opts, interaction = null) {
   mc.on("error", (e) => console.log(`[Bedrock Error] ${e.message}`));
 }
 
-// ----------------- JAVA LOGIC -----------------
+// ----------------- JAVA LOGIC (OFFLINE ONLY) -----------------
 
 async function startJavaSession(uid, interaction) {
     const u = getUser(uid);
@@ -340,7 +391,7 @@ async function startJavaSession(uid, interaction) {
         host: ip,
         port: port,
         username: j.offlineUsername || `Java_${uid.slice(-4)}`,
-        auth: 'offline', // STRICTLY OFFLINE
+        auth: 'offline', // FORCED OFFLINE
         version: false
     };
 
@@ -448,7 +499,7 @@ client.on(Events.InteractionCreate, async (i) => {
           const s = sessions.get(uid); 
           if (!s) return i.reply({ content: "❌ **No bots running on your account.**", ephemeral: true });
           s.manualStop = true; 
-          s.client.close(); // Triggers close event which handles cleanup
+          s.client.close(); 
           return i.reply({ ephemeral: true, content: "⏹ **Stopping Bedrock Bot...**" }); 
       }
 
@@ -590,31 +641,6 @@ client.on(Events.InteractionCreate, async (i) => {
 
   } catch (e) { console.error("Interaction Error:", e); }
 });
-
-// --- AUTH HELPER (Bedrock) ---
-async function linkMicrosoft(uid, interaction) {
-  if (pendingLink.has(uid)) return safeReply(interaction, "⏳ Login in progress.");
-  const authDir = getUserAuthDir(uid);
-  const u = getUser(uid);
-  
-  const flow = new Authflow(uid, authDir, { flow: "live", authTitle: "Bedrock Bot", deviceType: "Nintendo" }, async (data) => {
-    const uri = data.verification_uri_complete || data.verification_uri;
-    const content = `🔐 **Microsoft Link:** [Click Here](${uri})\nCode: \`${data.user_code}\``;
-    await safeReply(interaction, { content: content, ephemeral: true });
-  });
-
-  const p = (async () => {
-    try {
-      await flow.getMsaToken();
-      u.linked = true;
-      save();
-      await interaction.followUp({ ephemeral: true, content: "✅ Linked!" });
-    } catch (e) {
-      await safeReply(interaction, `❌ Failed: ${e.message}`);
-    } finally { pendingLink.delete(uid); }
-  })();
-  pendingLink.set(uid, p);
-}
 
 client.once("ready", async () => {
   console.log(`🟢 System Online: ${client.user.tag}`);
