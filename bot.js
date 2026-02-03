@@ -184,26 +184,41 @@ async function linkMicrosoft(uid, interaction) {
   pendingLink.set(uid, p);
 }
 
-function startSession(uid, interaction) {
+async function startSession(uid, interaction) {
   const u = getUser(uid);
   if (!u.server) {
     if (interaction && !interaction.replied) safeReply(interaction, "⚠ Set settings first.");
     return;
   }
   
-  // Check if session is already running and not in reconnection phase
   const existing = sessions.get(uid);
   if (existing && !existing.isReconnecting) {
-    if (interaction && !interaction.replied) safeReply(interaction, "❌ **Bot already running for your account!** Stop the current bot before starting a new one.");
+    if (interaction && !interaction.replied) safeReply(interaction, "❌ **Bot already running!** Stop it first.");
     return;
   }
 
   const { ip, port } = u.server;
   const authDir = getUserAuthDir(uid);
 
-  // Immediate UI feedback
-  if (interaction) safeReply(interaction, `⏳ **Connecting to ${ip}:${port}...**`);
+  // --- 1. PRE-FLIGHT CHECK (MOTD/PING) ---
+  if (interaction) safeReply(interaction, `🔍 **Pinging server ${ip}:${port}...**`);
+  
+  try {
+    const pong = await bedrock.ping({ host: ip, port: port, timeout: 5000 }); // 5s timeout
+    const motdClean = (typeof pong.motd === 'string' ? pong.motd : pong.motd?.toString() || "No MOTD").replace(/§[0-9a-fk-or]/g, ""); // Strip colors
+    
+    if (interaction) {
+        await safeReply(interaction, `✅ **Server Online!**\n> **MOTD:** ${motdClean}\n> **Ver:** ${pong.version || "?"}\n> **Players:** ${pong.playersOnline}/${pong.playersMax}\n\n🚀 Connecting bot...`);
+    }
+  } catch (pingErr) {
+    console.error(`Ping failed for ${uid}:`, pingErr.message);
+    if (interaction) {
+        return safeReply(interaction, `🛑 **Connection Cancelled: Server Unreachable**\nServer did not respond to ping.\nReason: \`${pingErr.message}\`\n\n*Check IP/Port or if server is booting.*`);
+    }
+    return; // STOP execution here if ping fails
+  }
 
+  // --- 2. START CONNECTION ---
   const opts = {
     host: ip,
     port,
@@ -221,7 +236,14 @@ function startSession(uid, interaction) {
     opts.profilesFolder = authDir;
   }
 
-  const mc = bedrock.createClient(opts);
+  // Error trapping for creation phase
+  let mc;
+  try {
+      mc = bedrock.createClient(opts);
+  } catch (creationErr) {
+      if (interaction) safeReply(interaction, `❌ **Client Creation Error:** ${creationErr.message}`);
+      return;
+  }
   
   let currentSession = sessions.get(uid);
   if (!currentSession) {
@@ -231,6 +253,7 @@ function startSession(uid, interaction) {
       startedAt: Date.now(), 
       manualStop: false, 
       connected: false, 
+      hasSpawned: false, // New flag for connection success
       isReconnecting: false,
       pos: { x: 0, y: 0, z: 0 },
       afkInterval: null,
@@ -240,6 +263,7 @@ function startSession(uid, interaction) {
   } else {
     currentSession.client = mc;
     currentSession.isReconnecting = false;
+    currentSession.hasSpawned = false; // Reset on reconnect
   }
 
   // Authority & Position Sync
@@ -265,7 +289,6 @@ function startSession(uid, interaction) {
         currentSession.pos.x += offset;
         currentSession.pos.z += offset;
 
-        // Sync with both Move and Auth Input packets
         mc.write("move_player", {
           runtime_id: mc.entityId,
           position: currentSession.pos,
@@ -286,30 +309,47 @@ function startSession(uid, interaction) {
 
   currentSession.timeout = setTimeout(() => {
     if (sessions.has(uid) && !currentSession.connected) {
-      if (interaction) safeReply(interaction, `❌ **Connection Timeout** at ${ip}:${port}. Retrying in 30s...`);
-      mc.close();
+      if (interaction) safeReply(interaction, `❌ **Connection Timeout** at ${ip}:${port}.`);
+      // Use manualStop = true here to prevent auto-reconnect loop on timeout
+      currentSession.manualStop = true;
+      cleanupSession(uid);
     }
   }, 47000);
 
   mc.on("spawn", () => {
     currentSession.connected = true;
+    currentSession.hasSpawned = true; // Mark as successfully entered world
     clearTimeout(currentSession.timeout);
     if (interaction) {
-        safeReply(interaction, `🟢 **Connected to ${ip}:${port}**\nAnti-AFK and Physics Sync are active.`);
+        safeReply(interaction, `🟢 **Connected to ${ip}:${port}**\nAnti-AFK active.`);
     }
   });
 
   mc.on("error", (e) => {
     clearTimeout(currentSession.timeout);
+    console.error(`Session Error [${uid}]:`, e.message);
     if (!currentSession.manualStop) {
-        handleAutoReconnect(uid, interaction);
+        // Only reconnect if we actually spawned previously (was a valid connection)
+        if (currentSession.hasSpawned) {
+            handleAutoReconnect(uid, interaction);
+        } else {
+            // Failed during handshake/login - STOP completely
+            cleanupSession(uid);
+            if (interaction) safeReply(interaction, `🛑 **Login Failed:** ${e.message}\nBot stopped (No retry).`);
+        }
     }
   });
 
   mc.on("close", () => {
     clearTimeout(currentSession.timeout);
     if (!currentSession.manualStop) {
-        handleAutoReconnect(uid, interaction);
+        if (currentSession.hasSpawned) {
+             handleAutoReconnect(uid, interaction);
+        } else {
+            // Closed before spawn (e.g., whitelist kick, full server)
+            cleanupSession(uid);
+            if (interaction) safeReply(interaction, `🛑 **Connection Closed before Join.**\nCheck whitelist/server status.`);
+        }
     }
   });
 }
@@ -320,6 +360,7 @@ function handleAutoReconnect(uid, interaction) {
 
     s.isReconnecting = true;
     s.connected = false;
+    // Keep hasSpawned true so we know this session WAS valid at some point
     
     if (s.afkInterval) clearInterval(s.afkInterval);
     if (s.waitForEntity) clearInterval(s.waitForEntity);
@@ -327,7 +368,11 @@ function handleAutoReconnect(uid, interaction) {
     s.reconnectTimer = setTimeout(() => {
         if (sessions.has(uid) && !s.manualStop) {
             s.reconnectTimer = null;
-            startSession(uid, interaction);
+            // Recursively call startSession - logic inside will handle ping check again
+            startSession(uid, null).catch(e => {
+                console.error("Auto-reconnect failed:", e);
+                cleanupSession(uid);
+            });
         }
     }, 30000);
 }
@@ -405,3 +450,4 @@ process.on("unhandledRejection", (e) => console.error("Unhandled Rejection:", e)
 process.on("uncaughtException", (e) => console.error("Uncaught Exception:", e));
 
 client.login(DISCORD_TOKEN);
+
