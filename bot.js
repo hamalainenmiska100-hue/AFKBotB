@@ -1,6 +1,7 @@
 /**
  * AFKBot Panel 🎛️
- * Simple, clean, Bedrock-only edition with Rejoin & MOTD.
+ * Static Launcher Edition.
+ * UI is static, all actions are ephemeral per user.
  */
 
 const {
@@ -72,31 +73,23 @@ const pendingAuth = new Set();
 
 const client = new Client({ intents: [GatewayIntentBits.Guilds] });
 
-// --- UI GENERATOR ---
-function getPanel(uid) {
-    const user = getUser(uid);
-    const session = sessions.get(uid);
-    const isRunning = !!session;
-
+// --- UI GENERATOR (STATIC) ---
+function getStaticPanel() {
     const embed = new EmbedBuilder()
-        .setTitle("AFKBot Panel 🎛️")
-        .setDescription("Control your Bedrock AFK client.")
+        .setTitle("AFKBot Launcher 🚀")
+        .setDescription("Click buttons below to control your personal AFK client.\nAll interactions are private.")
         .setColor(0x2B2D31)
-        .addFields(
-            { name: "Status", value: isRunning ? "🟢 **Online**" : "🔴 **Offline**", inline: true },
-            { name: "Target", value: user.ip ? `\`${user.ip}:${user.port}\`` : "Not Set", inline: true },
-            { name: "Account", value: user.linked ? "✅ Linked" : "👤 Offline Name", inline: true }
-        );
+        .setFooter({ text: "Bedrock Edition • Supports Geyser Servers" });
 
     const row1 = new ActionRowBuilder().addComponents(
-        new ButtonBuilder().setCustomId("start").setLabel("Start").setStyle(ButtonStyle.Success).setDisabled(isRunning),
-        new ButtonBuilder().setCustomId("stop").setLabel("Stop").setStyle(ButtonStyle.Danger).setDisabled(!isRunning),
-        new ButtonBuilder().setCustomId("settings").setLabel("Settings").setStyle(ButtonStyle.Secondary).setEmoji("⚙️")
+        new ButtonBuilder().setCustomId("start").setLabel("Start Client").setStyle(ButtonStyle.Success),
+        new ButtonBuilder().setCustomId("stop").setLabel("Stop Client").setStyle(ButtonStyle.Danger),
+        new ButtonBuilder().setCustomId("settings").setLabel("Configure").setStyle(ButtonStyle.Secondary).setEmoji("⚙️")
     );
 
     const row2 = new ActionRowBuilder().addComponents(
-        new ButtonBuilder().setCustomId("link").setLabel("Link Xbox").setStyle(ButtonStyle.Primary).setDisabled(user.linked),
-        new ButtonBuilder().setCustomId("unlink").setLabel("Unlink").setStyle(ButtonStyle.Secondary).setDisabled(!user.linked)
+        new ButtonBuilder().setCustomId("link").setLabel("Link Account").setStyle(ButtonStyle.Primary),
+        new ButtonBuilder().setCustomId("unlink").setLabel("Unlink").setStyle(ButtonStyle.Secondary)
     );
 
     return { embeds: [embed], components: [row1, row2] };
@@ -107,33 +100,33 @@ function getPanel(uid) {
 async function startBot(uid, interaction = null, isReconnect = false) {
     const user = getUser(uid);
 
-    // Initial Interaction Handling
+    // Prevent double start via UI
     if (!isReconnect && interaction) {
-        if (!user.ip) {
-            return interaction.reply({ content: "❌ IP address is missing. Go to **Settings**.", ephemeral: true });
+        if (sessions.has(uid)) {
+            return interaction.reply({ content: "⚠️ **Bot is already running!** Stop it first.", ephemeral: true });
         }
+        if (!user.ip) {
+            return interaction.reply({ content: "❌ IP address is missing. Click **Configure**.", ephemeral: true });
+        }
+        // Initial feedback
         await interaction.reply({ content: `🚀 **Connecting to** \`${user.ip}:${user.port}\`...`, ephemeral: true });
     }
 
     // --- MOTD CHECK (Server Status) ---
     try {
-        if (isReconnect) console.log(`[${uid}] Reconnecting ping check...`);
+        if (isReconnect) console.log(`[${uid}] Auto-reconnecting...`);
         // Ping with short timeout
         await bedrock.ping({ host: user.ip, port: parseInt(user.port), skipPing: false, connectTimeout: 5000 });
     } catch (e) {
-        const errorMsg = `❌ **Could not join server!**\nTarget: \`${user.ip}:${user.port}\`\nReason: Server might be offline or unreachable.`;
+        const errorMsg = `❌ **Connection Failed!**\nTarget: \`${user.ip}:${user.port}\`\nReason: Server offline or unreachable.`;
         
-        // Notify User
         if (!isReconnect && interaction) {
             interaction.editReply({ content: errorMsg });
         } else {
-            try {
-                const discordUser = await client.users.fetch(uid);
-                discordUser.send(errorMsg);
-            } catch (err) {}
+            notifyUser(uid, errorMsg);
         }
         
-        // Remove session if exists so we don't loop forever on a dead server
+        // Don't retry if server is dead during initial connect
         if (sessions.has(uid)) sessions.delete(uid);
         return;
     }
@@ -143,21 +136,20 @@ async function startBot(uid, interaction = null, isReconnect = false) {
         host: user.ip,
         port: parseInt(user.port),
         connectTimeout: 30000,
-        skipPing: true, // We already pinged above
+        skipPing: true, // We already pinged
         offline: !user.onlineMode,
         username: !user.onlineMode ? user.username : undefined,
         profilesFolder: user.onlineMode ? path.join(CONFIG.PATHS.AUTH, uid) : undefined,
-        conLog: () => {} // Silent
+        conLog: () => {} 
     };
 
     try {
         const bedrockClient = bedrock.createClient(options);
         
-        // Session Setup
         const session = {
             client: bedrockClient,
             afkInt: null,
-            manualStop: false // Track if user clicked stop
+            manualStop: false
         };
         sessions.set(uid, session);
 
@@ -167,13 +159,12 @@ async function startBot(uid, interaction = null, isReconnect = false) {
             console.log(`[${uid}] Spawned`);
             
             if (!isReconnect && interaction) {
-                interaction.editReply({ content: `✅ **Connected to ${user.ip}!**` });
+                interaction.editReply({ content: `✅ **Connected!**\nUser: \`${options.username || 'Online'}\`\nServer: \`${user.ip}\`` });
             } else if (isReconnect) {
-                // Optional: Notify on successful reconnect
-                client.users.fetch(uid).then(u => u.send(`♻️ **Reconnected** successfully to \`${user.ip}\`!`)).catch(()=>{});
+                notifyUser(uid, `♻️ **Reconnected** successfully to \`${user.ip}\`!`);
             }
             
-            // Simple AFK Rotation
+            // AFK Loop
             session.afkInt = setInterval(() => {
                 if(bedrockClient) {
                     try {
@@ -186,17 +177,15 @@ async function startBot(uid, interaction = null, isReconnect = false) {
 
         bedrockClient.on('error', (e) => {
             console.log(`[${uid}] Error: ${e.message}`);
-            // Let close event handle the restart logic
         });
 
         bedrockClient.on('close', () => {
-            console.log(`[${uid}] Connection Closed`);
+            console.log(`[${uid}] Closed`);
             handleDisconnect(uid);
         });
 
         bedrockClient.on('kick', (packet) => {
              console.log(`[${uid}] Kicked: ${packet.message}`);
-             // Kick also triggers close usually, but logging helps
         });
 
     } catch (e) {
@@ -208,23 +197,18 @@ function handleDisconnect(uid) {
     const session = sessions.get(uid);
     if (!session) return;
 
-    // Stop timers
     if (session.afkInt) clearInterval(session.afkInt);
 
     if (session.manualStop) {
-        // User clicked Stop - Clean up and exit
         sessions.delete(uid);
     } else {
-        // Accidental disconnect - REJOIN LOGIC
-        console.log(`[${uid}] Auto-reconnecting in 20s...`);
+        // Auto-Rejoin Logic
+        notifyUser(uid, `⚠️ **Connection Lost.** Rejoining in 20s...`);
         
-        // Notify user via DM about drop
-        client.users.fetch(uid).then(u => u.send(`⚠️ **Connection Lost.** Attempting to rejoin in 20 seconds...`)).catch(()=>{});
-
         setTimeout(() => {
-            // Check if user stopped it while waiting
+            // Ensure user didn't stop it during the wait
             if (sessions.has(uid) && !sessions.get(uid).manualStop) {
-                startBot(uid, null, true); // true = isReconnect
+                startBot(uid, null, true);
             }
         }, 20000);
     }
@@ -233,11 +217,17 @@ function handleDisconnect(uid) {
 function stopBot(uid) {
     const session = sessions.get(uid);
     if (session) {
-        session.manualStop = true; // Flag as manual stop to prevent rejoin
+        session.manualStop = true;
         if (session.afkInt) clearInterval(session.afkInt);
         try { session.client.close(); } catch(e){}
         sessions.delete(uid);
+        return true;
     }
+    return false;
+}
+
+function notifyUser(uid, msg) {
+    client.users.fetch(uid).then(u => u.send(msg)).catch(()=>{});
 }
 
 // --- DISCORD EVENTS ---
@@ -245,7 +235,7 @@ function stopBot(uid) {
 client.once(Events.ClientReady, () => {
     console.log(`Bot Online: ${client.user.tag}`);
     client.application.commands.set([
-        new SlashCommandBuilder().setName("panel").setDescription("Open AFKBot Panel")
+        new SlashCommandBuilder().setName("panel").setDescription("Show Launcher")
     ]);
 });
 
@@ -255,7 +245,7 @@ client.on(Events.InteractionCreate, async (i) => {
     try {
         // Command
         if (i.isChatInputCommand() && i.commandName === "panel") {
-            return i.reply(getPanel(uid));
+            return i.reply(getStaticPanel());
         }
 
         // Buttons
@@ -263,13 +253,17 @@ client.on(Events.InteractionCreate, async (i) => {
             if (i.customId === "start") return startBot(uid, i, false);
             
             if (i.customId === "stop") {
-                stopBot(uid);
-                return i.reply({ content: "⏹ **Bot Stopped.** (Auto-rejoin disabled)", ephemeral: true });
+                const stopped = stopBot(uid);
+                if (stopped) {
+                    return i.reply({ content: "⏹ **Bot Stopped.** Auto-rejoin disabled.", ephemeral: true });
+                } else {
+                    return i.reply({ content: "⚠️ **No bot running.**", ephemeral: true });
+                }
             }
 
             if (i.customId === "settings") {
                 const u = getUser(uid);
-                const modal = new ModalBuilder().setCustomId("settings_modal").setTitle("Settings");
+                const modal = new ModalBuilder().setCustomId("settings_modal").setTitle("Bot Configuration");
                 modal.addComponents(
                     new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("ip").setLabel("Server IP").setStyle(TextInputStyle.Short).setValue(u.ip || "").setRequired(true)),
                     new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("port").setLabel("Port").setStyle(TextInputStyle.Short).setValue(String(u.port)).setRequired(true)),
@@ -285,8 +279,7 @@ client.on(Events.InteractionCreate, async (i) => {
                 u.linked = false;
                 u.onlineMode = false;
                 saveUsers();
-                // Refresh panel
-                return i.reply({ content: "✅ Unlinked.", ephemeral: true });
+                return i.reply({ content: "✅ **Unlinked.** Bot is now in Offline Mode.", ephemeral: true });
             }
         }
 
@@ -297,7 +290,7 @@ client.on(Events.InteractionCreate, async (i) => {
             u.port = i.fields.getTextInputValue("port");
             u.username = i.fields.getTextInputValue("user");
             saveUsers();
-            return i.reply({ content: "✅ **Settings Saved!**", ephemeral: true });
+            return i.reply({ content: `✅ **Settings Saved!**\nTarget: \`${u.ip}:${u.port}\``, ephemeral: true });
         }
 
     } catch (e) {
@@ -307,7 +300,7 @@ client.on(Events.InteractionCreate, async (i) => {
 
 // Auth Logic
 async function handleLink(uid, i) {
-    if (pendingAuth.has(uid)) return i.reply({ content: "Auth already open.", ephemeral: true });
+    if (pendingAuth.has(uid)) return i.reply({ content: "Auth already in progress.", ephemeral: true });
     
     await i.deferReply({ ephemeral: true });
     pendingAuth.add(uid);
@@ -316,7 +309,7 @@ async function handleLink(uid, i) {
         flow: "live", authTitle: Titles.MinecraftNintendoSwitch, deviceType: "Nintendo" 
     }, async (res) => {
         i.editReply({ 
-            content: `**1.** Click: [Login to Microsoft](${res.verification_uri_complete})\n**2.** Code: \`${res.user_code}\`\n**3.** Wait here.` 
+            content: `**To Link:**\n1. Click [Here](${res.verification_uri_complete})\n2. Code: \`${res.user_code}\`\n3. Wait here...` 
         });
     });
 
@@ -328,7 +321,7 @@ async function handleLink(uid, i) {
         saveUsers();
         i.followUp({ content: "✅ **Success!** Account linked.", ephemeral: true });
     } catch(e) {
-        i.followUp({ content: "❌ Auth Failed.", ephemeral: true });
+        i.followUp({ content: "❌ **Auth Failed:** " + e.message, ephemeral: true });
     } finally {
         pendingAuth.delete(uid);
     }
