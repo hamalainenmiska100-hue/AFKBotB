@@ -8,14 +8,15 @@
   },
   "dependencies": {
     "discord.js": "^14.15.3",
-    "bedrock-protocol": "^4.3.0",
-    "mineflayer": "^5.0.1", 
-    "minecraft-protocol": "^1.50.0",
+    "bedrock-protocol": "latest",
+    "mineflayer": "latest",
+    "minecraft-protocol": "latest",
     "prismarine-auth": "^2.4.0",
     "canvas": "^2.11.2"
   },
   "scripts": {
-    "start": "node index.js"
+    "start": "node bot.js"
   }
 }
+
 
