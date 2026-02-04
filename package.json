@@ -1,19 +1,19 @@
 {
-  "name": "bedrock-java-afk-bot",
-  "version": "27.0.0",
-  "description": "Robust and lightweight AFK bot for Bedrock and Java Edition",
+  "name": "titan-afk-bot",
+  "version": "3.0.0",
+  "description": "High-performance, memory-optimized AFK bot using Bedrock Protocol",
   "main": "bot.js",
   "engines": {
-    "node": ">=22.0.0"
+    "node": ">=20.0.0"
   },
   "dependencies": {
     "discord.js": "^14.15.3",
     "bedrock-protocol": "latest",
-    "minecraft-protocol": "latest",
-    "prismarine-auth": "^2.4.0",
-    "canvas": "^2.11.2"
+    "prismarine-auth": "^2.4.0"
   },
   "scripts": {
     "start": "node bot.js"
   }
 }
+
+
