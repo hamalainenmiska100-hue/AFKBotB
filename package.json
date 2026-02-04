@@ -2,9 +2,9 @@
   "name": "bedrock-java-afk-bot",
   "version": "26.0.0",
   "description": "Ultimate AFK bot",
-  "main": "bot.js",
+  "main": "index.js",
   "engines": {
-    "node": ">=18.0.0"
+    "node": ">=22.0.0"
   },
   "dependencies": {
     "discord.js": "^14.15.3",
@@ -15,7 +15,7 @@
     "canvas": "^2.11.2"
   },
   "scripts": {
-    "start": "node bot.js"
+    "start": "node index.js"
   }
 }
 
