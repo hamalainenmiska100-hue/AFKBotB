@@ -1,14 +1,16 @@
-FROM node:20
+# Käytetään Node 22 (jota uudet kirjastot vaativat) ja Bookworm (vakaa Linux)
+FROM node:22-bookworm
 
-# Asenna Canvas-kirjaston vaatimat järjestelmäpaketit
+# Asenna CMake (kriittinen Bedrockille) ja Canvas-kirjaston vaatimat paketit
 RUN apt-get update && apt-get install -y \
     build-essential \
+    cmake \
+    python3 \
     libcairo2-dev \
     libpango1.0-dev \
     libjpeg-dev \
     libgif-dev \
     librsvg2-dev \
-    python3 \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -20,5 +22,7 @@ RUN npm install
 
 COPY . .
 
-CMD ["node", "bot.js"]
+# Käytä npm start, jotta se lukee komennon package.jsonista
+CMD ["npm", "start"]
+
 
