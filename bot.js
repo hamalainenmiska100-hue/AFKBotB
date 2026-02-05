@@ -1,7 +1,6 @@
 /**
  * AFKBot Panel 🎛️
- * Static Launcher Edition.
- * UI is static, all actions are ephemeral per user.
+ * Fixed Unlink Logic & Token Clearing.
  */
 
 const {
@@ -77,7 +76,7 @@ const client = new Client({ intents: [GatewayIntentBits.Guilds] });
 function getStaticPanel() {
     const embed = new EmbedBuilder()
         .setTitle("AFKBot Launcher 🚀")
-        .setDescription("Click buttons below to control your personal AFK client.\nAll interactions are private.")
+        .setDescription("Control your personal AFK client.\n\n**Note:** If you link your account, the bot joins as YOU.\nIf you unlink, it joins as a random offline bot.")
         .setColor(0x2B2D31)
         .setFooter({ text: "Bedrock Edition • Supports Geyser Servers" });
 
@@ -88,8 +87,9 @@ function getStaticPanel() {
     );
 
     const row2 = new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId("status").setLabel("My Status").setStyle(ButtonStyle.Secondary).setEmoji("👤"),
         new ButtonBuilder().setCustomId("link").setLabel("Link Account").setStyle(ButtonStyle.Primary),
-        new ButtonBuilder().setCustomId("unlink").setLabel("Unlink").setStyle(ButtonStyle.Secondary)
+        new ButtonBuilder().setCustomId("unlink").setLabel("Unlink / Reset").setStyle(ButtonStyle.Danger)
     );
 
     return { embeds: [embed], components: [row1, row2] };
@@ -100,46 +100,34 @@ function getStaticPanel() {
 async function startBot(uid, interaction = null, isReconnect = false) {
     const user = getUser(uid);
 
-    // Prevent double start via UI
     if (!isReconnect && interaction) {
-        if (sessions.has(uid)) {
-            return interaction.reply({ content: "⚠️ **Bot is already running!** Stop it first.", ephemeral: true });
-        }
-        if (!user.ip) {
-            return interaction.reply({ content: "❌ IP address is missing. Click **Configure**.", ephemeral: true });
-        }
-        // Initial feedback
+        if (sessions.has(uid)) return interaction.reply({ content: "⚠️ **Bot is already running!**", ephemeral: true });
+        if (!user.ip) return interaction.reply({ content: "❌ IP missing. Click **Configure**.", ephemeral: true });
         await interaction.reply({ content: `🚀 **Connecting to** \`${user.ip}:${user.port}\`...`, ephemeral: true });
     }
 
-    // --- MOTD CHECK (Server Status) ---
+    // Ping Check
     try {
-        if (isReconnect) console.log(`[${uid}] Auto-reconnecting...`);
-        // Ping with short timeout
+        if (isReconnect) console.log(`[${uid}] Reconnecting...`);
         await bedrock.ping({ host: user.ip, port: parseInt(user.port), skipPing: false, connectTimeout: 5000 });
     } catch (e) {
-        const errorMsg = `❌ **Connection Failed!**\nTarget: \`${user.ip}:${user.port}\`\nReason: Server offline or unreachable.`;
+        const msg = `❌ **Connection Failed!** Server \`${user.ip}\` is offline.`;
+        if (!isReconnect && interaction) interaction.editReply({ content: msg });
+        else notifyUser(uid, msg);
         
-        if (!isReconnect && interaction) {
-            interaction.editReply({ content: errorMsg });
-        } else {
-            notifyUser(uid, errorMsg);
-        }
-        
-        // Don't retry if server is dead during initial connect
         if (sessions.has(uid)) sessions.delete(uid);
         return;
     }
 
-    // --- CONNECTION ---
+    // Connect
     const options = {
         host: user.ip,
         port: parseInt(user.port),
         connectTimeout: 30000,
-        skipPing: true, // We already pinged
-        offline: !user.onlineMode,
-        username: !user.onlineMode ? user.username : undefined,
-        profilesFolder: user.onlineMode ? path.join(CONFIG.PATHS.AUTH, uid) : undefined,
+        skipPing: true,
+        offline: !user.onlineMode, // Important: If onlineMode is false, force offline
+        username: !user.onlineMode ? user.username : undefined, // Only send username in offline mode
+        profilesFolder: user.onlineMode ? path.join(CONFIG.PATHS.AUTH, uid) : undefined, // Only use cache in online mode
         conLog: () => {} 
     };
 
@@ -153,18 +141,14 @@ async function startBot(uid, interaction = null, isReconnect = false) {
         };
         sessions.set(uid, session);
 
-        // --- EVENTS ---
-
         bedrockClient.on('spawn', () => {
-            console.log(`[${uid}] Spawned`);
-            
+            const status = user.onlineMode ? "Online Account" : `Offline: ${user.username}`;
             if (!isReconnect && interaction) {
-                interaction.editReply({ content: `✅ **Connected!**\nUser: \`${options.username || 'Online'}\`\nServer: \`${user.ip}\`` });
+                interaction.editReply({ content: `✅ **Connected!**\n👤 User: \`${status}\`\n🌍 Server: \`${user.ip}\`` });
             } else if (isReconnect) {
-                notifyUser(uid, `♻️ **Reconnected** successfully to \`${user.ip}\`!`);
+                notifyUser(uid, `♻️ **Reconnected** to \`${user.ip}\`!`);
             }
             
-            // AFK Loop
             session.afkInt = setInterval(() => {
                 if(bedrockClient) {
                     try {
@@ -175,17 +159,10 @@ async function startBot(uid, interaction = null, isReconnect = false) {
             }, 10000);
         });
 
-        bedrockClient.on('error', (e) => {
-            console.log(`[${uid}] Error: ${e.message}`);
-        });
-
-        bedrockClient.on('close', () => {
-            console.log(`[${uid}] Closed`);
-            handleDisconnect(uid);
-        });
-
-        bedrockClient.on('kick', (packet) => {
-             console.log(`[${uid}] Kicked: ${packet.message}`);
+        bedrockClient.on('error', (e) => { console.log(e.message); });
+        bedrockClient.on('close', () => handleDisconnect(uid));
+        bedrockClient.on('kick', (p) => { 
+            if (!isReconnect && interaction) interaction.followUp({ content: `🛑 **Kicked:** ${p.message}`, ephemeral: true });
         });
 
     } catch (e) {
@@ -196,17 +173,13 @@ async function startBot(uid, interaction = null, isReconnect = false) {
 function handleDisconnect(uid) {
     const session = sessions.get(uid);
     if (!session) return;
-
     if (session.afkInt) clearInterval(session.afkInt);
 
     if (session.manualStop) {
         sessions.delete(uid);
     } else {
-        // Auto-Rejoin Logic
-        notifyUser(uid, `⚠️ **Connection Lost.** Rejoining in 20s...`);
-        
+        notifyUser(uid, `⚠️ **Lost Connection.** Rejoining in 20s...`);
         setTimeout(() => {
-            // Ensure user didn't stop it during the wait
             if (sessions.has(uid) && !sessions.get(uid).manualStop) {
                 startBot(uid, null, true);
             }
@@ -243,22 +216,27 @@ client.on(Events.InteractionCreate, async (i) => {
     const uid = i.user.id;
 
     try {
-        // Command
         if (i.isChatInputCommand() && i.commandName === "panel") {
             return i.reply(getStaticPanel());
         }
 
-        // Buttons
         if (i.isButton()) {
+            // --- CHECK STATUS BUTTON ---
+            if (i.customId === "status") {
+                const u = getUser(uid);
+                const s = sessions.has(uid);
+                let msg = `👤 **Your Status:**\n`;
+                msg += `• **Account:** ${u.linked ? "✅ Linked (Online Mode)" : "⚠️ Unlinked (Offline Mode)"}\n`;
+                msg += `• **Bot:** ${s ? "🟢 Running" : "🔴 Stopped"}\n`;
+                msg += `• **Target:** \`${u.ip || "Not Set"}:${u.port}\``;
+                return i.reply({ content: msg, ephemeral: true });
+            }
+
             if (i.customId === "start") return startBot(uid, i, false);
             
             if (i.customId === "stop") {
                 const stopped = stopBot(uid);
-                if (stopped) {
-                    return i.reply({ content: "⏹ **Bot Stopped.** Auto-rejoin disabled.", ephemeral: true });
-                } else {
-                    return i.reply({ content: "⚠️ **No bot running.**", ephemeral: true });
-                }
+                return i.reply({ content: stopped ? "⏹ **Bot Stopped.**" : "⚠️ **No bot running.**", ephemeral: true });
             }
 
             if (i.customId === "settings") {
@@ -274,16 +252,29 @@ client.on(Events.InteractionCreate, async (i) => {
 
             if (i.customId === "link") return handleLink(uid, i);
             
+            // --- FIX FOR UNLINK ---
             if (i.customId === "unlink") {
                 const u = getUser(uid);
+                
+                // 1. Update Database
                 u.linked = false;
                 u.onlineMode = false;
                 saveUsers();
-                return i.reply({ content: "✅ **Unlinked.** Bot is now in Offline Mode.", ephemeral: true });
+
+                // 2. FORCE DELETE TOKEN FOLDER
+                const authPath = path.join(CONFIG.PATHS.AUTH, uid);
+                try {
+                    if (fs.existsSync(authPath)) {
+                        fs.rmSync(authPath, { recursive: true, force: true });
+                    }
+                } catch(e) {
+                    console.error("Failed to delete tokens:", e);
+                }
+
+                return i.reply({ content: "🗑️ **Unlinked!** Tokens deleted. Bot will now join as Offline User.", ephemeral: true });
             }
         }
 
-        // Modals
         if (i.isModalSubmit() && i.customId === "settings_modal") {
             const u = getUser(uid);
             u.ip = i.fields.getTextInputValue("ip");
@@ -293,23 +284,26 @@ client.on(Events.InteractionCreate, async (i) => {
             return i.reply({ content: `✅ **Settings Saved!**\nTarget: \`${u.ip}:${u.port}\``, ephemeral: true });
         }
 
-    } catch (e) {
-        console.error(e);
-    }
+    } catch (e) { console.error(e); }
 });
 
-// Auth Logic
 async function handleLink(uid, i) {
     if (pendingAuth.has(uid)) return i.reply({ content: "Auth already in progress.", ephemeral: true });
     
     await i.deferReply({ ephemeral: true });
     pendingAuth.add(uid);
 
+    // Clear any existing tokens before starting new link to avoid conflicts
+    try {
+        const authPath = path.join(CONFIG.PATHS.AUTH, uid);
+        if (fs.existsSync(authPath)) fs.rmSync(authPath, { recursive: true, force: true });
+    } catch(e) {}
+
     const flow = new Authflow(uid, path.join(CONFIG.PATHS.AUTH, uid), { 
         flow: "live", authTitle: Titles.MinecraftNintendoSwitch, deviceType: "Nintendo" 
     }, async (res) => {
         i.editReply({ 
-            content: `**To Link:**\n1. Click [Here](${res.verification_uri_complete})\n2. Code: \`${res.user_code}\`\n3. Wait here...` 
+            content: `**1.** Click: [Login to Microsoft](${res.verification_uri_complete})\n**2.** Code: \`${res.user_code}\`\n**3.** Wait here...` 
         });
     });
 
@@ -321,7 +315,7 @@ async function handleLink(uid, i) {
         saveUsers();
         i.followUp({ content: "✅ **Success!** Account linked.", ephemeral: true });
     } catch(e) {
-        i.followUp({ content: "❌ **Auth Failed:** " + e.message, ephemeral: true });
+        i.followUp({ content: "❌ **Auth Failed.** Try again.", ephemeral: true });
     } finally {
         pendingAuth.delete(uid);
     }
