@@ -21,7 +21,7 @@ const path = require("path");
 // ----------------- CRITICAL CONFIGURATION -----------------
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
 if (!DISCORD_TOKEN) {
-  console.error("❌ CRTICAL ERROR: DISCORD_TOKEN is missing!");
+  console.error("❌ CRITICAL ERROR: DISCORD_TOKEN is missing!");
   process.exit(1);
 }
 
@@ -73,9 +73,7 @@ function getUserAuthDir(uid) {
 }
 
 // ----------------- GLOBAL STATE -----------------
-// We use a Map to store active sessions. 
-// Key: UserID, Value: Session Object
-const sessions = new Map();     // Bedrock
+const sessions = new Map();     // Bedrock sessions
 const pendingAuth = new Map();  // Auth flows
 
 const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.DirectMessages] });
@@ -86,19 +84,15 @@ async function notifyUser(uid, message) {
         const user = await client.users.fetch(uid);
         await user.send(message);
     } catch (e) {
-        console.log(`Failed to send DM to ${uid} (DMs likely closed).`);
+        // DMs closed or user unreachable, ignore silently to prevent crashing
+        console.log(`Could not DM user ${uid}: ${e.message}`);
     }
 }
 
-// ----------------- SESSION MANAGEMENT (OPTIMIZED) -----------------
+// ----------------- SESSION MANAGEMENT -----------------
 
-/**
- * Completely destroys a session to prevent memory leaks.
- * Clears timers, closes connections, and removes from map.
- */
 function destroySession(uid) {
     const s = sessions.get(uid);
-    
     if (!s) return;
 
     // 1. Clear Timers
@@ -121,13 +115,30 @@ function destroySession(uid) {
     console.log(`[BEDROCK] Session destroyed for ${uid}`);
 }
 
+function unlinkMicrosoft(uid) {
+    const u = getUser(uid);
+    u.linked = false;
+    saveDatabase();
+    
+    // Remove auth data
+    const authDir = getUserAuthDir(uid);
+    try {
+        if (fs.existsSync(authDir)) {
+            fs.rmSync(authDir, { recursive: true, force: true });
+        }
+    } catch (e) {
+        console.error(`Failed to delete auth dir for ${uid}:`, e);
+    }
+}
+
 // ----------------- BEDROCK ENGINE -----------------
 
 async function startBedrock(uid, interaction, versionOverride) {
     const u = getUser(uid);
     if (!u.server) return interaction.reply({ content: "❌ No server set! Go to Settings.", ephemeral: true });
     
-    // 1. SESSION LOCK: Check if already running
+    // 1. SESSION LOCK
+    // If user already has a running session, deny new one.
     if (sessions.has(uid)) {
         return interaction.reply({ 
             content: "❌ **Session Active:** Please terminate your old session before starting a new bot.", 
@@ -138,22 +149,24 @@ async function startBedrock(uid, interaction, versionOverride) {
     const authDir = getUserAuthDir(uid);
     const { ip, port } = u.server;
 
-    // 2. MOTD CHECK: Ping server before joining
+    // 2. MOTD CHECK (Ping before join)
     await interaction.update({ content: `🔎 **Pinging ${ip}:${port}...**`, components: [], embeds: [] });
 
     try {
-        // Attempt to ping with a 5-second timeout
+        // We ping just to check status. Timeout 5s.
         await bedrock.ping({ host: ip, port: port, timeout: 5000 });
         await interaction.editReply({ content: `✅ **Server Found! Joining...**` });
     } catch (e) {
         return interaction.editReply({ content: `❌ **Connection Failed:** Server is offline or unreachable.\nReason: ${e.message || "Timeout"}` });
     }
 
+    // 3. JOIN CONFIGURATION
+    // CRITICAL FIX: skipPing MUST be false for 'auto' version detection to work properly.
     const options = {
         host: ip,
         port: port,
-        connectTimeout: 30000, // Explicit 30s timeout
-        skipPing: true,        // We already pinged above
+        connectTimeout: 30000,
+        skipPing: false, // Ensures internal ping happens to negotiate version
         version: versionOverride === "auto" ? undefined : versionOverride,
         offline: u.connectionType === "offline",
         username: u.connectionType === "offline" ? (u.offlineUsername || `AFK_${uid.slice(-4)}`) : uid,
@@ -181,7 +194,7 @@ function createBedrockInstance(uid, opts, interaction) {
         connected: false,
         startTime: Date.now(),
         manualStop: false,
-        opts: opts, // Save options for auto-rejoin
+        opts: opts,
         pos: { x: 0, y: 0, z: 0 },
         congratsHours: 0
     };
@@ -192,7 +205,7 @@ function createBedrockInstance(uid, opts, interaction) {
         console.log(`[BEDROCK] ${uid} spawned on ${opts.host}`);
         if (interaction) interaction.followUp({ content: `✅ **Connected to ${opts.host}!**`, ephemeral: true });
         
-        // Critical Notification
+        // DM Notification: Spawn
         notifyUser(uid, `🚀 **Bot Connected!**\nYour bot has successfully joined **${opts.host}**.`);
         
         startAfkLogic(uid, session);
@@ -203,6 +216,8 @@ function createBedrockInstance(uid, opts, interaction) {
     });
 
     botClient.on('kick', (reason) => {
+        console.log(`[BEDROCK KICK] ${uid}:`, reason);
+        // DM Notification: Kick
         notifyUser(uid, `⚠️ **Bot Kicked!**\nServer kicked the bot. Reason: \`${reason}\``);
     });
 
@@ -210,7 +225,6 @@ function createBedrockInstance(uid, opts, interaction) {
         handleDisconnect(uid, session);
     });
 
-    // Handle Auth Input (Movement updates)
     botClient.on('move_player', (packet) => {
         if (packet.runtime_id === botClient.entityId) session.pos = packet.position;
     });
@@ -223,7 +237,6 @@ function startAfkLogic(uid, session) {
     session.afkInterval = setInterval(() => {
         try {
             if (session.client) {
-                // Send Bedrock movement packet
                 const yaw = Math.random() * 360;
                 session.client.write("player_auth_input", {
                     pitch: 0, yaw: yaw, head_yaw: yaw,
@@ -233,12 +246,10 @@ function startAfkLogic(uid, session) {
                     input_mode: 'mouse', play_mode: 'normal', tick: 0n, delta: { x: 0, y: 0, z: 0 }
                 });
             }
-        } catch (e) {
-            // Siltent catch - if this fails, connection is probably dropping anyway
-        }
-    }, 10000); // Every 10 seconds
+        } catch (e) {}
+    }, 10000);
 
-    // 2. Hourly Congrats DM
+    // 2. Hourly Update
     session.uptimeInterval = setInterval(async () => {
         session.congratsHours++;
         notifyUser(uid, `🎉 **Status Update:** Your bot has been online for **${session.congratsHours} hours**! Keep it up! 🚀`);
@@ -246,25 +257,21 @@ function startAfkLogic(uid, session) {
 }
 
 function handleDisconnect(uid, session) {
-    // Clear intervals immediately
     if (session.afkInterval) clearInterval(session.afkInterval);
     if (session.uptimeInterval) clearInterval(session.uptimeInterval);
 
     if (session.manualStop) {
-        // User asked to stop -> Destroy everything
+        // DM Notification: Manual Stop
         notifyUser(uid, `⏹ **Bot Stopped.**\nYou manually terminated the session.`);
         destroySession(uid);
     } else {
-        // Crash/Kick -> Reconnect
         console.log(`[BEDROCK] Disconnected ${uid}. Reconnecting in 30s...`);
+        // DM Notification: Crash/Disconnect
         notifyUser(uid, `⚠️ **Disconnected!**\nConnection lost. Attempting to auto-reconnect in 30 seconds...`);
         
-        // Store reconnect timer in session so we can cancel it if user clicks stop during wait
         session.reconnectTimer = setTimeout(() => {
-            // Double check if user stopped it during the wait
             if (sessions.has(uid) && !sessions.get(uid).manualStop) {
                 console.log(`[BEDROCK] Reconnecting ${uid} now...`);
-                // Recursive restart
                 createBedrockInstance(uid, session.opts, null);
             } else {
                 destroySession(uid);
@@ -276,7 +283,6 @@ function handleDisconnect(uid, session) {
 // ----------------- UI BUILDERS -----------------
 
 function getVersionSelector(current) {
-    // Bedrock Versions
     const bv = [
         { label: "Auto-Detect (Best)", value: "auto" },
         { label: "1.21.60", value: "1.21.60" }, { label: "1.21.50", value: "1.21.50" },
@@ -284,20 +290,18 @@ function getVersionSelector(current) {
         { label: "1.21.0", value: "1.21.0" }, { label: "1.20.80", value: "1.20.80" }
     ];
 
-    const list = bv;
-    // Validate selection
-    const safeCurrent = list.find(x => x.value === current) ? current : "auto";
+    const safeCurrent = bv.find(x => x.value === current) ? current : "auto";
 
     return new ActionRowBuilder().addComponents(
         new StringSelectMenuBuilder()
             .setCustomId("sel_bed_ver")
             .setPlaceholder(`Selected: ${safeCurrent}`)
-            .addOptions(list.map(v => ({ label: v.label, value: v.value, default: v.value === safeCurrent })))
+            .addOptions(bv.map(v => ({ label: v.label, value: v.value, default: v.value === safeCurrent })))
     );
 }
 
 function getPanel() {
-    // Clean, minimalistic buttons - TECHNICAL REMOVED
+    // Technical button REMOVED as requested
     return [
         new ActionRowBuilder().addComponents(
             new ButtonBuilder().setCustomId("pre_bedrock").setLabel("▶ Start").setStyle(ButtonStyle.Success),
@@ -314,9 +318,7 @@ function getPanel() {
 // ----------------- INTERACTION HANDLER -----------------
 
 client.on(Events.InteractionCreate, async (i) => {
-    // 1. Guild Security Check
     if (i.guildId && !ALLOWED_GUILDS.includes(i.guildId)) return;
-    
     const uid = i.user.id;
 
     try {
@@ -329,40 +331,35 @@ client.on(Events.InteractionCreate, async (i) => {
         if (i.isButton()) {
             const id = i.customId;
 
-            // PRE-FLIGHT (Start Checks)
+            // PRE-FLIGHT
             if (id === "pre_bedrock") {
-                // Pre-check: Session Lock (Visual check only, real check in startBedrock)
+                // SESSION LOCK CHECK (Visual)
                 if (sessions.has(uid)) {
                     return i.reply({ content: "❌ **Session Active:** Please terminate your old session before starting a new bot.", ephemeral: true });
                 }
 
                 const u = getUser(uid);
-                
-                // Config Check
-                const serverData = u.server;
-                if (!serverData) return i.reply({ content: "❌ **Configuration Missing!** Please click 'Settings' first.", ephemeral: true });
+                if (!u.server) return i.reply({ content: "❌ **Configuration Missing!** Please click 'Settings' first.", ephemeral: true });
 
-                const ver = u.bedrockVersion;
-                const verRow = getVersionSelector(ver);
-                
+                const verRow = getVersionSelector(u.bedrockVersion);
                 const confirmRow = new ActionRowBuilder().addComponents(
                     new ButtonBuilder().setCustomId(`start_bedrock`).setLabel("✅ Connect Now").setStyle(ButtonStyle.Success),
                     new ButtonBuilder().setCustomId("cancel").setLabel("Cancel").setStyle(ButtonStyle.Secondary)
                 );
 
                 return i.reply({ 
-                    content: `**Pre-Flight Check (Bedrock)**\nTarget: \`${serverData.ip}:${serverData.port}\`\n\n*Does this look correct? Select version if auto-detect fails.*`,
+                    content: `**Pre-Flight Check (Bedrock)**\nTarget: \`${u.server.ip}:${u.server.port}\`\n\n*Does this look correct? Select version if auto-detect fails.*`,
                     components: [verRow, confirmRow], 
                     ephemeral: true 
                 });
             }
 
-            // START SIGNALS
+            // START SIGNAL
             if (id === "start_bedrock") return startBedrock(uid, i, getUser(uid).bedrockVersion || "auto");
             
             if (id === "cancel") return i.update({ content: "❌ Cancelled.", components: [], embeds: [] });
 
-            // STOPS
+            // STOP SIGNAL
             if (id === "stop_bedrock") {
                 const s = sessions.get(uid);
                 if (!s) return i.reply({ content: "❌ No Bedrock bot running.", ephemeral: true });
@@ -371,7 +368,7 @@ client.on(Events.InteractionCreate, async (i) => {
                 return i.reply({ content: "⏹ **Stopping Bedrock Bot...**", ephemeral: true });
             }
 
-            // SETTINGS MODALS
+            // SETTINGS MODAL
             if (id === "set_bedrock") {
                 const u = getUser(uid);
                 const m = new ModalBuilder().setCustomId("modal_bedrock").setTitle("Bedrock Settings");
@@ -382,15 +379,16 @@ client.on(Events.InteractionCreate, async (i) => {
                 return i.showModal(m);
             }
 
-            // AUTH
+            // AUTH ACTIONS
             if (id === "link") return handleLink(uid, i);
-            if (id === "unlink") { unlinkMicrosoft(uid); return i.reply({ content: "🗑 Unlinked.", ephemeral: true }); }
-            
+            if (id === "unlink") { 
+                unlinkMicrosoft(uid); 
+                return i.reply({ content: "🗑 Unlinked.", ephemeral: true }); 
+            }
         }
 
         // --- MENUS ---
         if (i.isStringSelectMenu()) {
-            // Version Selectors
             if (i.customId === "sel_bed_ver") {
                 const u = getUser(uid);
                 u.bedrockVersion = i.values[0];
