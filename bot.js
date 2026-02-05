@@ -17,15 +17,16 @@ const bedrock = require("bedrock-protocol");
 const { Authflow, Titles } = require("prismarine-auth");
 const fs = require("fs");
 const path = require("path");
+const crypto = require("crypto");
 
-// ----------------- CRITICAL CONFIGURATION -----------------
+// ----------------- CONFIGURATION -----------------
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
 if (!DISCORD_TOKEN) {
   console.error("❌ CRITICAL ERROR: DISCORD_TOKEN is missing!");
   process.exit(1);
 }
 
-// Allowed Guilds (Support for multiple servers)
+const ROOT_ID = "1144987924123881564"; // VIP User ID
 const ALLOWED_GUILDS = [
     "1462335230345089254", 
     "1468289465783943354"
@@ -36,150 +37,187 @@ const DATA_DIR = path.join(__dirname, "data");
 const AUTH_DIR = path.join(DATA_DIR, "auth");
 const USER_FILE = path.join(DATA_DIR, "users.json");
 
-// Ensure directories exist
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR);
 if (!fs.existsSync(AUTH_DIR)) fs.mkdirSync(AUTH_DIR, { recursive: true });
 
-// Load Users
 let users = {};
 try {
   users = fs.existsSync(USER_FILE) ? JSON.parse(fs.readFileSync(USER_FILE, "utf8")) : {};
 } catch (e) {
-  console.error("⚠️ Failed to load users.json, creating new database.");
   users = {};
 }
 
 function saveDatabase() {
-  fs.writeFile(USER_FILE, JSON.stringify(users, null, 2), (err) => {
-    if (err) console.error("❌ Failed to save database:", err);
-  });
+  fs.writeFile(USER_FILE, JSON.stringify(users, null, 2), (err) => { if (err) console.error(err); });
 }
 
 function getUser(uid) {
   if (!users[uid]) users[uid] = {};
-  
-  // Ensure Bedrock structure
   if (!users[uid].connectionType) users[uid].connectionType = "online";
   if (!users[uid].bedrockVersion) users[uid].bedrockVersion = "auto";
   if (!users[uid].offlineUsername) users[uid].offlineUsername = `AFK_${uid.slice(-4)}`;
-  
+  if (!users[uid].profiles) {
+      if (users[uid].linked) {
+          users[uid].profiles = [{ id: 'default', name: 'Main Account', created: Date.now() }];
+      } else {
+          users[uid].profiles = [];
+      }
+      delete users[uid].linked;
+  }
   return users[uid];
 }
 
-function getUserAuthDir(uid) {
-  const dir = path.join(AUTH_DIR, uid);
+function getUserAuthDir(uid, profileId) {
+  let dir;
+  if (!profileId || profileId === 'default') {
+      dir = path.join(AUTH_DIR, uid);
+  } else {
+      dir = path.join(AUTH_DIR, uid, profileId);
+  }
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
   return dir;
 }
 
 // ----------------- GLOBAL STATE -----------------
-const sessions = new Map();     // Bedrock sessions
-const pendingAuth = new Map();  // Auth flows
+const sessions = new Map();     
+const pendingAuth = new Map();
 
 const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.DirectMessages] });
 
-// ----------------- NOTIFICATION SYSTEM -----------------
+// ----------------- NOTIFICATIONS -----------------
 async function notifyUser(uid, message) {
     try {
         const user = await client.users.fetch(uid);
         await user.send(message);
-    } catch (e) {
-        // DMs closed or user unreachable, ignore silently to prevent crashing
-    }
+    } catch (e) {}
 }
 
 // ----------------- SESSION MANAGEMENT -----------------
 
-function destroySession(uid) {
-    const s = sessions.get(uid);
+function getSessionKey(uid, profileId) {
+    return `${uid}_${profileId || 'default'}`;
+}
+
+function destroySession(uid, profileId = 'default') {
+    const key = getSessionKey(uid, profileId);
+    const s = sessions.get(key);
+    
     if (!s) return;
 
-    // 1. Remove from Map IMMEDIATELY to prevent loop logic checks
-    sessions.delete(uid);
+    sessions.delete(key);
 
-    // 2. Clear Timers
+    // Clean up advanced logic loops
+    if (s.physicsLoop) clearInterval(s.physicsLoop);
+    if (s.moveTimer) clearTimeout(s.moveTimer);
+    if (s.reconnectTimer) clearTimeout(s.reconnectTimer);
     if (s.afkInterval) clearInterval(s.afkInterval);
     if (s.uptimeInterval) clearInterval(s.uptimeInterval);
-    if (s.reconnectTimer) clearTimeout(s.reconnectTimer);
 
-    // 3. Close Connections
     try {
         if (s.client) {
-            // CRITICAL FIX: Remove listeners BEFORE closing to prevent spam loop
-            s.client.removeAllListeners(); 
+            s.client.removeAllListeners();
             s.client.close();
         }
     } catch (e) {
-        console.error(`Error closing session for ${uid}:`, e.message);
+        console.error(`Error closing session ${key}:`, e.message);
     }
 
-    console.log(`[BEDROCK] Session destroyed for ${uid}`);
+    console.log(`[BEDROCK] Session destroyed: ${key}`);
 }
 
-function unlinkMicrosoft(uid) {
+function unlinkProfile(uid, profileId) {
     const u = getUser(uid);
-    u.linked = false;
+    u.profiles = u.profiles.filter(p => p.id !== profileId);
     saveDatabase();
-    
-    // Remove auth data
-    const authDir = getUserAuthDir(uid);
+    const dir = getUserAuthDir(uid, profileId);
     try {
-        if (fs.existsSync(authDir)) {
-            fs.rmSync(authDir, { recursive: true, force: true });
-        }
-    } catch (e) {
-        console.error(`Failed to delete auth dir for ${uid}:`, e);
-    }
+        if (fs.existsSync(dir)) fs.rmSync(dir, { recursive: true, force: true });
+    } catch (e) { console.error("Delete error:", e); }
+}
+
+// ----------------- MOVEMENT LOGIC (HIDDEN) -----------------
+
+// Linear interpolation
+const lerp = (start, end, amt) => (1 - amt) * start + amt * end;
+
+// Calculate Rotation
+function getLookRotation(currentPos, targetPos) {
+    const dx = targetPos.x - currentPos.x;
+    const dz = targetPos.z - currentPos.z;
+    const dy = targetPos.y - currentPos.y; 
+
+    const distance = Math.sqrt(dx * dx + dz * dz);
+    let yaw = Math.atan2(dz, dx) * (180 / Math.PI) - 90;
+    let pitch = -Math.atan2(dy, distance) * (180 / Math.PI);
+
+    return { yaw, pitch };
 }
 
 // ----------------- BEDROCK ENGINE -----------------
 
-async function startBedrock(uid, interaction, versionOverride) {
+async function prepareStart(uid, interaction, profileId, isUpdate = false) {
     const u = getUser(uid);
-    if (!u.server) return interaction.reply({ content: "❌ No server set! Go to Settings.", ephemeral: true });
+    const profile = u.profiles.find(p => p.id === profileId) || { id: 'default', name: 'Offline/Default' };
     
-    // 1. SESSION LOCK
-    if (sessions.has(uid)) {
-        return interaction.reply({ 
-            content: "❌ **Session Active:** Please terminate your old session before starting a new bot.", 
-            ephemeral: true 
-        });
+    // Config Check
+    if (!u.server) {
+        const msg = "❌ No server set! Go to Settings.";
+        if (isUpdate) return interaction.update({ content: msg, components: [] });
+        return interaction.reply({ content: msg, ephemeral: true });
     }
 
-    const authDir = getUserAuthDir(uid);
+    // Session Check
+    const key = getSessionKey(uid, profile.id);
+    if (sessions.has(key)) {
+        const msg = `❌ **Session Active:** This profile (${profile.name}) is already online. Stop it first.`;
+        if (isUpdate) return interaction.update({ content: msg, components: [] });
+        return interaction.reply({ content: msg, ephemeral: true });
+    }
+
+    // VIP Override / Limit Check
+    if (uid !== ROOT_ID) {
+        const active = Array.from(sessions.keys()).some(k => k.startsWith(uid));
+        if (active) {
+            const msg = "❌ **Limit Reached:** You can only have one active bot.";
+            if (isUpdate) return interaction.update({ content: msg, components: [] });
+            return interaction.reply({ content: msg, ephemeral: true });
+        }
+    }
+
+    const authDir = getUserAuthDir(uid, profile.id);
     const { ip, port } = u.server;
 
-    // 2. MOTD CHECK (Pre-connection ping)
-    await interaction.update({ content: `🔎 **Pinging ${ip}:${port}...**`, components: [], embeds: [] });
+    // Feedback
+    if (isUpdate) await interaction.update({ content: `🔎 **Pinging ${ip}:${port}...**`, components: [], embeds: [] });
+    else await interaction.reply({ content: `🔎 **Pinging ${ip}:${port}...**`, components: [], embeds: [], ephemeral: true });
 
     try {
-        // We ping just to check status
         await bedrock.ping({ host: ip, port: port, timeout: 5000 });
-        await interaction.editReply({ content: `✅ **Server Found! Joining...**` });
+        await interaction.editReply({ content: `✅ **Server Found! Joining as ${profile.name}...**` });
     } catch (e) {
-        return interaction.editReply({ content: `❌ **Connection Failed:** Server is offline or unreachable.\nReason: ${e.message || "Timeout"}` });
+        return interaction.editReply({ content: `❌ **Connection Failed:** Server offline.\nReason: ${e.message}` });
     }
 
-    // 3. JOIN CONFIGURATION
     const options = {
         host: ip,
         port: port,
         connectTimeout: 30000,
-        skipPing: false, // CRITICAL: Must be false for auto-version detection to work
-        version: versionOverride === "auto" ? undefined : versionOverride,
+        skipPing: false, 
+        version: u.bedrockVersion === "auto" ? undefined : u.bedrockVersion,
         offline: u.connectionType === "offline",
         username: u.connectionType === "offline" ? (u.offlineUsername || `AFK_${uid.slice(-4)}`) : uid,
         profilesFolder: u.connectionType === "online" ? authDir : undefined
     };
 
-    if (u.connectionType === "online" && !u.linked) {
-        return interaction.followUp({ content: "❌ Microsoft Account not linked! Use 'Link Xbox' first.", ephemeral: true });
+    if (u.connectionType === "online") {
+        const hasProfile = u.profiles.find(p => p.id === profile.id);
+        if (!hasProfile) return interaction.followUp({ content: "❌ Account not linked!", ephemeral: true });
     }
 
-    createBedrockInstance(uid, options, interaction);
+    createBedrockInstance(uid, profile.id, options, interaction);
 }
 
-function createBedrockInstance(uid, opts, interaction) {
+function createBedrockInstance(uid, profileId, opts, interaction, attempt = 0) {
     let botClient;
     try {
         botClient = bedrock.createClient(opts);
@@ -188,106 +226,399 @@ function createBedrockInstance(uid, opts, interaction) {
         return;
     }
 
+    const sessionKey = getSessionKey(uid, profileId);
+    
     const session = {
         client: botClient,
         connected: false,
         startTime: Date.now(),
         manualStop: false,
         opts: opts,
-        pos: { x: 0, y: 0, z: 0 },
-        congratsHours: 0
+        // Movement State
+        pos: { x: 0, y: 0, z: 0 }, 
+        targetPos: null,           
+        yaw: 0,
+        pitch: 0,
+        headYaw: 0,
+        tickCount: 0n,
+        
+        profileId: profileId,
+        rejoinAttempts: attempt
     };
-    sessions.set(uid, session);
+    sessions.set(sessionKey, session);
 
     botClient.on('spawn', () => {
         session.connected = true;
-        console.log(`[BEDROCK] ${uid} spawned on ${opts.host}`);
+        session.rejoinAttempts = 0;
+        console.log(`[BEDROCK] ${sessionKey} spawned`);
         if (interaction) interaction.followUp({ content: `✅ **Connected to ${opts.host}!**`, ephemeral: true });
         
-        // DM Notification: Spawn
-        notifyUser(uid, `🚀 **Bot Connected!**\nYour bot has successfully joined **${opts.host}**.`);
+        notifyUser(uid, `🚀 **Bot Connected!**\nProfile: ${profileId === 'default' ? 'Main' : 'Alt'}\nTarget: ${opts.host}`);
         
-        startAfkLogic(uid, session);
+        // Start advanced logic
+        startAdvancedLogic(uid, session);
     });
 
-    botClient.on('error', (err) => {
-        console.log(`[BEDROCK ERR] ${uid}:`, err.message);
-    });
+    botClient.on('error', (err) => console.log(`[ERR] ${sessionKey}:`, err.message));
 
     botClient.on('kick', (reason) => {
-        console.log(`[BEDROCK KICK] ${uid}:`, reason);
-        // Clean up listeners first to avoid spam
         botClient.removeAllListeners();
-        // DM Notification: Kick
-        notifyUser(uid, `⚠️ **Bot Kicked!**\nServer kicked the bot. Reason: \`${reason}\``);
-        destroySession(uid);
+        notifyUser(uid, `⚠️ **Bot Kicked!**\nReason: \`${reason}\``);
+        destroySession(uid, profileId);
     });
 
-    botClient.on('close', () => {
-        handleDisconnect(uid, session);
-    });
+    botClient.on('close', () => handleDisconnect(uid, session));
 
     botClient.on('move_player', (packet) => {
-        if (packet.runtime_id === botClient.entityId) session.pos = packet.position;
+        if (packet.runtime_id === botClient.entityId) {
+            session.pos = { x: packet.position.x, y: packet.position.y, z: packet.position.z };
+            session.targetPos = null; // Reset path on teleport
+        }
     });
 }
 
-// ----------------- SHARED LOGIC -----------------
+// ----------------- ADVANCED LOGIC (MOVEMENT & AFK) -----------------
 
-function startAfkLogic(uid, session) {
-    // 1. Movement Interval (Anti-AFK)
-    session.afkInterval = setInterval(() => {
+function startAdvancedLogic(uid, session) {
+    // 1. Move Scheduler (Randomized ~3 mins)
+    const scheduleNextMove = () => {
+        if (!sessions.get(getSessionKey(uid, session.profileId))) return;
+        // 160s - 200s delay
+        const delay = Math.floor(Math.random() * (200000 - 160000 + 1) + 160000);
+        
+        session.moveTimer = setTimeout(() => {
+            triggerMovement(session);
+            scheduleNextMove();
+        }, delay);
+    };
+
+    // 2. Trigger
+    const triggerMovement = (s) => {
+        const angle = Math.random() * Math.PI * 2;
+        const dist = 2 + Math.random() * 2; // 2-4 blocks
+        s.targetPos = {
+            x: s.pos.x + Math.cos(angle) * dist,
+            y: s.pos.y, 
+            z: s.pos.z + Math.sin(angle) * dist
+        };
+    };
+
+    // 3. Tick Loop (50ms)
+    session.physicsLoop = setInterval(() => {
+        if (!session.client) return;
+        
         try {
-            if (session.client) {
-                const yaw = Math.random() * 360;
-                session.client.write("player_auth_input", {
-                    pitch: 0, yaw: yaw, head_yaw: yaw,
-                    position: session.pos,
-                    move_vector: { x: 0, z: 0 },
-                    input_data: { _value: 0n },
-                    input_mode: 'mouse', play_mode: 'normal', tick: 0n, delta: { x: 0, y: 0, z: 0 }
-                });
-            }
-        } catch (e) {}
-    }, 10000);
+            s = session;
+            s.tickCount++;
 
-    // 2. Hourly Update
+            let delta = { x: 0, y: 0, z: 0 };
+            let moveVector = { x: 0, z: 0 };
+            let isMoving = false;
+
+            if (s.targetPos) {
+                isMoving = true;
+                const speed = 0.22; 
+
+                const dx = s.targetPos.x - s.pos.x;
+                const dz = s.targetPos.z - s.pos.z;
+                const dist = Math.sqrt(dx*dx + dz*dz);
+
+                if (dist < 0.3) {
+                    s.targetPos = null;
+                } else {
+                    const rotations = getLookRotation(s.pos, s.targetPos);
+                    s.yaw = lerp(s.yaw, rotations.yaw, 0.15); 
+                    s.headYaw = s.yaw;
+
+                    const moveX = (dx / dist) * speed;
+                    const moveZ = (dz / dist) * speed;
+
+                    s.pos.x += moveX;
+                    s.pos.z += moveZ;
+
+                    delta = { x: moveX, y: 0, z: moveZ };
+                    moveVector = { x: dx/dist, z: dz/dist };
+                }
+            } else {
+                // Micro-Jitter
+                if (Math.random() > 0.95) {
+                    s.headYaw += (Math.random() - 0.5) * 2;
+                    s.pitch += (Math.random() - 0.5) * 1;
+                    s.pitch = Math.max(-90, Math.min(90, s.pitch));
+                }
+            }
+
+            const inputFlags = isMoving ? { _value: 3n } : { _value: 0n };
+
+            s.client.write("player_auth_input", {
+                pitch: s.pitch,
+                yaw: s.yaw,
+                position: { x: s.pos.x, y: s.pos.y, z: s.pos.z },
+                move_vector: moveVector,
+                head_yaw: s.headYaw,
+                input_data: inputFlags,
+                input_mode: 'mouse',
+                play_mode: 'normal',
+                tick: s.tickCount,
+                delta: delta
+            });
+
+        } catch (e) {}
+    }, 50);
+
+    // 4. Hourly Congrats
     session.uptimeInterval = setInterval(async () => {
         session.congratsHours++;
-        notifyUser(uid, `🎉 **Status Update:** Your bot has been online for **${session.congratsHours} hours**! Keep it up! 🚀`);
+        notifyUser(uid, `🎉 **Status Update:** Bot has been online for **${session.congratsHours} hours**!`);
     }, 3600 * 1000);
+
+    scheduleNextMove(); 
 }
 
+// ----------------- SMART REJOIN LOGIC -----------------
+
 function handleDisconnect(uid, session) {
+    const key = getSessionKey(uid, session.profileId);
+    if (!sessions.has(key)) return;
+
+    // Cleanup timers
+    if (session.physicsLoop) clearInterval(session.physicsLoop);
+    if (session.moveTimer) clearTimeout(session.moveTimer);
+    if (session.reconnectTimer) clearTimeout(session.reconnectTimer);
     if (session.afkInterval) clearInterval(session.afkInterval);
     if (session.uptimeInterval) clearInterval(session.uptimeInterval);
 
-    // If already removed from sessions map, do nothing (prevents infinite recursion)
-    if (!sessions.has(uid)) return;
-
     if (session.manualStop) {
-        // DM Notification: Manual Stop
         notifyUser(uid, `⏹ **Bot Stopped.**\nYou manually terminated the session.`);
-        destroySession(uid);
+        destroySession(uid, session.profileId);
     } else {
-        console.log(`[BEDROCK] Disconnected ${uid}. Reconnecting in 30s...`);
-        // DM Notification: Crash/Disconnect
-        notifyUser(uid, `⚠️ **Disconnected!**\nConnection lost. Attempting to auto-reconnect in 30 seconds...`);
+        // Backoff: 10s -> 30s -> 60s -> 5min
+        let waitTime = 10000;
+        if (session.rejoinAttempts === 1) waitTime = 30000;
+        else if (session.rejoinAttempts >= 2 && session.rejoinAttempts < 5) waitTime = 60000;
+        else if (session.rejoinAttempts >= 5) waitTime = 300000;
+
+        notifyUser(uid, `⚠️ **Disconnected!**\nAuto-rejoining in ${waitTime / 1000} seconds... (Attempt ${session.rejoinAttempts + 1})`);
         
         session.reconnectTimer = setTimeout(() => {
-            if (sessions.has(uid) && !sessions.get(uid).manualStop) {
-                console.log(`[BEDROCK] Reconnecting ${uid} now...`);
-                // Force cleanup of old client before new one
+            if (sessions.has(key) && !sessions.get(key).manualStop) {
                 try { session.client.removeAllListeners(); session.client.close(); } catch(e){}
-                createBedrockInstance(uid, session.opts, null);
+                createBedrockInstance(uid, session.profileId, session.opts, null, session.rejoinAttempts + 1);
             } else {
-                destroySession(uid);
+                destroySession(uid, session.profileId);
             }
-        }, 30000);
+        }, waitTime);
     }
 }
 
-// ----------------- UI BUILDERS -----------------
+// ----------------- UI & INTERACTIONS -----------------
+
+client.on(Events.InteractionCreate, async (i) => {
+    if (i.guildId && !ALLOWED_GUILDS.includes(i.guildId)) return;
+    const uid = i.user.id;
+
+    try {
+        if (i.isChatInputCommand() && i.commandName === "panel") {
+            // Public Panel (Not ephemeral)
+            return i.reply({ content: "**Bedrock Bot Panel 🤖**", components: getPanel() });
+        }
+
+        if (i.isButton()) {
+            const id = i.customId;
+
+            // --- START FLOW ---
+            if (id === "pre_bedrock") {
+                const u = getUser(uid);
+                if (!u.server) return i.reply({ content: "❌ **Configuration Missing!** Go to Settings.", ephemeral: true });
+
+                // VIP Multi-Account Select
+                if (uid === ROOT_ID && u.profiles.length > 1) {
+                    const select = new StringSelectMenuBuilder()
+                        .setCustomId("start_select")
+                        .setPlaceholder("Select Account to Use")
+                        .addOptions(u.profiles.map(p => ({ label: p.name, value: p.id, description: `ID: ${p.id}` })));
+                    
+                    return i.reply({ content: "Choose an account:", components: [new ActionRowBuilder().addComponents(select)], ephemeral: true });
+                }
+
+                // Default Flow
+                const profileId = u.profiles.length > 0 ? u.profiles[0].id : 'default';
+                return showPreFlight(i, u, profileId, false); // false = reply new message
+            }
+
+            if (id.startsWith("start_conf_")) {
+                const profileId = id.replace("start_conf_", "");
+                // This happens inside ephemeral message, so we update it
+                return prepareStart(uid, i, profileId, true);
+            }
+            
+            if (id === "cancel") return i.update({ content: "❌ Cancelled.", components: [], embeds: [] });
+
+            // --- STOP FLOW ---
+            if (id === "stop_bedrock") {
+                const userSessions = Array.from(sessions.entries()).filter(([k, v]) => k.startsWith(uid + "_"));
+                
+                if (userSessions.length === 0) return i.reply({ content: "❌ No bots running.", ephemeral: true });
+
+                if (userSessions.length === 1) {
+                    const s = userSessions[0][1];
+                    s.manualStop = true;
+                    destroySession(uid, s.profileId);
+                    return i.reply({ content: "⏹ **Stopping Bot...**", ephemeral: true });
+                } else {
+                    const select = new StringSelectMenuBuilder()
+                        .setCustomId("stop_select")
+                        .setPlaceholder("Select Bot to Stop")
+                        .addOptions(userSessions.map(([k, s]) => ({ 
+                            label: `Bot on ${s.opts.host}`, 
+                            value: s.profileId, 
+                            description: `Profile: ${s.profileId}` 
+                        })));
+                    return i.reply({ content: "Select which bot to stop:", components: [new ActionRowBuilder().addComponents(select)], ephemeral: true });
+                }
+            }
+
+            // --- SETTINGS ---
+            if (id === "set_bedrock") {
+                const u = getUser(uid);
+                const m = new ModalBuilder().setCustomId("modal_bedrock").setTitle("Bedrock Settings");
+                const ip = new TextInputBuilder().setCustomId("ip").setLabel("IP").setStyle(TextInputStyle.Short).setValue(u.server?.ip || "").setRequired(true);
+                const port = new TextInputBuilder().setCustomId("port").setLabel("Port").setStyle(TextInputStyle.Short).setValue(String(u.server?.port || 19132));
+                const user = new TextInputBuilder().setCustomId("off").setLabel("Offline Username").setStyle(TextInputStyle.Short).setValue(u.offlineUsername || "");
+                m.addComponents(new ActionRowBuilder().addComponents(ip), new ActionRowBuilder().addComponents(port), new ActionRowBuilder().addComponents(user));
+                return i.showModal(m);
+            }
+
+            // --- LINKING ---
+            if (id === "link") return handleLink(uid, i);
+            
+            if (id === "unlink") {
+                const u = getUser(uid);
+                if (u.profiles.length === 0) return i.reply({ content: "❌ Nothing to unlink.", ephemeral: true });
+
+                if (uid === ROOT_ID && u.profiles.length > 1) {
+                    const select = new StringSelectMenuBuilder()
+                        .setCustomId("unlink_select")
+                        .setPlaceholder("Select Account to Remove")
+                        .addOptions(u.profiles.map(p => ({ label: p.name, value: p.id })));
+                    return i.reply({ content: "Select account to unlink:", components: [new ActionRowBuilder().addComponents(select)], ephemeral: true });
+                }
+
+                unlinkProfile(uid, u.profiles[0].id);
+                return i.reply({ content: "🗑 **Account Unlinked.**", ephemeral: true });
+            }
+        }
+
+        // --- MENUS ---
+        if (i.isStringSelectMenu()) {
+            if (i.customId === "sel_bed_ver") {
+                const u = getUser(uid);
+                u.bedrockVersion = i.values[0];
+                saveDatabase();
+                
+                // Get profileId from the existing button logic or default
+                let profileId = 'default';
+                try {
+                    const oldId = i.message.components[1].components[0].customId;
+                    if (oldId && oldId.startsWith("start_conf_")) profileId = oldId.replace("start_conf_", "");
+                } catch(e) {}
+
+                const verRow = getVersionSelector(i.values[0]);
+                const confirmRow = new ActionRowBuilder().addComponents(
+                    new ButtonBuilder().setCustomId(`start_conf_${profileId}`).setLabel("✅ Connect Now").setStyle(ButtonStyle.Success),
+                    new ButtonBuilder().setCustomId("cancel").setLabel("Cancel").setStyle(ButtonStyle.Secondary)
+                );
+                return i.update({ components: [verRow, confirmRow] });
+            }
+
+            if (i.customId === "start_select") {
+                const u = getUser(uid);
+                // Updating the ephemeral menu to the preflight check
+                return showPreFlight(i, u, i.values[0], true);
+            }
+
+            if (i.customId === "stop_select") {
+                const profileId = i.values[0];
+                const key = getSessionKey(uid, profileId);
+                const s = sessions.get(key);
+                if (s) {
+                    s.manualStop = true;
+                    destroySession(uid, profileId);
+                    return i.update({ content: `⏹ **Stopped bot on profile ${profileId}.**`, components: [] });
+                }
+                return i.update({ content: "❌ Session not found.", components: [] });
+            }
+
+            if (i.customId === "unlink_select") {
+                unlinkProfile(uid, i.values[0]);
+                return i.update({ content: `🗑 **Profile ${i.values[0]} removed.**`, components: [] });
+            }
+        }
+
+        if (i.isModalSubmit() && i.customId === "modal_bedrock") {
+            const u = getUser(uid);
+            u.server = { ip: i.fields.getTextInputValue("ip"), port: parseInt(i.fields.getTextInputValue("port")) };
+            u.offlineUsername = i.fields.getTextInputValue("off");
+            saveDatabase();
+            // Response to modal submit is private
+            return i.reply({ content: "✅ Settings saved.", ephemeral: true });
+        }
+
+    } catch (err) { console.error("Ix Err:", err); }
+});
+
+// ----------------- HELPERS -----------------
+
+function showPreFlight(i, u, profileId, isUpdate) {
+    const verRow = getVersionSelector(u.bedrockVersion);
+    const confirmRow = new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId(`start_conf_${profileId}`).setLabel("✅ Connect Now").setStyle(ButtonStyle.Success),
+        new ButtonBuilder().setCustomId("cancel").setLabel("Cancel").setStyle(ButtonStyle.Secondary)
+    );
+    const pName = u.profiles.find(p => p.id === profileId)?.name || "Default";
+    const content = `**Pre-Flight Check**\nAccount: **${pName}**\nTarget: \`${u.server.ip}:${u.server.port}\`\n\n*Ready to join?*`;
+    
+    // Crucial: Use update if modifying existing ephemeral message, reply if creating new one
+    if (isUpdate) return i.update({ content: content, components: [verRow, confirmRow] });
+    return i.reply({ content: content, components: [verRow, confirmRow], ephemeral: true });
+}
+
+async function handleLink(uid, interaction) {
+    if (pendingAuth.has(uid)) return interaction.reply({ content: "⏳ Auth pending.", ephemeral: true });
+    const u = getUser(uid);
+    
+    // RESTRICTION: Normal user limit
+    if (uid !== ROOT_ID && u.profiles.length >= 1) {
+        return interaction.reply({ content: "❌ **You cant link more than one Xbox account!**\nUnlink your current one first.", ephemeral: true });
+    }
+    
+    const newProfileId = (u.profiles.length === 0) ? 'default' : crypto.randomUUID().split('-')[0];
+    const newAuthDir = getUserAuthDir(uid, newProfileId);
+
+    const flow = new Authflow(uid, newAuthDir, { flow: "live", authTitle: Titles.MinecraftNintendoSwitch, deviceType: "Nintendo" }, async (res) => {
+        const link = res.verification_uri_complete || res.verification_uri;
+        const row = new ActionRowBuilder().addComponents(new ButtonBuilder().setLabel("Login to Microsoft").setStyle(ButtonStyle.Link).setURL(link));
+        // Link request is always private
+        interaction.editReply({ content: `🔐 **Code:** \`${res.user_code}\`\n*Link new account...*`, components: [row] }).catch(()=>{});
+    });
+
+    await interaction.deferReply({ ephemeral: true });
+    pendingAuth.set(uid, true);
+
+    try {
+        await flow.getMsaToken();
+        const u = getUser(uid);
+        const name = `Xbox Account ${u.profiles.length + 1}`;
+        u.profiles.push({ id: newProfileId, name: name, created: Date.now() });
+        saveDatabase();
+        interaction.followUp({ content: "✅ **Linked Successfully!**", ephemeral: true });
+    } catch (e) {
+        interaction.followUp({ content: `❌ Auth Failed: ${e.message}`, ephemeral: true });
+        try { fs.rmSync(newAuthDir, { recursive: true, force: true }); } catch(e){}
+    } finally {
+        pendingAuth.delete(uid);
+    }
+}
 
 function getVersionSelector(current) {
     const bv = [
@@ -296,13 +627,9 @@ function getVersionSelector(current) {
         { label: "1.21.40", value: "1.21.40" }, { label: "1.21.20", value: "1.21.20" },
         { label: "1.21.0", value: "1.21.0" }, { label: "1.20.80", value: "1.20.80" }
     ];
-
     const safeCurrent = bv.find(x => x.value === current) ? current : "auto";
-
     return new ActionRowBuilder().addComponents(
-        new StringSelectMenuBuilder()
-            .setCustomId("sel_bed_ver")
-            .setPlaceholder(`Selected: ${safeCurrent}`)
+        new StringSelectMenuBuilder().setCustomId("sel_bed_ver").setPlaceholder(`Version: ${safeCurrent}`)
             .addOptions(bv.map(v => ({ label: v.label, value: v.value, default: v.value === safeCurrent })))
     );
 }
@@ -321,146 +648,14 @@ function getPanel() {
     ];
 }
 
-// ----------------- INTERACTION HANDLER -----------------
-
-client.on(Events.InteractionCreate, async (i) => {
-    if (i.guildId && !ALLOWED_GUILDS.includes(i.guildId)) return;
-    const uid = i.user.id;
-
-    try {
-        // --- COMMANDS ---
-        if (i.isChatInputCommand()) {
-            if (i.commandName === "panel") return i.reply({ content: "**Bedrock Bot Panel 🤖**", components: getPanel() });
-        }
-
-        // --- BUTTONS ---
-        if (i.isButton()) {
-            const id = i.customId;
-
-            // PRE-FLIGHT
-            if (id === "pre_bedrock") {
-                // SESSION LOCK CHECK
-                if (sessions.has(uid)) {
-                    return i.reply({ content: "❌ **Session Active:** Please terminate your old session before starting a new bot.", ephemeral: true });
-                }
-
-                const u = getUser(uid);
-                if (!u.server) return i.reply({ content: "❌ **Configuration Missing!** Please click 'Settings' first.", ephemeral: true });
-
-                const verRow = getVersionSelector(u.bedrockVersion);
-                const confirmRow = new ActionRowBuilder().addComponents(
-                    new ButtonBuilder().setCustomId(`start_bedrock`).setLabel("✅ Connect Now").setStyle(ButtonStyle.Success),
-                    new ButtonBuilder().setCustomId("cancel").setLabel("Cancel").setStyle(ButtonStyle.Secondary)
-                );
-
-                return i.reply({ 
-                    content: `**Pre-Flight Check (Bedrock)**\nTarget: \`${u.server.ip}:${u.server.port}\`\n\n*Does this look correct? Select version if auto-detect fails.*`,
-                    components: [verRow, confirmRow], 
-                    ephemeral: true 
-                });
-            }
-
-            // START SIGNAL
-            if (id === "start_bedrock") return startBedrock(uid, i, getUser(uid).bedrockVersion || "auto");
-            
-            if (id === "cancel") return i.update({ content: "❌ Cancelled.", components: [], embeds: [] });
-
-            // STOP SIGNAL
-            if (id === "stop_bedrock") {
-                const s = sessions.get(uid);
-                if (!s) return i.reply({ content: "❌ No Bedrock bot running.", ephemeral: true });
-                s.manualStop = true;
-                destroySession(uid);
-                return i.reply({ content: "⏹ **Stopping Bedrock Bot...**", ephemeral: true });
-            }
-
-            // SETTINGS MODAL
-            if (id === "set_bedrock") {
-                const u = getUser(uid);
-                const m = new ModalBuilder().setCustomId("modal_bedrock").setTitle("Bedrock Settings");
-                const ip = new TextInputBuilder().setCustomId("ip").setLabel("IP").setStyle(TextInputStyle.Short).setValue(u.server?.ip || "").setRequired(true);
-                const port = new TextInputBuilder().setCustomId("port").setLabel("Port").setStyle(TextInputStyle.Short).setValue(String(u.server?.port || 19132));
-                const user = new TextInputBuilder().setCustomId("off").setLabel("Offline Username").setStyle(TextInputStyle.Short).setValue(u.offlineUsername || "");
-                m.addComponents(new ActionRowBuilder().addComponents(ip), new ActionRowBuilder().addComponents(port), new ActionRowBuilder().addComponents(user));
-                return i.showModal(m);
-            }
-
-            // AUTH ACTIONS
-            if (id === "link") return handleLink(uid, i);
-            if (id === "unlink") { 
-                unlinkMicrosoft(uid); 
-                return i.reply({ content: "🗑 Unlinked.", ephemeral: true }); 
-            }
-        }
-
-        // --- MENUS ---
-        if (i.isStringSelectMenu()) {
-            if (i.customId === "sel_bed_ver") {
-                const u = getUser(uid);
-                u.bedrockVersion = i.values[0];
-                saveDatabase();
-                const verRow = getVersionSelector(i.values[0]);
-                const confirmRow = new ActionRowBuilder().addComponents(
-                    new ButtonBuilder().setCustomId(`start_bedrock`).setLabel("✅ Connect Now").setStyle(ButtonStyle.Success),
-                    new ButtonBuilder().setCustomId("cancel").setLabel("Cancel").setStyle(ButtonStyle.Secondary)
-                );
-                return i.update({ components: [verRow, confirmRow] });
-            }
-        }
-
-        // --- MODAL SUBMITS ---
-        if (i.isModalSubmit()) {
-            if (i.customId === "modal_bedrock") {
-                const u = getUser(uid);
-                u.server = { ip: i.fields.getTextInputValue("ip"), port: parseInt(i.fields.getTextInputValue("port")) };
-                u.offlineUsername = i.fields.getTextInputValue("off");
-                saveDatabase();
-                return i.reply({ content: "✅ Bedrock settings saved.", ephemeral: true });
-            }
-        }
-
-    } catch (err) {
-        console.error("Interaction Error:", err);
-    }
-});
-
-// ----------------- HELPERS -----------------
-
-async function handleLink(uid, interaction) {
-    if (pendingAuth.has(uid)) return interaction.reply({ content: "⏳ Auth already pending.", ephemeral: true });
-    
-    const flow = new Authflow(uid, getUserAuthDir(uid), { flow: "live", authTitle: Titles.MinecraftNintendoSwitch, deviceType: "Nintendo" }, async (res) => {
-        const link = res.verification_uri_complete || res.verification_uri;
-        const row = new ActionRowBuilder().addComponents(new ButtonBuilder().setLabel("Login to Microsoft").setStyle(ButtonStyle.Link).setURL(link));
-        interaction.editReply({ content: `🔐 **Code:** \`${res.user_code}\``, components: [row] }).catch(()=>{});
-    });
-
-    await interaction.deferReply({ ephemeral: true });
-    pendingAuth.set(uid, true);
-
-    try {
-        await flow.getMsaToken();
-        const u = getUser(uid);
-        u.linked = true;
-        saveDatabase();
-        interaction.followUp({ content: "✅ **Linked Successfully!**", ephemeral: true });
-    } catch (e) {
-        interaction.followUp({ content: `❌ Auth Failed: ${e.message}`, ephemeral: true });
-    } finally {
-        pendingAuth.delete(uid);
-    }
-}
-
-// ----------------- STARTUP -----------------
-client.once("ready", async () => {
-    console.log(`🟢 Bot Online: ${client.user.tag}`);
-    client.application.commands.set([
-        new SlashCommandBuilder().setName("panel").setDescription("Bedrock Panel")
-    ]);
+client.once("ready", () => {
+    console.log(`🟢 Online: ${client.user.tag}`);
+    client.application.commands.set([ new SlashCommandBuilder().setName("panel").setDescription("Bedrock Panel") ]);
 });
 
 process.on("uncaughtException", (e) => console.error("Uncaught:", e));
 process.on("unhandledRejection", (e) => console.error("Unhandled:", e));
 
 client.login(DISCORD_TOKEN);
+
 
