@@ -85,7 +85,6 @@ async function notifyUser(uid, message) {
         await user.send(message);
     } catch (e) {
         // DMs closed or user unreachable, ignore silently to prevent crashing
-        console.log(`Could not DM user ${uid}: ${e.message}`);
     }
 }
 
@@ -95,23 +94,25 @@ function destroySession(uid) {
     const s = sessions.get(uid);
     if (!s) return;
 
-    // 1. Clear Timers
+    // 1. Remove from Map IMMEDIATELY to prevent loop logic checks
+    sessions.delete(uid);
+
+    // 2. Clear Timers
     if (s.afkInterval) clearInterval(s.afkInterval);
     if (s.uptimeInterval) clearInterval(s.uptimeInterval);
     if (s.reconnectTimer) clearTimeout(s.reconnectTimer);
 
-    // 2. Close Connections
+    // 3. Close Connections
     try {
         if (s.client) {
+            // CRITICAL FIX: Remove listeners BEFORE closing to prevent spam loop
+            s.client.removeAllListeners(); 
             s.client.close();
-            s.client.removeAllListeners();
         }
     } catch (e) {
         console.error(`Error closing session for ${uid}:`, e.message);
     }
 
-    // 3. Delete from Memory
-    sessions.delete(uid);
     console.log(`[BEDROCK] Session destroyed for ${uid}`);
 }
 
@@ -138,7 +139,6 @@ async function startBedrock(uid, interaction, versionOverride) {
     if (!u.server) return interaction.reply({ content: "❌ No server set! Go to Settings.", ephemeral: true });
     
     // 1. SESSION LOCK
-    // If user already has a running session, deny new one.
     if (sessions.has(uid)) {
         return interaction.reply({ 
             content: "❌ **Session Active:** Please terminate your old session before starting a new bot.", 
@@ -149,11 +149,11 @@ async function startBedrock(uid, interaction, versionOverride) {
     const authDir = getUserAuthDir(uid);
     const { ip, port } = u.server;
 
-    // 2. MOTD CHECK (Ping before join)
+    // 2. MOTD CHECK (Pre-connection ping)
     await interaction.update({ content: `🔎 **Pinging ${ip}:${port}...**`, components: [], embeds: [] });
 
     try {
-        // We ping just to check status. Timeout 5s.
+        // We ping just to check status
         await bedrock.ping({ host: ip, port: port, timeout: 5000 });
         await interaction.editReply({ content: `✅ **Server Found! Joining...**` });
     } catch (e) {
@@ -161,12 +161,11 @@ async function startBedrock(uid, interaction, versionOverride) {
     }
 
     // 3. JOIN CONFIGURATION
-    // CRITICAL FIX: skipPing MUST be false for 'auto' version detection to work properly.
     const options = {
         host: ip,
         port: port,
         connectTimeout: 30000,
-        skipPing: false, // Ensures internal ping happens to negotiate version
+        skipPing: false, // CRITICAL: Must be false for auto-version detection to work
         version: versionOverride === "auto" ? undefined : versionOverride,
         offline: u.connectionType === "offline",
         username: u.connectionType === "offline" ? (u.offlineUsername || `AFK_${uid.slice(-4)}`) : uid,
@@ -217,8 +216,11 @@ function createBedrockInstance(uid, opts, interaction) {
 
     botClient.on('kick', (reason) => {
         console.log(`[BEDROCK KICK] ${uid}:`, reason);
+        // Clean up listeners first to avoid spam
+        botClient.removeAllListeners();
         // DM Notification: Kick
         notifyUser(uid, `⚠️ **Bot Kicked!**\nServer kicked the bot. Reason: \`${reason}\``);
+        destroySession(uid);
     });
 
     botClient.on('close', () => {
@@ -260,6 +262,9 @@ function handleDisconnect(uid, session) {
     if (session.afkInterval) clearInterval(session.afkInterval);
     if (session.uptimeInterval) clearInterval(session.uptimeInterval);
 
+    // If already removed from sessions map, do nothing (prevents infinite recursion)
+    if (!sessions.has(uid)) return;
+
     if (session.manualStop) {
         // DM Notification: Manual Stop
         notifyUser(uid, `⏹ **Bot Stopped.**\nYou manually terminated the session.`);
@@ -272,6 +277,8 @@ function handleDisconnect(uid, session) {
         session.reconnectTimer = setTimeout(() => {
             if (sessions.has(uid) && !sessions.get(uid).manualStop) {
                 console.log(`[BEDROCK] Reconnecting ${uid} now...`);
+                // Force cleanup of old client before new one
+                try { session.client.removeAllListeners(); session.client.close(); } catch(e){}
                 createBedrockInstance(uid, session.opts, null);
             } else {
                 destroySession(uid);
@@ -301,7 +308,6 @@ function getVersionSelector(current) {
 }
 
 function getPanel() {
-    // Technical button REMOVED as requested
     return [
         new ActionRowBuilder().addComponents(
             new ButtonBuilder().setCustomId("pre_bedrock").setLabel("▶ Start").setStyle(ButtonStyle.Success),
@@ -333,7 +339,7 @@ client.on(Events.InteractionCreate, async (i) => {
 
             // PRE-FLIGHT
             if (id === "pre_bedrock") {
-                // SESSION LOCK CHECK (Visual)
+                // SESSION LOCK CHECK
                 if (sessions.has(uid)) {
                     return i.reply({ content: "❌ **Session Active:** Please terminate your old session before starting a new bot.", ephemeral: true });
                 }
