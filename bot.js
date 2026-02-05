@@ -1,6 +1,6 @@
 /**
  * AFKBot Panel 🎛️
- * Fixed Auth Link & Settings Modal.
+ * Removed 'My Status'. Fixed Settings Modal.
  */
 
 const {
@@ -86,8 +86,8 @@ function getStaticPanel() {
         new ButtonBuilder().setCustomId("settings").setLabel("Configure").setStyle(ButtonStyle.Secondary).setEmoji("⚙️")
     );
 
+    // Removed "My Status" button as requested
     const row2 = new ActionRowBuilder().addComponents(
-        new ButtonBuilder().setCustomId("status").setLabel("My Status").setStyle(ButtonStyle.Secondary).setEmoji("👤"),
         new ButtonBuilder().setCustomId("link").setLabel("Link Account").setStyle(ButtonStyle.Primary),
         new ButtonBuilder().setCustomId("unlink").setLabel("Unlink / Reset").setStyle(ButtonStyle.Danger)
     );
@@ -221,17 +221,6 @@ client.on(Events.InteractionCreate, async (i) => {
         }
 
         if (i.isButton()) {
-            // --- CHECK STATUS BUTTON ---
-            if (i.customId === "status") {
-                const u = getUser(uid);
-                const s = sessions.has(uid);
-                let msg = `👤 **Your Status:**\n`;
-                msg += `• **Account:** ${u.linked ? "✅ Linked (Online Mode)" : "⚠️ Unlinked (Offline Mode)"}\n`;
-                msg += `• **Bot:** ${s ? "🟢 Running" : "🔴 Stopped"}\n`;
-                msg += `• **Target:** \`${u.ip || "Not Set"}:${u.port}\``;
-                return i.reply({ content: msg, ephemeral: true });
-            }
-
             if (i.customId === "start") return startBot(uid, i, false);
             
             if (i.customId === "stop") {
@@ -239,16 +228,38 @@ client.on(Events.InteractionCreate, async (i) => {
                 return i.reply({ content: stopped ? "⏹ **Bot Stopped.**" : "⚠️ **No bot running.**", ephemeral: true });
             }
 
-            // --- CONFIG BUTTON FIX ---
+            // --- CONFIG BUTTON ---
             if (i.customId === "settings") {
-                // DO NOT deferReply here, modals must be the first response!
                 const u = getUser(uid);
                 const modal = new ModalBuilder().setCustomId("settings_modal").setTitle("Bot Configuration");
+                
+                const ipInput = new TextInputBuilder()
+                    .setCustomId("ip")
+                    .setLabel("Server IP")
+                    .setStyle(TextInputStyle.Short)
+                    .setValue(u.ip || "")
+                    .setRequired(true);
+
+                const portInput = new TextInputBuilder()
+                    .setCustomId("port")
+                    .setLabel("Port")
+                    .setStyle(TextInputStyle.Short)
+                    .setValue(String(u.port || "19132"))
+                    .setRequired(true);
+
+                const userInput = new TextInputBuilder()
+                    .setCustomId("user")
+                    .setLabel("Offline Username")
+                    .setStyle(TextInputStyle.Short)
+                    .setValue(u.username || "Bot_User")
+                    .setRequired(true);
+
                 modal.addComponents(
-                    new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("ip").setLabel("Server IP").setStyle(TextInputStyle.Short).setValue(u.ip || "").setRequired(true)),
-                    new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("port").setLabel("Port").setStyle(TextInputStyle.Short).setValue(String(u.port)).setRequired(true)),
-                    new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("user").setLabel("Offline Username").setStyle(TextInputStyle.Short).setValue(u.username).setRequired(true))
+                    new ActionRowBuilder().addComponents(ipInput),
+                    new ActionRowBuilder().addComponents(portInput),
+                    new ActionRowBuilder().addComponents(userInput)
                 );
+                
                 return i.showModal(modal);
             }
 
@@ -299,7 +310,6 @@ async function handleLink(uid, i) {
     const flow = new Authflow(uid, path.join(CONFIG.PATHS.AUTH, uid), { 
         flow: "live", authTitle: Titles.MinecraftNintendoSwitch, deviceType: "Nintendo" 
     }, async (res) => {
-        // FIX: Ensure a fallback URL is used if verification_uri_complete is missing
         const link = res.verification_uri_complete || res.verification_uri || "https://microsoft.com/link";
         
         const row = new ActionRowBuilder().addComponents(
