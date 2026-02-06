@@ -106,8 +106,9 @@ function destroySession(uid, profileId = 'default') {
 
     sessions.delete(key);
 
-    // Clean up timers
+    // Clean up timers (Added actionLoop)
     if (s.afkLoop) clearInterval(s.afkLoop);
+    if (s.actionLoop) clearInterval(s.actionLoop);
     if (s.moveTimer) clearTimeout(s.moveTimer);
     if (s.reconnectTimer) clearTimeout(s.reconnectTimer);
     if (s.uptimeInterval) clearInterval(s.uptimeInterval);
@@ -220,12 +221,18 @@ function createBedrockInstance(uid, profileId, opts, interaction, attempt = 0) {
         yaw: 0,
         pitch: 0,
         tickCount: 0n,
+        runtimeEntityId: null, // Critical for animations
         congratsHours: 0,
         
         profileId: profileId,
         rejoinAttempts: attempt
     };
     sessions.set(sessionKey, session);
+
+    // Capture Entity ID for animations
+    botClient.on('start_game', (packet) => {
+        session.runtimeEntityId = packet.runtime_entity_id;
+    });
 
     botClient.on('spawn', () => {
         session.connected = true;
@@ -255,7 +262,7 @@ function createBedrockInstance(uid, profileId, opts, interaction, attempt = 0) {
     });
 }
 
-// ----------------- IMPROVED ANTI-AFK LOGIC -----------------
+// ----------------- IMPROVED ANTI-AFK LOGIC (FIXED TIMEOUTS) -----------------
 
 function startAfkLogic(uid, session) {
     // 1. Packet Loop (Keep-Alive & Head Rotation)
@@ -290,13 +297,25 @@ function startAfkLogic(uid, session) {
         } catch (e) {}
     }, 100); // 100ms = 10 ticks/sec
 
-    // 2. Teleport Movement (0.5 blocks)
+    // 2. ACTION LOOP (NEW: Prevents "Ghost" timeouts)
+    // Punches the air every 5 seconds. This keeps the connection "hot".
+    session.actionLoop = setInterval(() => {
+        if (!session.client || !session.runtimeEntityId) return;
+        try {
+            session.client.write("animate", {
+                action_id: 1, // Swing Arm
+                runtime_entity_id: session.runtimeEntityId
+            });
+        } catch (e) {}
+    }, 5000);
+
+    // 3. Teleport Movement (0.5 blocks)
     // Moves slightly every random interval to prevent server AFK detection
     const scheduleTeleport = () => {
         if (!sessions.get(getSessionKey(uid, session.profileId))) return;
 
-        // Random interval: 2 to 4 minutes
-        const delay = Math.floor(Math.random() * (240000 - 120000 + 1) + 120000);
+        // Random interval: 30s to 90s (More frequent to prevent 1h timeouts)
+        const delay = Math.floor(Math.random() * (90000 - 30000 + 1) + 30000);
         
         session.moveTimer = setTimeout(() => {
             if (session.client) {
@@ -315,7 +334,7 @@ function startAfkLogic(uid, session) {
 
     scheduleTeleport();
 
-    // 3. Hourly Stats
+    // 4. Hourly Stats
     session.uptimeInterval = setInterval(async () => {
         session.congratsHours++;
         notifyUser(uid, `🎉 **Status Update:** Bot has been online for **${session.congratsHours} hours**!`);
@@ -330,6 +349,7 @@ function handleDisconnect(uid, session) {
 
     // Cleanup timers
     if (session.afkLoop) clearInterval(session.afkLoop);
+    if (session.actionLoop) clearInterval(session.actionLoop);
     if (session.moveTimer) clearTimeout(session.moveTimer);
     if (session.reconnectTimer) clearTimeout(session.reconnectTimer);
     if (session.uptimeInterval) clearInterval(session.uptimeInterval);
