@@ -54,7 +54,10 @@ function saveDatabase() {
 function getUser(uid) {
   if (!users[uid]) users[uid] = {};
   if (!users[uid].connectionType) users[uid].connectionType = "online";
-  if (!users[uid].bedrockVersion) users[uid].bedrockVersion = "auto";
+  
+  // Default to a safe recent version instead of auto
+  if (!users[uid].bedrockVersion || users[uid].bedrockVersion === "auto") users[uid].bedrockVersion = "1.21.60";
+  
   if (!users[uid].offlineUsername) users[uid].offlineUsername = `AFK_${uid.slice(-4)}`;
   if (!users[uid].profiles) {
       if (users[uid].linked) {
@@ -90,20 +93,6 @@ async function notifyUser(uid, message) {
         const user = await client.users.fetch(uid);
         await user.send(message);
     } catch (e) {}
-}
-
-// ----------------- VERSION RESOLVER (CRITICAL FIX) -----------------
-// Maps unsupported new minor versions to known stable protocol versions
-function resolveSafeVersion(detectedVer) {
-    if (!detectedVer) return undefined;
-    
-    // Fix for 1.21.132 -> 1.21.130 (Protocol 766 compatibility)
-    if (detectedVer.includes("1.21.13")) return "1.21.130";
-    if (detectedVer.includes("1.21.12")) return "1.21.124";
-    
-    // Fallback: If version is totally unknown, try to force 1.21.130 as it's most common right now
-    // or return the original if it looks like a main version.
-    return detectedVer;
 }
 
 // ----------------- SESSION MANAGEMENT -----------------
@@ -191,31 +180,21 @@ async function prepareStart(uid, interaction, profileId, isUpdate = false) {
     if (isUpdate) await interaction.update({ content: `🔎 **Pinging ${ip}:${port}...**`, components: [], embeds: [] });
     else await interaction.reply({ content: `🔎 **Pinging ${ip}:${port}...**`, components: [], embeds: [], ephemeral: true });
 
-    let detectedVersion = null;
-
     try {
-        const pong = await bedrock.ping({ host: ip, port: port, timeout: 5000 });
-        detectedVersion = pong.version;
-        // Logic to fix "Unsupported version" error
-        const safeVersion = resolveSafeVersion(detectedVersion);
-        
-        await interaction.editReply({ content: `✅ **Server Found! (v${detectedVersion} -> using v${safeVersion}) Joining as ${profile.name}...**` });
-        
-        // Use the safe version for connection
-        detectedVersion = safeVersion; 
+        // Just ping to check if online, ignore version
+        await bedrock.ping({ host: ip, port: port, timeout: 5000 });
+        await interaction.editReply({ content: `✅ **Server Found! Joining as ${profile.name}...**\nUsing version: \`${u.bedrockVersion}\`` });
     } catch (e) {
         return interaction.editReply({ content: `❌ **Connection Failed:** Server offline.\nReason: ${e.message}` });
     }
 
-    // Determine Version Strategy
-    const targetVersion = u.bedrockVersion === "auto" ? detectedVersion : u.bedrockVersion;
-
+    // STRICT VERSION USAGE (No auto-detect)
     const options = {
         host: ip,
         port: port,
         connectTimeout: 30000,
         skipPing: false, 
-        version: targetVersion, 
+        version: u.bedrockVersion, // STRICTLY USER DEFINED
         offline: u.connectionType === "offline",
         username: u.connectionType === "offline" ? (u.offlineUsername || `AFK_${uid.slice(-4)}`) : uid,
         profilesFolder: u.connectionType === "online" ? authDir : undefined
@@ -226,7 +205,7 @@ async function prepareStart(uid, interaction, profileId, isUpdate = false) {
         if (!hasProfile) return interaction.followUp({ content: "❌ Account not linked!", ephemeral: true });
     }
 
-    console.log(`[INIT] Starting bot for ${uid} on ${ip}:${port} (Target: v${targetVersion})`);
+    console.log(`[INIT] Starting bot for ${uid} on ${ip}:${port} (Forced v${u.bedrockVersion})`);
     createBedrockInstance(uid, profile.id, options, interaction);
 }
 
@@ -255,7 +234,7 @@ function createBedrockInstance(uid, profileId, opts, interaction, attempt = 0) {
         tickCount: 0n,
         runtimeEntityId: null, 
         congratsHours: 0,
-        isDestroying: false, // Flag to prevent spam loop
+        isDestroying: false, 
         
         profileId: profileId,
         rejoinAttempts: attempt
@@ -372,9 +351,8 @@ function startAfkLogic(uid, session) {
 
 function handleDisconnect(uid, session) {
     const key = getSessionKey(uid, session.profileId);
-    if (!sessions.has(key)) return; // Already destroyed
+    if (!sessions.has(key)) return; 
 
-    // Stop loops immediately
     if (session.afkLoop) clearInterval(session.afkLoop);
     if (session.actionLoop) clearInterval(session.actionLoop);
     if (session.uptimeInterval) clearInterval(session.uptimeInterval);
@@ -383,7 +361,6 @@ function handleDisconnect(uid, session) {
         notifyUser(uid, `⏹ **Bot Stopped.**\nYou manually terminated the session.`);
         destroySession(uid, session.profileId);
     } else {
-        // --- REJOIN STRATEGY ---
         if (session.rejoinAttempts >= 5) {
             notifyUser(uid, `❌ **Reconnection Failed:** Gave up after 5 attempts.`);
             destroySession(uid, session.profileId);
@@ -401,7 +378,6 @@ function handleDisconnect(uid, session) {
         session.reconnectTimer = setTimeout(() => {
             if (sessions.has(key) && !sessions.get(key).manualStop) {
                 try { session.client.removeAllListeners(); session.client.close(); } catch(e){}
-                // Pass attempt count + 1 AND use opts with SAFE version
                 createBedrockInstance(uid, session.profileId, session.opts, null, session.rejoinAttempts + 1);
             } else {
                 destroySession(uid, session.profileId);
@@ -499,10 +475,27 @@ client.on(Events.InteractionCreate, async (i) => {
             }
         }
 
+        // --- SELECT MENU HANDLER ---
         if (i.isStringSelectMenu()) {
             if (i.customId === "sel_bed_ver") {
+                const val = i.values[0];
+
+                // If user selected "Manual Input", show Modal
+                if (val === "custom") {
+                    const m = new ModalBuilder().setCustomId("modal_version").setTitle("Manual Version Input");
+                    const inp = new TextInputBuilder()
+                        .setCustomId("ver_input")
+                        .setLabel("Exact Version (e.g. 1.21.132)")
+                        .setStyle(TextInputStyle.Short)
+                        .setPlaceholder("1.21.x")
+                        .setRequired(true);
+                    m.addComponents(new ActionRowBuilder().addComponents(inp));
+                    return i.showModal(m);
+                }
+
+                // Normal selection
                 const u = getUser(uid);
-                u.bedrockVersion = i.values[0];
+                u.bedrockVersion = val;
                 saveDatabase();
                 
                 let profileId = 'default';
@@ -511,7 +504,7 @@ client.on(Events.InteractionCreate, async (i) => {
                     if (oldId && oldId.startsWith("start_conf_")) profileId = oldId.replace("start_conf_", "");
                 } catch(e) {}
 
-                const verRow = getVersionSelector(i.values[0]);
+                const verRow = getVersionSelector(val);
                 const confirmRow = new ActionRowBuilder().addComponents(
                     new ButtonBuilder().setCustomId(`start_conf_${profileId}`).setLabel("✅ Connect Now").setStyle(ButtonStyle.Success),
                     new ButtonBuilder().setCustomId("cancel").setLabel("Cancel").setStyle(ButtonStyle.Secondary)
@@ -542,12 +535,29 @@ client.on(Events.InteractionCreate, async (i) => {
             }
         }
 
-        if (i.isModalSubmit() && i.customId === "modal_bedrock") {
-            const u = getUser(uid);
-            u.server = { ip: i.fields.getTextInputValue("ip"), port: parseInt(i.fields.getTextInputValue("port")) };
-            u.offlineUsername = i.fields.getTextInputValue("off");
-            saveDatabase();
-            return i.reply({ content: "✅ Settings saved.", ephemeral: true });
+        // --- MODAL HANDLER ---
+        if (i.isModalSubmit()) {
+            if (i.customId === "modal_bedrock") {
+                const u = getUser(uid);
+                u.server = { ip: i.fields.getTextInputValue("ip"), port: parseInt(i.fields.getTextInputValue("port")) };
+                u.offlineUsername = i.fields.getTextInputValue("off");
+                saveDatabase();
+                return i.reply({ content: "✅ Settings saved.", ephemeral: true });
+            }
+
+            // Custom Version Modal Submit
+            if (i.customId === "modal_version") {
+                const customVer = i.fields.getTextInputValue("ver_input").trim();
+                const u = getUser(uid);
+                u.bedrockVersion = customVer;
+                saveDatabase();
+
+                // We need to refresh the pre-flight UI. Since modal interaction is a reply, we send a new ephemeral msg.
+                // Try to find profile ID from context is hard here, default to default/0
+                const profileId = u.profiles.length > 0 ? u.profiles[0].id : 'default';
+                
+                return showPreFlight(i, u, profileId, false); // Send new message with updated version
+            }
         }
 
     } catch (err) { console.error("Ix Err:", err); }
@@ -562,7 +572,7 @@ function showPreFlight(i, u, profileId, isUpdate) {
         new ButtonBuilder().setCustomId("cancel").setLabel("Cancel").setStyle(ButtonStyle.Secondary)
     );
     const pName = u.profiles.find(p => p.id === profileId)?.name || "Default";
-    const content = `**Pre-Flight Check**\nAccount: **${pName}**\nTarget: \`${u.server.ip}:${u.server.port}\`\n\n*Ready to join?*`;
+    const content = `**Pre-Flight Check**\nAccount: **${pName}**\nTarget: \`${u.server.ip}:${u.server.port}\`\nVersion: \`${u.bedrockVersion}\`\n\n*Ready to join?*`;
     
     if (isUpdate) return i.update({ content: content, components: [verRow, confirmRow] });
     return i.reply({ content: content, components: [verRow, confirmRow], ephemeral: true });
@@ -605,15 +615,24 @@ async function handleLink(uid, interaction) {
 
 function getVersionSelector(current) {
     const bv = [
-        { label: "Auto-Detect (Best)", value: "auto" },
-        { label: "1.21.60", value: "1.21.60" }, { label: "1.21.50", value: "1.21.50" },
-        { label: "1.21.40", value: "1.21.40" }, { label: "1.21.20", value: "1.21.20" },
-        { label: "1.21.0", value: "1.21.0" }, { label: "1.20.80", value: "1.20.80" }
+        { label: "✍️ Manual / Custom Input...", value: "custom" }, // NEW OPTION
+        { label: "1.21.60 (Latest)", value: "1.21.60" },
+        { label: "1.21.50", value: "1.21.50" },
+        { label: "1.21.40", value: "1.21.40" }, 
+        { label: "1.21.20", value: "1.21.20" },
+        { label: "1.21.0", value: "1.21.0" }, 
+        { label: "1.20.80", value: "1.20.80" }
     ];
-    const safeCurrent = bv.find(x => x.value === current) ? current : "auto";
+    
+    // Ensure current selection is shown even if it's custom
+    const isStandard = bv.some(b => b.value === current);
+    const placeholder = isStandard ? `Selected: ${current}` : `Custom: ${current}`;
+
     return new ActionRowBuilder().addComponents(
-        new StringSelectMenuBuilder().setCustomId("sel_bed_ver").setPlaceholder(`Version: ${safeCurrent}`)
-            .addOptions(bv.map(v => ({ label: v.label, value: v.value, default: v.value === safeCurrent })))
+        new StringSelectMenuBuilder()
+            .setCustomId("sel_bed_ver")
+            .setPlaceholder(placeholder)
+            .addOptions(bv.map(v => ({ label: v.label, value: v.value, default: v.value === current })))
     );
 }
 
