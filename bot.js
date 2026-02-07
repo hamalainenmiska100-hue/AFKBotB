@@ -1,4 +1,4 @@
-does this code have an rejoin logic? code: const {
+const {
 Client,
 GatewayIntentBits,
 ActionRowBuilder,
