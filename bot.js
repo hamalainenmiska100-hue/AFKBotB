@@ -91,6 +91,24 @@ const client = new Client({
   ]
 });
 
+// ==========================================================
+// 🛡️ CRASH PREVENTION SYSTEM (THE FIX)
+// ==========================================================
+// These listeners stop the bot from dying when Discord API fails
+client.on("error", (error) => {
+    console.error("⚠️ Discord Client Error (Ignored):", error.message);
+});
+
+client.on("shardError", (error) => {
+    console.error("⚠️ WebSocket Error (Ignored):", error.message);
+});
+
+process.on("uncaughtException", (err) => {
+    console.error("🔥 Uncaught Exception:", err);
+    // We do NOT exit here, keeping the bot alive.
+});
+// ==========================================================
+
 async function logToDiscord(message) {
   try {
     const channel = await client.channels.fetch(LOG_CHANNEL_ID);
@@ -305,7 +323,6 @@ async function startSession(uid, interaction, isReconnect = false) {
   const u = getUser(uid);
   
   // MARK AS ACTIVE IN PERSISTENCE IMMEDIATELY
-  // This ensures if the app crashes even while connecting, it tries again on boot.
   if (!activeSessionsStore[uid]) {
       activeSessionsStore[uid] = true;
       saveActiveSessions();
@@ -350,10 +367,6 @@ async function startSession(uid, interaction, isReconnect = false) {
           // If server is down during reconnect/auto-boot, wait and try again.
           handleAutoReconnect(uid); 
       } else {
-          // If manual start fails, we keep it in ReJoin.json? 
-          // Actually, let's keep it. If user clicked start, they want it to work eventually.
-          // Or you can choose to delete it here if you want manual starts to be strict.
-          // For now, I will NOT delete it, so if the server comes up later and app restarts, it joins.
           await reply(`❌ **Connection Failed**: The server is currently offline.`).catch(() => {});
       }
       return; 
@@ -456,7 +469,7 @@ client.on(Events.InteractionCreate, async (i) => {
 
     if (i.isButton()) {
       if (i.customId === "admin_refresh") {
-        return i.update({ embeds: [getAdminStatsEmbed()], components: adminPanelComponents() });
+        return i.update({ embeds: [getAdminStatsEmbed()], components: adminPanelComponents() }).catch(() => {});
       }
 
       if (i.customId === "start_bedrock") {
@@ -471,7 +484,7 @@ client.on(Events.InteractionCreate, async (i) => {
             new ButtonBuilder().setCustomId("confirm_start").setLabel("Confirm & Start").setStyle(ButtonStyle.Success),
             new ButtonBuilder().setCustomId("cancel").setLabel("Cancel").setStyle(ButtonStyle.Secondary)
         );
-        return i.reply({ embeds: [embed], components: [row], ephemeral: true });
+        return i.reply({ embeds: [embed], components: [row], ephemeral: true }).catch(() => {});
       }
 
       if (i.customId === "start_java") {
@@ -489,29 +502,30 @@ client.on(Events.InteractionCreate, async (i) => {
             new ButtonBuilder().setCustomId("confirm_start").setLabel("Confirm & Start").setStyle(ButtonStyle.Success),
             new ButtonBuilder().setCustomId("cancel").setLabel("Cancel").setStyle(ButtonStyle.Secondary)
         );
-        return i.reply({ embeds: [embed], components: [row], ephemeral: true });
+        return i.reply({ embeds: [embed], components: [row], ephemeral: true }).catch(() => {});
       }
 
       if (i.customId === "confirm_start") {
-          await i.deferUpdate();
+          // Safeguard the defer update
+          await i.deferUpdate().catch(() => {});
           return startSession(uid, i, false);
       }
 
-      if (i.customId === "cancel") return i.update({ content: "❌ Cancelled.", embeds: [], components: [] });
+      if (i.customId === "cancel") return i.update({ content: "❌ Cancelled.", embeds: [], components: [] }).catch(() => {});
       
       if (i.customId === "stop") {
         const ok = stopSession(uid);
-        return i.reply({ ephemeral: true, content: ok ? "⏹ **Session Terminated.**" : "No active sessions found." });
+        return i.reply({ ephemeral: true, content: ok ? "⏹ **Session Terminated.**" : "No active sessions found." }).catch(() => {});
       }
 
       if (i.customId === "link") {
-          await i.deferReply({ ephemeral: true });
+          await i.deferReply({ ephemeral: true }).catch(() => {});
           return linkMicrosoft(uid, i);
       }
 
       if (i.customId === "unlink") {
         unlinkMicrosoft(uid);
-        return i.reply({ ephemeral: true, content: "🗑 Microsoft account link removed." });
+        return i.reply({ ephemeral: true, content: "🗑 Microsoft account link removed." }).catch(() => {});
       }
 
       if (i.customId === "settings") {
@@ -533,7 +547,7 @@ client.on(Events.InteractionCreate, async (i) => {
         u.server = { ip, port };
         u.offlineUsername = i.fields.getTextInputValue("offline").trim();
         save();
-        return i.reply({ ephemeral: true, content: `✅ Saved: **${ip}:${port}**` });
+        return i.reply({ ephemeral: true, content: `✅ Saved: **${ip}:${port}**` }).catch(() => {});
     }
 
   } catch (e) {
@@ -541,5 +555,6 @@ client.on(Events.InteractionCreate, async (i) => {
   }
 });
 
-process.on("unhandledRejection", (e) => console.error(e));
+// Also catch globally
+process.on("unhandledRejection", (e) => console.error("Unhandled Rejection:", e));
 client.login(DISCORD_TOKEN);
