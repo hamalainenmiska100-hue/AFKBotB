@@ -315,7 +315,7 @@ function handleAutoReconnect(uid) {
                 cleanupSession(uid);
             }
         }
-    }, 120000); // 2 Minutes
+    }, 60000); // 2 Minutes
 }
 
 // ----------------- MAIN SESSION FUNCTION -----------------
