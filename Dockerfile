@@ -1,28 +1,24 @@
-# Käytetään Node 22 (jota uudet kirjastot vaativat) ja Bookworm (vakaa Linux)
+# Use Node 22 on Debian Bookworm
 FROM node:22-bookworm
 
-# Asenna CMake (kriittinen Bedrockille) ja Canvas-kirjaston vaatimat paketit
+# Install build tools required for native modules (RakNet, etc.)
+# Removed heavy graphics libraries not needed for headless bots
 RUN apt-get update && apt-get install -y \
     build-essential \
     cmake \
     python3 \
-    libcairo2-dev \
-    libpango1.0-dev \
-    libjpeg-dev \
-    libgif-dev \
-    librsvg2-dev \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
+# Copy package.json first to cache dependencies
 COPY package.json .
 
-# Asenna riippuvuudet
+# Install dependencies
 RUN npm install
 
+# Copy the rest of the application code
 COPY . .
 
-# Käytä npm start, jotta se lukee komennon package.jsonista
+# Start the bot
 CMD ["npm", "start"]
-
-
