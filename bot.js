@@ -18,12 +18,15 @@ const { Authflow, Titles } = require("prismarine-auth");
 const fs = require("fs");
 const path = require("path");
 
-// --- DEPENDENCIES FOR PHYSICS ---
-let Vec3;
+// --- RE-ADDED: Dependencies for Chunk Scanning & Bed Detection ---
+let Vec3, PrismarineChunk, PrismarineRegistry, MinecraftData;
 try {
   Vec3 = require("vec3");
+  PrismarineChunk = require("prismarine-chunk");
+  PrismarineRegistry = require("prismarine-registry");
+  MinecraftData = require("minecraft-data");
 } catch (e) {
-  console.log("⚠️  Physics dependencies missing! Bot will not fall or walk. Run: npm install vec3");
+  console.log("⚠️  Advanced features disabled! Run: npm install vec3 prismarine-chunk prismarine-registry minecraft-data");
 }
 
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
@@ -47,10 +50,7 @@ const REJOIN_STORE = path.join(DATA, "ReJoin.json");
 if (!fs.existsSync(DATA)) fs.mkdirSync(DATA);
 if (!fs.existsSync(AUTH_ROOT)) fs.mkdirSync(AUTH_ROOT, { recursive: true });
 
-// Load Users
 let users = fs.existsSync(STORE) ? JSON.parse(fs.readFileSync(STORE, "utf8")) : {};
-
-// Load ReJoin Data (Active Sessions)
 let activeSessionsStore = fs.existsSync(REJOIN_STORE) ? JSON.parse(fs.readFileSync(REJOIN_STORE, "utf8")) : {};
 
 function save() {
@@ -100,17 +100,9 @@ const client = new Client({
 // ==========================================================
 // 🛡️ CRASH PREVENTION SYSTEM
 // ==========================================================
-client.on("error", (error) => {
-    console.error("⚠️ Discord Client Error (Ignored):", error.message);
-});
-
-client.on("shardError", (error) => {
-    console.error("⚠️ WebSocket Error (Ignored):", error.message);
-});
-
-process.on("uncaughtException", (err) => {
-    console.error("🔥 Uncaught Exception:", err);
-});
+client.on("error", (error) => console.error("⚠️ Discord Client Error (Ignored):", error.message));
+client.on("shardError", (error) => console.error("⚠️ WebSocket Error (Ignored):", error.message));
+process.on("uncaughtException", (err) => console.error("🔥 Uncaught Exception:", err));
 
 async function logToDiscord(message) {
   try {
@@ -213,7 +205,6 @@ client.once("ready", async () => {
   ];
   await client.application.commands.set(cmds);
 
-  // Admin Refresh Loop
   setInterval(async () => {
     if (lastAdminMessage) {
         try {
@@ -222,7 +213,6 @@ client.once("ready", async () => {
     }
   }, 30000);
 
-  // PROCESS REJOINS
   console.log("📂 Checking ReJoin.json for previous sessions...");
   const previousSessions = Object.keys(activeSessionsStore);
   
@@ -230,9 +220,7 @@ client.once("ready", async () => {
       console.log(`♻️ Found ${previousSessions.length} bots to restore. Starting them now...`);
       let delay = 0;
       for (const uid of previousSessions) {
-          setTimeout(() => {
-              startSession(uid, null, true);
-          }, delay);
+          setTimeout(() => startSession(uid, null, true), delay);
           delay += 5000; 
       }
   } else {
@@ -252,7 +240,7 @@ async function linkMicrosoft(uid, interaction) {
       const code = data.user_code || "(no code)";
       lastMsa.set(uid, { uri, code, at: Date.now() });
       codeShown = true;
-      const msg = `🔐 **Microsoft Authentication Required**\n\n1. Visit: ${uri}\n2. Enter Code: \`${code}\`\n\n⚠️ **Important:** Please use an alternative account.`;
+      const msg = `🔐 **Microsoft Authentication Required**\n\n1. Visit: ${uri}\n2. Enter Code: \`${code}\``;
       await interaction.editReply({ content: msg, components: [new ActionRowBuilder().addComponents(new ButtonBuilder().setLabel("🌐 Open link").setStyle(ButtonStyle.Link).setURL(uri))] }).catch(() => {});
   });
 
@@ -274,10 +262,10 @@ function cleanupSession(uid) {
   const s = sessions.get(uid);
   if (!s) return;
   
-  // Clear Timers
   if (s.reconnectTimer) clearTimeout(s.reconnectTimer);
   if (s.physicsLoop) clearInterval(s.physicsLoop);
   if (s.afkTimeout) clearTimeout(s.afkTimeout);
+  if (s.chunkGCLoop) clearInterval(s.chunkGCLoop);
 
   try { s.client.close(); } catch {}
   sessions.delete(uid);
@@ -297,12 +285,10 @@ function stopSession(uid) {
   return true;
 }
 
-// ----------------- Auto Reconnect Handling -----------------
 function handleAutoReconnect(uid) {
     const s = sessions.get(uid);
     if (!s || s.manualStop) return;
     
-    // PREVENT DUPLICATE TIMERS
     if (s.reconnectTimer) clearTimeout(s.reconnectTimer);
     
     s.isReconnecting = true;
@@ -318,18 +304,14 @@ function handleAutoReconnect(uid) {
                 cleanupSession(uid);
             }
         }
-    }, 60000); // 1 Minute Wait
+    }, 60000);
 }
 
-// ----------------- HELPER: Safe Reply -----------------
 async function safeReply(interaction, content) {
     if (!interaction) return;
     try {
-        if (interaction.replied || interaction.deferred) {
-            await interaction.editReply(content);
-        } else {
-            await interaction.reply(content);
-        }
+        if (interaction.replied || interaction.deferred) await interaction.editReply(content);
+        else await interaction.reply(content);
     } catch (e) {}
 }
 
@@ -352,21 +334,12 @@ async function startSession(uid, interaction, isReconnect = false) {
   const { ip, port } = u.server;
 
   if (sessions.has(uid) && !isReconnect) {
-      const zombie = sessions.get(uid);
-      if (!zombie.connected && !zombie.isReconnecting) {
-          cleanupSession(uid);
-      } else {
-          return safeReply(interaction, "⚠️ **Session Conflict**: Active session already exists.").catch(() => {});
-      }
+      return safeReply(interaction, "⚠️ **Session Conflict**: Active session already exists.").catch(() => {});
   }
 
-  // --- MOTD PING ---
   try {
       if (!isReconnect) await safeReply(interaction, { content: "🔍 Pinging server...", embeds: [], components: [] });
-      
-      const pingPort = parseInt(port) || 19132;
-      await bedrock.ping({ host: ip, port: pingPort, timeout: 5000 });
-      
+      await bedrock.ping({ host: ip, port: parseInt(port) || 19132, timeout: 5000 });
       if (!isReconnect) await safeReply(interaction, "✅ **Server found! Joining...**");
   } catch (err) {
       logToDiscord(`❌ Connection failure for <@${uid}>: Server ${ip}:${port} unreachable.`);
@@ -375,7 +348,6 @@ async function startSession(uid, interaction, isReconnect = false) {
       return; 
   }
 
-  // --- CLIENT SETUP ---
   const authDir = getUserAuthDir(uid);
   
   const opts = { 
@@ -396,58 +368,85 @@ async function startSession(uid, interaction, isReconnect = false) {
 
   const mc = bedrock.createClient(opts);
   
-  // SESSION STATE
   const currentSession = { 
       client: mc, 
       startedAt: Date.now(), 
       manualStop: false, 
       connected: false,
       isReconnecting: false,
-      // --- MODIFIED: More advanced physics state ---
       position: null,
       velocity: (Vec3) ? new Vec3(0, 0, 0) : null,
       yaw: 0,
       pitch: 0,
       onGround: false,
-      // --- NEW: State for walking AI ---
       isWalking: false,
       targetPosition: null, 
+      isTryingToSleep: false, // --- NEW: State for bed AI ---
+      // --- NEW: For chunk parsing ---
+      chunks: new Map(),
+      registry: null,
+      Chunk: null,
       // Timers
       reconnectTimer: null,
       physicsLoop: null,
-      afkTimeout: null
+      afkTimeout: null,
+      chunkGCLoop: null,
   };
   sessions.set(uid, currentSession);
 
   // ==========================================
-  // 🍎 ADVANCED PHYSICS & WALKING ENGINE
+  // 🍎 ADVANCED PHYSICS, WALKING & CHUNK ENGINE
   // ==========================================
-  if (Vec3) {
+  if (Vec3 && PrismarineChunk) {
+      // Initialize Registry and Chunk loader
+      try {
+          // We guess the version. Bedrock is not standardized like Java.
+          currentSession.registry = PrismarineRegistry('bedrock_1.20.0');
+          currentSession.Chunk = PrismarineChunk(currentSession.registry);
+      } catch (e) {
+          logToDiscord(`Could not initialize chunk manager for <@${uid}>. Bed detection disabled.`);
+          currentSession.Chunk = null; // Disable if failed
+      }
+      
+      // --- RE-ADDED: Chunk Loading ---
+      mc.on('level_chunk', (packet) => {
+          if (!currentSession.Chunk) return;
+          try {
+              const chunk = new currentSession.Chunk();
+              chunk.load(packet.payload);
+              currentSession.chunks.set(`${packet.x},${packet.z}`, chunk);
+          } catch(e) { /* ignore chunk load errors */ }
+      });
+      
+      // --- RE-ADDED: Chunk Garbage Collector for RAM ---
+      currentSession.chunkGCLoop = setInterval(() => {
+          if (currentSession.chunks.size > 50) {
+              currentSession.chunks.clear();
+          }
+      }, 10000);
+
       currentSession.physicsLoop = setInterval(() => {
           if (!currentSession.connected || !currentSession.position) return;
           
           const gravity = 0.08; 
-          const moveVector = { x: 0, z: 0 }; // Default to standing still
+          const moveVector = { x: 0, z: 0 };
 
-          // --- NEW: Walking Logic ---
           if (currentSession.isWalking && currentSession.targetPosition) {
               const distance = currentSession.position.distanceTo(currentSession.targetPosition);
-              
-              if (distance > 0.5) { // Stop when close to target
+              if (distance > 0.5) {
                   const direction = currentSession.targetPosition.minus(currentSession.position).normalize();
                   moveVector.x = direction.x;
                   moveVector.z = direction.z;
               } else {
-                  currentSession.isWalking = false; // Arrived at destination
+                  currentSession.isWalking = false;
               }
           }
 
-          // --- MODIFIED: Aggressive Grounding Physics ---
           if (!currentSession.onGround) {
              currentSession.velocity.y -= gravity;
           }
 
-          if (currentSession.velocity.y < -3.92) currentSession.velocity.y = -3.92; // Terminal velocity
+          if (currentSession.velocity.y < -3.92) currentSession.velocity.y = -3.92;
           
           currentSession.position.add(currentSession.velocity);
 
@@ -456,27 +455,19 @@ async function startSession(uid, interaction, isReconnect = false) {
              currentSession.velocity.y = 0;
           }
 
-          // SEND THE COMBINED PHYSICS + WALKING PACKET
           try {
               mc.write("player_auth_input", {
-                 pitch: currentSession.pitch,
-                 yaw: currentSession.yaw,
+                 pitch: currentSession.pitch, yaw: currentSession.yaw,
                  position: { x: currentSession.position.x, y: currentSession.position.y, z: currentSession.position.z },
-                 move_vector: moveVector, // --- THIS MAKES IT WALK ---
-                 head_yaw: currentSession.yaw,
-                 input_data: 0n,
-                 input_mode: "mouse",
-                 play_mode: "screen",
-                 interaction_model: "touch",
-                 tick: 0n
+                 move_vector: moveVector, head_yaw: currentSession.yaw, input_data: 0n,
+                 input_mode: "mouse", play_mode: "screen", interaction_model: "touch", tick: 0n
               });
           } catch (e) {}
-
       }, 50); 
   }
 
   // ==========================================
-  // 🤖 ANTI-AFK & WALKING AI CONTROLLER
+  // 🤖 ANTI-AFK & AI CONTROLLER
   // ==========================================
   const performAntiAfk = () => {
       if (!sessions.has(uid)) return;
@@ -488,36 +479,74 @@ async function startSession(uid, interaction, isReconnect = false) {
       }
 
       try {
-          // --- MODIFIED: Now controls walking state ---
-          // Every 10-30 seconds, decide to do something
+          // --- NEW: Trigger bed scan ---
+          scanForBedAndSleep(uid);
+
           const action = Math.random();
           if (action > 0.5 && !s.isWalking) {
-              // Decide to walk back to spawn
               s.isWalking = true;
           } else {
-              // Just look around and maybe jump
               s.yaw += (Math.random() - 0.5) * 20; 
               s.pitch += (Math.random() - 0.5) * 10;
 
               if (s.onGround && Math.random() > 0.9) {
-                  s.velocity.y = 0.42; // Jump
+                  s.velocity.y = 0.42;
                   s.onGround = false;
               }
           }
           
-          // Swing Arm
-          mc.write('animate', {
-             action_id: 1, 
-             runtime_entity_id: s.entityId || 0n
-          });
-
+          mc.write('animate', { action_id: 1, runtime_entity_id: s.entityId || 0n });
       } catch (e) {}
 
-      // Schedule next decision
       const nextDelay = Math.random() * 20000 + 10000;
       s.afkTimeout = setTimeout(performAntiAfk, nextDelay);
   };
 
+  // ==========================================
+  // 🛌 BED DETECTION AI
+  // ==========================================
+  function scanForBedAndSleep(uid) {
+      const s = sessions.get(uid);
+      if (!s || !s.Chunk || !s.position || s.isTryingToSleep) return;
+
+      const searchRadius = 3; // 3 blocks in each direction
+      const playerPos = s.position.floored();
+
+      for (let x = -searchRadius; x <= searchRadius; x++) {
+          for (let y = -searchRadius; y <= searchRadius; y++) {
+              for (let z = -searchRadius; z <= searchRadius; z++) {
+                  const checkPos = playerPos.offset(x, y, z);
+                  
+                  const chunkX = Math.floor(checkPos.x / 16);
+                  const chunkZ = Math.floor(checkPos.z / 16);
+                  const chunk = s.chunks.get(`${chunkX},${chunkZ}`);
+                  
+                  if (chunk) {
+                      const block = chunk.getBlock(checkPos);
+                      if (block && block.name.includes('bed')) {
+                          logToDiscord(`🛌 Bed found for <@${uid}> at ${checkPos}. Attempting to sleep.`);
+                          s.isTryingToSleep = true;
+                          
+                          // Use the correct packet to interact with the bed
+                          mc.write('inventory_transaction', {
+                              transaction: {
+                                  transaction_type: 'item_use_on_block',
+                                  action_type: 0,
+                                  block_position: checkPos,
+                                  block_face: 1, // 1 is typically 'up'
+                                  hotbar_slot: 0, // Assuming empty hand
+                                  item_in_hand: { network_id: 0 },
+                                  player_position: s.position,
+                                  click_position: { x: 0, y: 0, z: 0 }
+                              }
+                          });
+                          return; // Stop scanning once a bed is found and used
+                      }
+                  }
+              }
+          }
+      }
+  }
 
   // --- EVENTS ---
   mc.on("spawn", () => {
@@ -525,11 +554,9 @@ async function startSession(uid, interaction, isReconnect = false) {
     if (!isReconnect) safeReply(interaction, `🟢 **Connected**`);
   });
 
-  // This is the most important event for initialization
   mc.on("start_game", (packet) => {
       if (Vec3) {
           currentSession.position = new Vec3(packet.player_position.x, packet.player_position.y, packet.player_position.z);
-          // --- NEW: Set the initial walking target ---
           currentSession.targetPosition = currentSession.position.clone();
       }
       currentSession.entityId = packet.runtime_entity_id;
@@ -539,21 +566,18 @@ async function startSession(uid, interaction, isReconnect = false) {
       performAntiAfk();
   });
   
-  // --- MODIFIED: This is now the key to fixing hovering ---
   mc.on("move_player", (packet) => {
       if (packet.runtime_id === currentSession.entityId && currentSession.position) {
-          
-          // If the server corrects our Y position upwards, it means we hit a solid block.
           if (packet.position.y > currentSession.position.y) {
-              // We have landed on the ground.
               currentSession.onGround = true;
               currentSession.velocity.y = 0;
           } else {
-              // We are likely falling.
               currentSession.onGround = false;
           }
           
-          // Always accept the server's position as the source of truth.
+          // If we are moved, we are no longer trying to sleep
+          currentSession.isTryingToSleep = false;
+          
           currentSession.position.set(packet.position.x, packet.position.y, packet.position.z);
       }
   });
@@ -562,8 +586,9 @@ async function startSession(uid, interaction, isReconnect = false) {
       logToDiscord(`💀 Bot of <@${uid}> died and respawned.`);
       if (currentSession.position) {
           currentSession.position.set(packet.position.x, packet.position.y, packet.position.z);
-          currentSession.targetPosition = currentSession.position.clone(); // Reset walk target
+          currentSession.targetPosition = currentSession.position.clone();
           currentSession.velocity.set(0,0,0);
+          currentSession.isTryingToSleep = false;
       }
   });
 
@@ -587,7 +612,7 @@ client.on(Events.InteractionCreate, async (i) => {
 
     if (i.isChatInputCommand()) {
       if (i.commandName === "panel") return safeReply(i, panelRow(false));
-      if (i.commandName === "java") return safeReply(i, panelRow(true));
+      if (i.commandName === "java") return safeReply(i, panelRow(true)); // Restored
       if (i.commandName === "admin") {
         if (uid !== ADMIN_ID || i.channelId !== ADMIN_CHANNEL_ID) return safeReply(i, { content: "⛔ Access restricted.", ephemeral: true });
         const msg = await i.reply({ embeds: [getAdminStatsEmbed()], components: adminPanelComponents(), fetchReply: true });
@@ -603,10 +628,26 @@ client.on(Events.InteractionCreate, async (i) => {
 
       if (i.customId === "start_bedrock") {
         if (sessions.has(uid)) return safeReply(i, { ephemeral: true, content: "⚠️ **Session Conflict**: Active session exists." });
-        
         const embed = new EmbedBuilder().setTitle("Bedrock Connection").setDescription("Start bot?").setColor("#2ECC71");
         const row = new ActionRowBuilder().addComponents(
             new ButtonBuilder().setCustomId("confirm_start").setLabel("Start").setStyle(ButtonStyle.Success),
+            new ButtonBuilder().setCustomId("cancel").setLabel("Cancel").setStyle(ButtonStyle.Secondary)
+        );
+        return i.reply({ embeds: [embed], components: [row], ephemeral: true }).catch(() => {});
+      }
+
+      // --- RESTORED: Java Button Logic ---
+      if (i.customId === "start_java") {
+        if (sessions.has(uid)) return safeReply(i, { ephemeral: true, content: "⚠️ **Session Conflict**: Active session exists." });
+
+        const embed = new EmbedBuilder()
+          .setTitle("⚙️ Java Compatibility Check")
+          .setDescription("For a successful connection to a Java server, ensure the following plugins are installed.")
+          .addFields( { name: "Required Plugins", value: "• GeyserMC\n• Floodgate" } )
+          .setColor("#E67E22");
+
+        const row = new ActionRowBuilder().addComponents(
+            new ButtonBuilder().setCustomId("confirm_start").setLabel("Confirm & Start").setStyle(ButtonStyle.Success),
             new ButtonBuilder().setCustomId("cancel").setLabel("Cancel").setStyle(ButtonStyle.Secondary)
         );
         return i.reply({ embeds: [embed], components: [row], ephemeral: true }).catch(() => {});
