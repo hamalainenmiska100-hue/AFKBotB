@@ -26,7 +26,7 @@ try {
   PrismarineRegistry = require("prismarine-registry");
   MinecraftData = require("minecraft-data");
 } catch (e) {
-  console.log("⚠️  Advanced features disabled! Run: npm install vec3 prismarine-chunk prismarine-registry minecraft-data");
+  console.log("⚠️ Advanced features disabled! Run: npm install vec3 prismarine-chunk prismarine-registry minecraft-data");
 }
 
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
@@ -337,23 +337,23 @@ async function startSession(uid, interaction, isReconnect = false) {
       return safeReply(interaction, "⚠️ **Session Conflict**: Active session already exists.").catch(() => {});
   }
 
-  // --- MODIFIED: Connection Embed with Loading GIF ---
+  // --- MODIFIED: COMPACT Connection Embed ---
   const connectionEmbed = new EmbedBuilder()
     .setColor("#5865F2")
-    .setTitle("Connecting to Server")
-    .setImage("https://files.catbox.moe/9mqpoz.gif")
-    .setTimestamp();
+    .setTitle("Bot Initialization")
+    // Switch to Thumbnail (next to text) for a compact UI
+    .setThumbnail("https://files.catbox.moe/9mqpoz.gif");
 
   try {
       if (!isReconnect) {
-          connectionEmbed.setDescription(`🔍 **Pinging server...**\n🌐 IP: \`${ip}:${port}\``);
+          connectionEmbed.setDescription(`🔍 **Pinging server...**\n🌐 **Target:** \`${ip}:${port}\``);
           await safeReply(interaction, { embeds: [connectionEmbed], content: null, components: [] });
       }
       
       await bedrock.ping({ host: ip, port: parseInt(port) || 19132, timeout: 5000 });
       
       if (!isReconnect) {
-          connectionEmbed.setDescription(`✅ **Server found! Attempting to join...**\n🌐 IP: \`${ip}:${port}\``);
+          connectionEmbed.setDescription(`✅ **Server found! Joining...**\n🌐 **Target:** \`${ip}:${port}\``);
           await safeReply(interaction, { embeds: [connectionEmbed] });
       }
   } catch (err) {
@@ -563,8 +563,7 @@ async function startSession(uid, interaction, isReconnect = false) {
   // --- EVENTS ---
   mc.on("spawn", () => {
     logToDiscord(`✅ Bot of <@${uid}> spawned on **${ip}:${port}**` + (isReconnect ? " (Auto-Rejoined)" : ""));
-    // Clear connection embed upon success
-    if (!isReconnect) safeReply(interaction, { content: `🟢 **Successfully Connected** to \`${ip}:${port}\``, embeds: [] });
+    if (!isReconnect) safeReply(interaction, { content: `🟢 **Online** on \`${ip}:${port}\``, embeds: [] });
   });
 
   mc.on("start_game", (packet) => {
