@@ -18,15 +18,12 @@ const { Authflow, Titles } = require("prismarine-auth");
 const fs = require("fs");
 const path = require("path");
 
-// --- DEPENDENCIES FOR PHYSICS & GRAVITY ---
-let Vec3, PrismarineChunk, PrismarineRegistry, MinecraftData;
+// --- DEPENDENCIES FOR PHYSICS ---
+let Vec3;
 try {
   Vec3 = require("vec3");
-  PrismarineChunk = require("prismarine-chunk");
-  PrismarineRegistry = require("prismarine-registry");
-  MinecraftData = require("minecraft-data");
 } catch (e) {
-  console.log("⚠️  Physics dependencies missing! Bot will not fall. Run: npm install vec3 prismarine-chunk prismarine-registry minecraft-data");
+  console.log("⚠️  Physics dependencies missing! Bot will not fall. Run: npm install vec3");
 }
 
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
@@ -113,7 +110,6 @@ client.on("shardError", (error) => {
 
 process.on("uncaughtException", (err) => {
     console.error("🔥 Uncaught Exception:", err);
-    // Keep alive logic
 });
 
 async function logToDiscord(message) {
@@ -281,7 +277,6 @@ function cleanupSession(uid) {
   // Clear Timers
   if (s.reconnectTimer) clearTimeout(s.reconnectTimer);
   if (s.physicsLoop) clearInterval(s.physicsLoop);
-  if (s.chunkGCLoop) clearInterval(s.chunkGCLoop);
   if (s.afkTimeout) clearTimeout(s.afkTimeout);
 
   try { s.client.close(); } catch {}
@@ -384,22 +379,20 @@ async function startSession(uid, interaction, isReconnect = false) {
   // --- CLIENT SETUP ---
   const authDir = getUserAuthDir(uid);
   
-  // OPTIMIZATION: Small view distance to save RAM
   const opts = { 
       host: ip, 
       port: parseInt(port), 
       connectTimeout: 60000, 
       keepAlive: true,
-      viewDistance: 6 
+      viewDistance: 4, // OPTIMIZED for RAM
+      profilesFolder: authDir,
+      username: uid,
+      offline: false
   };
 
   if (u.connectionType === "offline") {
     opts.username = u.offlineUsername || `AFK_${uid.slice(-4)}`;
     opts.offline = true;
-  } else {
-    opts.username = uid;
-    opts.offline = false;
-    opts.profilesFolder = authDir;
   }
 
   const mc = bedrock.createClient(opts);
@@ -412,74 +405,51 @@ async function startSession(uid, interaction, isReconnect = false) {
       connected: false,
       isReconnecting: false,
       // Physics Data
-      // IMPORTANT: Initialize as null so we know we aren't spawned yet
+      // Initialized to null to wait for start_game
       position: null,
       velocity: (Vec3) ? new Vec3(0, 0, 0) : null,
       yaw: 0,
       pitch: 0,
-      chunks: new Map(), // Stores chunk data temporarily
+      onGround: false,
       // Timers
       reconnectTimer: null,
       physicsLoop: null,
-      chunkGCLoop: null,
       afkTimeout: null
   };
   sessions.set(uid, currentSession);
 
   // ==========================================
-  // 🌍 PHYSICS & CHUNK LOADING ENGINE
+  // 🍎 GRAVITY & PHYSICS ENGINE (Server Corrected)
   // ==========================================
-  if (Vec3 && PrismarineChunk && PrismarineRegistry) {
-      
-      // 1. Listen for Chunks
-      mc.on('level_chunk', async (packet) => {
-          if (!currentSession.connected) return;
-          const ccKey = `${packet.x},${packet.z}`;
-          try {
-             // We just mark that we received data for ground checking
-             currentSession.chunks.set(ccKey, { timestamp: Date.now(), x: packet.x, z: packet.z });
-          } catch (e) { }
-      });
-
-      // 2. Garbage Collect Chunks (RAM Saver)
-      currentSession.chunkGCLoop = setInterval(() => {
-          const now = Date.now();
-          // RAM PROTECTION: If we have too many chunks, clear them all
-          if (currentSession.chunks.size > 50) {
-              currentSession.chunks.clear();
-              return;
-          }
-          for (const [key, data] of currentSession.chunks) {
-              // Delete chunks older than 5 seconds
-              if (now - data.timestamp > 5000) {
-                  currentSession.chunks.delete(key);
-              }
-          }
-      }, 1000);
-
+  if (Vec3) {
       // 3. Gravity / Physics Loop (20 TPS)
       currentSession.physicsLoop = setInterval(() => {
           // CRITICAL FIX: Do not run physics if we haven't received spawn coordinates yet.
-          // This prevents "SizeOf error for undefined".
           if (!currentSession.connected || !currentSession.position) return;
           
-          // Basic Gravity
-          const gravity = 0.05; 
+          const gravity = 0.08; 
           
-          // Apply Velocity
-          currentSession.velocity.y -= gravity;
+          // Always try to apply gravity if not grounded
+          if (!currentSession.onGround) {
+             currentSession.velocity.y -= gravity;
+          } else {
+             // Keep a tiny downward velocity to stick to the floor
+             currentSession.velocity.y = -0.01;
+          }
+
+          // Terminal velocity
+          if (currentSession.velocity.y < -3.0) currentSession.velocity.y = -3.0;
           
-          // Apply position change
+          // Apply velocity
           currentSession.position.add(currentSession.velocity);
 
-          // Terminate velocity if we hit "bottom" (void) to prevent infinite falling
+          // Void Protection
           if (currentSession.position.y < -64) {
              currentSession.position.y = 100; // Rubberband up
              currentSession.velocity.y = 0;
           }
 
-          // SEND POSITION
-          // This packet is what keeps the connection alive and the bot falling
+          // SEND POSITION PACKET (Heartbeat)
           try {
               mc.write("player_auth_input", {
                  pitch: currentSession.pitch,
@@ -493,9 +463,7 @@ async function startSession(uid, interaction, isReconnect = false) {
                  interaction_model: "touch",
                  tick: 0n
               });
-          } catch (e) {
-              // Ignore serialization errors to prevent crashes
-          }
+          } catch (e) {}
 
       }, 50); // 20 times a second
   }
@@ -507,32 +475,24 @@ async function startSession(uid, interaction, isReconnect = false) {
       if (!sessions.has(uid)) return;
       const s = sessions.get(uid);
       
-      // CRITICAL FIX: Guard clause here too
+      // Guard clause
       if (!s.connected || !s.position) {
-          // Retry slightly later if not spawned
           s.afkTimeout = setTimeout(performAntiAfk, 5000);
           return;
       }
 
       try {
-          // Randomize look direction slightly
+          // Randomize look direction
           s.yaw += (Math.random() - 0.5) * 10; 
           s.pitch += (Math.random() - 0.5) * 5;
 
-          const shouldJump = Math.random() > 0.7;
+          // Occasional Jump (only if grounded)
+          if (s.onGround && Math.random() > 0.8) {
+              s.velocity.y = 0.42;
+              s.onGround = false;
+          }
           
-          mc.write("player_auth_input", {
-            pitch: s.pitch,
-            yaw: s.yaw,
-            position: { x: s.position.x, y: s.position.y, z: s.position.z },
-            move_vector: { x: 0, z: 0 },
-            head_yaw: s.yaw,
-            input_data: shouldJump ? 8n : 0n,
-            input_mode: "mouse",
-            play_mode: "screen",
-            interaction_model: "touch",
-            tick: 0n
-          });
+          // Send update (Physics loop handles the position packet, we just updated yaw/pitch/velocity)
           
           // Swing Arm
           mc.write('animate', {
@@ -542,22 +502,21 @@ async function startSession(uid, interaction, isReconnect = false) {
 
       } catch (e) {}
 
-      // Schedule next action (Random: 5s to 20s)
-      const nextDelay = Math.random() * 15000 + 5000;
+      // Schedule next action (Random: 2s to 10s)
+      const nextDelay = Math.random() * 8000 + 2000;
       s.afkTimeout = setTimeout(performAntiAfk, nextDelay);
   };
 
 
   // --- EVENTS ---
   mc.on("spawn", () => {
-    // IMPORTANT: Wait for start_game packet before setting connected=true fully for physics
-    if (!isReconnect) safeReply(interaction, `🟢 **Connected** to **${ip}:${port}**`);
+    // We log here, but physics waits for start_game
     logToDiscord(`✅ Bot of <@${uid}> spawned on **${ip}:${port}**` + (isReconnect ? " (Auto-Rejoined)" : ""));
+    if (!isReconnect) safeReply(interaction, `🟢 **Connected**`);
   });
 
   // Use start_game to get the initial coordinates safely
   mc.on("start_game", (packet) => {
-      // This is the source of truth for where we are
       if (Vec3) {
           currentSession.position = new Vec3(packet.player_position.x, packet.player_position.y, packet.player_position.z);
       }
@@ -565,15 +524,33 @@ async function startSession(uid, interaction, isReconnect = false) {
       currentSession.connected = true;
       currentSession.isReconnecting = false;
       
-      // Start Anti-AFK now that we have position
       performAntiAfk();
   });
   
-  // Update position if server teleports us
+  // SERVER CORRECTION: This fixes the floating issue
   mc.on("move_player", (packet) => {
       if (packet.runtime_id === currentSession.entityId && currentSession.position) {
+          const serverY = packet.position.y;
+          const clientY = currentSession.position.y;
+
+          // If server stopped our fall, we are on ground
+          if (serverY >= clientY) {
+              currentSession.onGround = true;
+              currentSession.velocity.y = 0;
+          } else {
+              currentSession.onGround = false;
+          }
+
           currentSession.position.set(packet.position.x, packet.position.y, packet.position.z);
-          currentSession.velocity.set(0,0,0); // Reset velocity on teleport
+      }
+  });
+  
+  // Respawn Handling
+  mc.on("respawn", (packet) => {
+      logToDiscord(`💀 Bot of <@${uid}> died and respawned.`);
+      if (currentSession.position) {
+          currentSession.position.set(packet.position.x, packet.position.y, packet.position.z);
+          currentSession.velocity.set(0,0,0);
       }
   });
 
