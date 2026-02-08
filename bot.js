@@ -31,16 +31,28 @@ const LOG_CHANNEL_ID = "1464615030111731753";
 const ADMIN_CHANNEL_ID = "1469013237625393163"; 
 
 // ----------------- Storage -----------------
+// This 'data' folder is where your Fly.io volume should be mounted
 const DATA = path.join(__dirname, "data");
 const AUTH_ROOT = path.join(DATA, "auth");
 const STORE = path.join(DATA, "users.json");
+const REJOIN_STORE = path.join(DATA, "ReJoin.json"); // New file for persistence
 
 if (!fs.existsSync(DATA)) fs.mkdirSync(DATA);
 if (!fs.existsSync(AUTH_ROOT)) fs.mkdirSync(AUTH_ROOT, { recursive: true });
 
+// Load Users
 let users = fs.existsSync(STORE) ? JSON.parse(fs.readFileSync(STORE, "utf8")) : {};
+
+// Load ReJoin Data (Active Sessions)
+let activeSessionsStore = fs.existsSync(REJOIN_STORE) ? JSON.parse(fs.readFileSync(REJOIN_STORE, "utf8")) : {};
+
 function save() {
   fs.writeFileSync(STORE, JSON.stringify(users, null, 2));
+}
+
+// Function to save which bots should be running
+function saveActiveSessions() {
+  fs.writeFileSync(REJOIN_STORE, JSON.stringify(activeSessionsStore, null, 2));
 }
 
 function getUser(uid) {
@@ -49,7 +61,6 @@ function getUser(uid) {
   if (!users[uid].bedrockVersion) users[uid].bedrockVersion = "auto";
   return users[uid];
 }
-
 
 function getUserAuthDir(uid) {
   const dir = path.join(AUTH_ROOT, uid);
@@ -87,13 +98,6 @@ async function logToDiscord(message) {
       const embed = new EmbedBuilder().setColor("#5865F2").setDescription(message).setTimestamp();
       await channel.send({ embeds: [embed] });
     }
-  } catch (e) {}
-}
-
-async function sendUserDM(uid, message) {
-  try {
-    const user = await client.users.fetch(uid);
-    if (user) await user.send(message);
   } catch (e) {}
 }
 
@@ -160,7 +164,8 @@ function getAdminStatsEmbed() {
     .setColor("#2f3136")
     .addFields(
       { name: "📊 Performance", value: `**RAM:** ${ramMB} MB\n**Uptime:** ${hours}h ${minutes}m`, inline: true },
-      { name: "🤖 Active Sessions", value: `**Total Bots:** ${sessions.size}`, inline: true }
+      { name: "🤖 Active Sessions", value: `**Total Bots:** ${sessions.size}`, inline: true },
+      { name: "💾 Persisted Sessions", value: `**Saved for Restart:** ${Object.keys(activeSessionsStore).length}`, inline: true }
     )
     .setFooter({ text: "Auto-refreshing every 30s • Administrative Access Only" })
     .setTimestamp();
@@ -176,10 +181,11 @@ function getAdminStatsEmbed() {
   return embed;
 }
 
-// ----------------- Slash commands -----------------
+// ----------------- Events: Ready & Startup Rejoin -----------------
 client.once("ready", async () => {
   console.log("🟢 Online as", client.user.tag);
 
+  // 1. Set Commands
   const cmds = [
     new SlashCommandBuilder().setName("panel").setDescription("Open Bedrock AFK panel"),
     new SlashCommandBuilder().setName("java").setDescription("Open Java AFKBot Panel"),
@@ -187,6 +193,7 @@ client.once("ready", async () => {
   ];
   await client.application.commands.set(cmds);
 
+  // 2. Start Admin Refresh Loop
   setInterval(async () => {
     if (lastAdminMessage) {
         try {
@@ -196,6 +203,26 @@ client.once("ready", async () => {
         }
     }
   }, 30000);
+
+  // 3. PROCESS REJOINS (The Magic Part)
+  // This logic runs every time the app deploys/restarts
+  console.log("📂 Checking ReJoin.json for previous sessions...");
+  const previousSessions = Object.keys(activeSessionsStore);
+  
+  if (previousSessions.length > 0) {
+      console.log(`♻️ Found ${previousSessions.length} bots to restore. Starting them now...`);
+      let delay = 0;
+      for (const uid of previousSessions) {
+          // Add a slight delay between starts to prevent flooding
+          setTimeout(() => {
+              // We pass true for isReconnect so it doesn't try to reply to a non-existent interaction
+              startSession(uid, null, true);
+          }, delay);
+          delay += 5000; // 5 seconds stagger
+      }
+  } else {
+      console.log("⚪ No previous sessions found.");
+  }
 });
 
 // ----------------- Microsoft link -----------------
@@ -239,26 +266,65 @@ function cleanupSession(uid) {
 
 function stopSession(uid) {
   const s = sessions.get(uid);
+  
+  // REMOVE FROM PERSISTENCE (So it doesn't auto-start on next deploy)
+  if (activeSessionsStore[uid]) {
+      delete activeSessionsStore[uid];
+      saveActiveSessions();
+  }
+
   if (!s) return false;
-  s.manualStop = true; cleanupSession(uid);
+  s.manualStop = true; 
+  cleanupSession(uid);
   return true;
 }
 
-// FIXED START SESSION FUNCTION WITH ANTI-CHEAT BYPASS
+// ----------------- Auto Reconnect Handling -----------------
+function handleAutoReconnect(uid) {
+    const s = sessions.get(uid);
+    if (!s || s.manualStop || s.reconnectTimer) return;
+    
+    s.isReconnecting = true;
+    logToDiscord(`⏳ Bot of <@${uid}> disconnected. Reconnecting in 2 minutes...`);
+
+    s.reconnectTimer = setTimeout(() => {
+        if (sessions.has(uid)) {
+            const checkS = sessions.get(uid);
+            if (!checkS.manualStop) {
+                checkS.reconnectTimer = null; 
+                startSession(uid, null, true); 
+            } else {
+                cleanupSession(uid);
+            }
+        }
+    }, 120000); // 2 Minutes
+}
+
+// ----------------- MAIN SESSION FUNCTION -----------------
 async function startSession(uid, interaction, isReconnect = false) {
   const u = getUser(uid);
   
+  // MARK AS ACTIVE IN PERSISTENCE IMMEDIATELY
+  // This ensures if the app crashes even while connecting, it tries again on boot.
+  if (!activeSessionsStore[uid]) {
+      activeSessionsStore[uid] = true;
+      saveActiveSessions();
+  }
+
   const reply = async (msgObj) => {
     if (!isReconnect && interaction) {
       try {
         if (typeof msgObj === 'string') await interaction.editReply(msgObj);
         else await interaction.editReply(msgObj);
-      } catch (e) { }
+      } catch (e) { /* ignore expired interaction */ }
     }
   };
 
   if (!u.server) {
       await reply("⚠ Please configure your server settings first.");
+      // If config is missing, we shouldn't persist the session
+      delete activeSessionsStore[uid];
+      saveActiveSessions();
       return;
   }
 
@@ -268,6 +334,7 @@ async function startSession(uid, interaction, isReconnect = false) {
       return reply("⚠️ **Session Conflict**: An active bot session is already associated with your account.").catch(() => {});
   }
 
+  // --- MOTD PING CHECK ---
   try {
       if (!isReconnect) await reply({ content: "🔍 Pinging server...", embeds: [], components: [] }).catch(() => {});
       
@@ -277,10 +344,22 @@ async function startSession(uid, interaction, isReconnect = false) {
       if (!isReconnect) await reply("✅ **Server found! Joining...**").catch(() => {});
   } catch (err) {
       logToDiscord(`❌ Connection failure for <@${uid}>: Server ${ip}:${port} is offline or unreachable.`);
-      if (!isReconnect) await reply(`❌ **Connection Failed**: The server is currently offline.`).catch(() => {});
-      return;
+      
+      if (isReconnect) {
+          // INFINITE LOOP LOGIC:
+          // If server is down during reconnect/auto-boot, wait and try again.
+          handleAutoReconnect(uid); 
+      } else {
+          // If manual start fails, we keep it in ReJoin.json? 
+          // Actually, let's keep it. If user clicked start, they want it to work eventually.
+          // Or you can choose to delete it here if you want manual starts to be strict.
+          // For now, I will NOT delete it, so if the server comes up later and app restarts, it joins.
+          await reply(`❌ **Connection Failed**: The server is currently offline.`).catch(() => {});
+      }
+      return; 
   }
 
+  // --- CLIENT SETUP ---
   const authDir = getUserAuthDir(uid);
   const opts = { host: ip, port: parseInt(port), connectTimeout: 47000, keepAlive: true };
 
@@ -301,25 +380,19 @@ async function startSession(uid, interaction, isReconnect = false) {
       startedAt: Date.now(), 
       manualStop: false, 
       connected: false,
-      isReconnecting: false
+      isReconnecting: false 
   };
   sessions.set(uid, currentSession);
 
-  // ---------------------------------------------------------
-  // UPDATED ANTI-AFK / ANTI-CHEAT BYPASS LOGIC
-  // ---------------------------------------------------------
+  // --- ANTI-CHEAT & ANTI-AFK BYPASS (JUMPING) ---
   const waitForEntity = setInterval(() => {
-    // Wait until bot spawns and has a valid entity ID
     if (!mc.entity || !mc.entityId) return;
     clearInterval(waitForEntity);
 
-    // Every 15 seconds, send the bypass packet
     const afkInterval = setInterval(() => {
       try {
         if (!mc.entity || !mc.entity.position) return;
         
-        // Input Flag: JUMP_DOWN (usually bit 3, value 8)
-        // We use BigInt (8n) to be safe with protocol libraries
         const JUMP_FLAG = 8n; 
 
         mc.write("player_auth_input", {
@@ -332,21 +405,19 @@ async function startSession(uid, interaction, isReconnect = false) {
           },
           move_vector: { x: 0, z: 0 },
           head_yaw: 0,
-          input_data: JUMP_FLAG, // Forces the server to think SPACE is held
+          input_data: JUMP_FLAG, 
           input_mode: "mouse",
           play_mode: "screen",
           interaction_model: "touch",
-          tick: 0n // Basic tick handling
+          tick: 0n
         });
-      } catch (e) {
-        // Silently fail if packet fails, preventing crash
-      }
-    }, 15000); // 15 Seconds
+      } catch (e) {}
+    }, 15000); // 15s
 
     mc.once("close", () => clearInterval(afkInterval));
   }, 1000);
-  // ---------------------------------------------------------
 
+  // --- EVENTS ---
   mc.on("spawn", () => {
     currentSession.connected = true;
     clearTimeout(currentSession.timeout);
@@ -363,26 +434,6 @@ async function startSession(uid, interaction, isReconnect = false) {
     if (!currentSession.manualStop) handleAutoReconnect(uid);
     logToDiscord(`🔌 Bot of <@${uid}> connection closed.`);
   });
-}
-
-function handleAutoReconnect(uid) {
-    const s = sessions.get(uid);
-    if (!s || s.manualStop || s.reconnectTimer) return;
-    
-    s.isReconnecting = true;
-    logToDiscord(`⏳ Bot of <@${uid}> disconnected. Reconnecting in 2 minutes...`);
-
-    s.reconnectTimer = setTimeout(() => {
-        if (sessions.has(uid)) {
-            const checkS = sessions.get(uid);
-            if (!checkS.manualStop) {
-                checkS.reconnectTimer = null;
-                startSession(uid, null, true);
-            } else {
-                cleanupSession(uid);
-            }
-        }
-    }, 120000); 
 }
 
 // ----------------- Interactions -----------------
