@@ -26,7 +26,7 @@ try {
   PrismarineRegistry = require("prismarine-registry");
   MinecraftData = require("minecraft-data");
 } catch (e) {
-  console.log("⚠️ Advanced features disabled! Run: npm install vec3 prismarine-chunk prismarine-registry minecraft-data");
+  console.log("⚠️  Advanced features disabled! Run: npm install vec3 prismarine-chunk prismarine-registry minecraft-data");
 }
 
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
@@ -93,7 +93,8 @@ const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
     GatewayIntentBits.DirectMessages,
-    GatewayIntentBits.GuildMessages
+    GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.MessageContent // --- LISÄTTY: Tarvitaan viestien lukemiseen ---
   ]
 });
 
@@ -336,12 +337,10 @@ async function startSession(uid, interaction, isReconnect = false) {
   if (sessions.has(uid) && !isReconnect) {
       return safeReply(interaction, "⚠️ **Session Conflict**: Active session already exists.").catch(() => {});
   }
-
-  // --- MODIFIED: COMPACT Connection Embed ---
+  
   const connectionEmbed = new EmbedBuilder()
     .setColor("#5865F2")
     .setTitle("Bot Initialization")
-    // Switch to Thumbnail (next to text) for a compact UI
     .setThumbnail("https://files.catbox.moe/9mqpoz.gif");
 
   try {
@@ -702,6 +701,41 @@ client.on(Events.InteractionCreate, async (i) => {
     }
 
   } catch (e) { console.error(e); }
+});
+
+// --- LISÄTTY: Uusi viestien kuuntelija ---
+client.on(Events.MessageCreate, async (message) => {
+    // Älä reagoi botteihin (mukaan lukien itseensä)
+    if (message.author.bot) return;
+
+    // Tarkista, onko viesti oikealla kanavalla
+    if (message.channel.id !== '1462398161074000143') return;
+    
+    const content = message.content.toLowerCase();
+    const triggerWords = ['afk', 'afkbot'];
+
+    // Tarkista, sisältääkö viesti jonkin avainsanoista
+    if (triggerWords.some(word => content.includes(word))) {
+        try {
+            // 1. Reagoi viestiin
+            const reaction = await message.react('<a:loading:1470137639339299053>');
+            
+            // 2. Aseta ajastin 3 sekunniksi
+            setTimeout(async () => {
+                try {
+                    // 3. Poista reaktio
+                    await reaction.remove();
+                    // 4. Vastaa viestiin
+                    await message.reply("What bout me? 😁");
+                } catch (e) {
+                    // Jätä huomiotta, jos reaktion poistaminen tai vastaaminen epäonnistuu
+                }
+            }, 3000);
+
+        } catch (e) {
+            console.error("Could not react to message. Is the emoji on the server?", e.message);
+        }
+    }
 });
 
 process.on("unhandledRejection", (e) => console.error("Unhandled Rejection:", e));
