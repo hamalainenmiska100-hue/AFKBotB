@@ -337,14 +337,29 @@ async function startSession(uid, interaction, isReconnect = false) {
       return safeReply(interaction, "⚠️ **Session Conflict**: Active session already exists.").catch(() => {});
   }
 
+  // --- MODIFIED: Connection Embed with Loading GIF ---
+  const connectionEmbed = new EmbedBuilder()
+    .setColor("#5865F2")
+    .setTitle("Connecting to Server")
+    .setImage("https://files.catbox.moe/9mqpoz.gif")
+    .setTimestamp();
+
   try {
-      if (!isReconnect) await safeReply(interaction, { content: "🔍 Pinging server...", embeds: [], components: [] });
+      if (!isReconnect) {
+          connectionEmbed.setDescription(`🔍 **Pinging server...**\n🌐 IP: \`${ip}:${port}\``);
+          await safeReply(interaction, { embeds: [connectionEmbed], content: null, components: [] });
+      }
+      
       await bedrock.ping({ host: ip, port: parseInt(port) || 19132, timeout: 5000 });
-      if (!isReconnect) await safeReply(interaction, "✅ **Server found! Joining...**");
+      
+      if (!isReconnect) {
+          connectionEmbed.setDescription(`✅ **Server found! Attempting to join...**\n🌐 IP: \`${ip}:${port}\``);
+          await safeReply(interaction, { embeds: [connectionEmbed] });
+      }
   } catch (err) {
       logToDiscord(`❌ Connection failure for <@${uid}>: Server ${ip}:${port} unreachable.`);
       if (isReconnect) handleAutoReconnect(uid); 
-      else await safeReply(interaction, `❌ **Connection Failed**: Server offline.`);
+      else await safeReply(interaction, { content: `❌ **Connection Failed**: The server at \`${ip}:${port}\` is currently offline.`, embeds: [] });
       return; 
   }
 
@@ -496,7 +511,7 @@ async function startSession(uid, interaction, isReconnect = false) {
   };
 
   // ==========================================
-  // 🛌 BED DETECTION AI (IMPROVED)
+  // 🛌 BED DETECTION AI
   // ==========================================
   function scanForBedAndSleep(uid) {
       const s = sessions.get(uid);
@@ -520,8 +535,6 @@ async function startSession(uid, interaction, isReconnect = false) {
                           logToDiscord(`🛌 Bed found for <@${uid}> at ${checkPos}. Attempting to sleep.`);
                           s.isTryingToSleep = true;
                           
-                          // --- NEW: Dual Packet System for Sleeping ---
-                          // Packet 1: The "Right-Click"
                           mc.write('inventory_transaction', {
                               transaction: {
                                   transaction_type: 'item_use_on_block', action_type: 0,
@@ -531,7 +544,6 @@ async function startSession(uid, interaction, isReconnect = false) {
                               }
                           });
 
-                          // Packet 2: The "Explicit Intent"
                           mc.write('player_action', {
                               runtime_entity_id: s.entityId || 0n,
                               action: 'start_sleeping',
@@ -551,7 +563,8 @@ async function startSession(uid, interaction, isReconnect = false) {
   // --- EVENTS ---
   mc.on("spawn", () => {
     logToDiscord(`✅ Bot of <@${uid}> spawned on **${ip}:${port}**` + (isReconnect ? " (Auto-Rejoined)" : ""));
-    if (!isReconnect) safeReply(interaction, `🟢 **Connected**`);
+    // Clear connection embed upon success
+    if (!isReconnect) safeReply(interaction, { content: `🟢 **Successfully Connected** to \`${ip}:${port}\``, embeds: [] });
   });
 
   mc.on("start_game", (packet) => {
