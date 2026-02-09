@@ -1,12 +1,13 @@
 {
   "name": "bedrock-afk-bot",
-  "version": "2.0.2",
-  "description": "Discord-controlled Minecraft Bedrock AFK Bot",
+  "version": "2.1.0",
+  "description": "Discord-controlled Minecraft Bedrock AFK Bot with Gemini AI Integration",
   "main": "bot.js",
   "scripts": {
     "start": "node bot.js"
   },
   "dependencies": {
+    "@google/generative-ai": "^0.21.0",
     "bedrock-protocol": "^3.11.1",
     "discord.js": "^14.14.1",
     "minecraft-data": "^3.58.0",
