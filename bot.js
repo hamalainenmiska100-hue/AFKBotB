@@ -148,10 +148,9 @@ function adminPanelComponents() {
       new ButtonBuilder().setCustomId("admin_reconnect_all").setLabel("♻️ Reconnect All").setStyle(ButtonStyle.Secondary),
       new ButtonBuilder().setCustomId("admin_stop_all").setLabel("🛑 Stop All").setStyle(ButtonStyle.Danger)
     ),
-    // Row 2: Fun/Control
+    // Row 2: Fun/Control (Removed Jump, Kept Chat)
     new ActionRowBuilder().addComponents(
-      new ButtonBuilder().setCustomId("admin_chat_all").setLabel("📢 Chat (All)").setStyle(ButtonStyle.Success),
-      new ButtonBuilder().setCustomId("admin_jump_all").setLabel("🦘 Jump (All)").setStyle(ButtonStyle.Success)
+      new ButtonBuilder().setCustomId("admin_chat_all").setLabel("📢 Chat (All)").setStyle(ButtonStyle.Success)
     )
   ];
 
@@ -346,23 +345,46 @@ async function startSession(uid, interaction, isReconnect = false) {
   const connectionEmbed = new EmbedBuilder()
     .setColor("#5865F2")
     .setTitle("Bot Initialization")
-    .setThumbnail("https://files.catbox.moe/9mqpoz.gif"); // Compact GIF next to text
+    .setThumbnail("https://files.catbox.moe/9mqpoz.gif");
 
-  // 1. Show "Connecting" UI immediately
-  if (!isReconnect) {
-      connectionEmbed.setDescription(`🚀 **Connecting to server...**\n🌐 **Target:** \`${ip}:${port}\``);
-      await safeReply(interaction, { embeds: [connectionEmbed], content: null, components: [] });
+  // --- STEP 1: PING (BLOCKING CHECK) ---
+  try {
+      if (!isReconnect) {
+          connectionEmbed.setDescription(`🔍 **Pinging server...**\n🌐 **Target:** \`${ip}:${port}\``);
+          await safeReply(interaction, { embeds: [connectionEmbed], content: null, components: [] });
+      }
+      
+      // Wait for ping to finish. If fails, we stop.
+      await bedrock.ping({ host: ip, port: parseInt(port) || 19132, timeout: 5000 });
+      
+      if (!isReconnect) {
+          connectionEmbed.setDescription(`✅ **Server Online! Connecting...**\n🌐 **Target:** \`${ip}:${port}\``);
+          await safeReply(interaction, { embeds: [connectionEmbed] });
+      }
+  } catch (err) {
+      logToDiscord(`❌ Connection failure for <@${uid}>: Server ${ip}:${port} unreachable.`);
+      if (isReconnect) {
+          // If auto-reconnecting, we just wait and try later (infinite rejoin loop)
+          handleAutoReconnect(uid); 
+      } else {
+          // If user started manually, we stop and show error
+          connectionEmbed.setDescription(`❌ **Connection Failed**\nThe server at \`${ip}:${port}\` is offline or unreachable.`);
+          await safeReply(interaction, { embeds: [connectionEmbed] });
+          delete activeSessionsStore[uid];
+          saveActiveSessions();
+      }
+      return; // STOP HERE
   }
 
+  // --- STEP 2: CONNECT ---
   const authDir = getUserAuthDir(uid);
   
-  // 2. Start Client Creation IMMEDIATELY (Do not wait for ping)
   const opts = { 
       host: ip, 
       port: parseInt(port), 
       connectTimeout: 60000, 
       keepAlive: true,
-      viewDistance: 4, // Low RAM usage
+      viewDistance: 4, 
       profilesFolder: authDir,
       username: uid,
       offline: false
@@ -392,23 +414,6 @@ async function startSession(uid, interaction, isReconnect = false) {
   };
   sessions.set(uid, currentSession);
 
-  // 3. Run Ping in Background (Just for UI feedback)
-  if (!isReconnect) {
-      bedrock.ping({ host: ip, port: parseInt(port) || 19132, timeout: 5000 })
-      .then(() => {
-          // Only update UI if we are still connecting
-          if (sessions.has(uid) && !currentSession.connected) {
-             connectionEmbed.setDescription(`✅ **Server found! Authenticating...**\n🌐 **Target:** \`${ip}:${port}\``);
-             safeReply(interaction, { embeds: [connectionEmbed] });
-          }
-      })
-      .catch(() => {
-          // If ping fails, we still let the client try to connect, but warn user
-          connectionEmbed.setDescription(`⚠️ **Ping failed, but trying to connect...**\n🌐 **Target:** \`${ip}:${port}\``);
-          safeReply(interaction, { embeds: [connectionEmbed] });
-      });
-  }
-
   // ==========================================
   // 🍎 PHYSICS ENGINE (Gravity & Hand Swing Only)
   // ==========================================
@@ -433,7 +438,7 @@ async function startSession(uid, interaction, isReconnect = false) {
              currentSession.velocity.y = 0;
           }
 
-          // Send Packet (No walking vector, just existence)
+          // Send Packet
           try {
               mc.write("player_auth_input", {
                  pitch: currentSession.pitch, yaw: currentSession.yaw,
@@ -563,7 +568,7 @@ client.on(Events.InteractionCreate, async (i) => {
         const ids = Array.from(sessions.keys());
         ids.forEach(id => {
             stopSession(id);
-            setTimeout(() => startSession(id, null, true), 3000); // 3s delay before reconnect
+            setTimeout(() => startSession(id, null, true), 3000); 
         });
         return;
       }
@@ -574,16 +579,6 @@ client.on(Events.InteractionCreate, async (i) => {
               new TextInputBuilder().setCustomId("msg").setLabel("Message").setStyle(TextInputStyle.Short)
           ));
           return i.showModal(modal);
-      }
-
-      if (i.customId === "admin_jump_all") {
-          let count = 0;
-          sessions.forEach(s => {
-              if (s.connected && s.onGround) {
-                  s.velocity.y = 0.42; s.onGround = false; count++;
-              }
-          });
-          return i.reply({ content: `🦘 Made ${count} bots jump.`, ephemeral: true });
       }
 
       // --- USER CONTROLS ---
@@ -655,15 +650,29 @@ client.on(Events.InteractionCreate, async (i) => {
             return safeReply(i, { ephemeral: true, content: `✅ Saved: **${ip}:${port}**` });
         }
         
+        // --- FIXED CHAT (ALL) LOGIC ---
         if (i.customId === "admin_chat_modal") {
             const msg = i.fields.getTextInputValue("msg");
-            let count = 0;
-            sessions.forEach(s => {
-                if (s.connected) {
-                    try { s.client.queue('text', { type: 'chat', needs_translation: false, source_name: s.client.username, xuid: '', message: msg }); count++; } catch (e) {}
+            let sentCount = 0;
+            
+            // Loop through all sessions to find valid clients
+            for (const [id, session] of sessions) {
+                if (session.client) {
+                    try { 
+                        session.client.queue('text', { 
+                            type: 'chat', 
+                            needs_translation: false, 
+                            source_name: session.client.username, 
+                            xuid: '', 
+                            message: msg 
+                        }); 
+                        sentCount++; 
+                    } catch (e) {
+                        console.error(`Failed to send chat to ${id}:`, e.message);
+                    }
                 }
-            });
-            return i.reply({ content: `📢 Broadcast sent to ${count} bots.`, ephemeral: true });
+            }
+            return i.reply({ content: `📢 Broadcast sent to ${sentCount} active bots.`, ephemeral: true });
         }
     }
 
