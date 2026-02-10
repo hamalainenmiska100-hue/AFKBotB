@@ -6,13 +6,13 @@
     "start": "node bot.js"
   },
   "dependencies": {
-    "bedrock-protocol": "^1.29.0",
+    "bedrock-protocol": "latest",
     "discord.js": "^14.11.0",
     "firebase-admin": "^11.11.0",
-    "minecraft-data": "^3.35.0",
-    "prismarine-auth": "^2.3.0",
-    "prismarine-chunk": "^1.32.0",
-    "prismarine-registry": "^1.6.0",
+    "minecraft-data": "latest",
+    "prismarine-auth": "latest",
+    "prismarine-chunk": "latest",
+    "prismarine-registry": "latest",
     "vec3": "^0.2.0"
   },
   "engines": {
