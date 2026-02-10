@@ -147,6 +147,21 @@ function denyIfWrongGuild(i) {
   return null;
 }
 
+// ----------------- Helper: Robust Ping -----------------
+// Tries 3 times to ensure the server is actually offline before giving up
+async function checkServerOnline(ip, port) {
+    for (let i = 0; i < 3; i++) {
+        try {
+            await bedrock.ping({ host: ip, port: port, timeout: 2000 });
+            return true; // Success!
+        } catch (e) {
+            // Wait 500ms before retry
+            await new Promise(r => setTimeout(r, 500));
+        }
+    }
+    return false; // Failed all attempts
+}
+
 // ----------------- UI Helpers -----------------
 function panelRow(isJava = false) {
   const title = isJava ? "Java AFKBot Panel 🎛️" : "Bedrock AFKBot Panel 🎛️";
@@ -168,13 +183,11 @@ function panelRow(isJava = false) {
 
 function adminPanelComponents() {
   const rows = [
-    // Row 1: Core Controls
     new ActionRowBuilder().addComponents(
       new ButtonBuilder().setCustomId("admin_refresh").setLabel("🔄 Refresh").setStyle(ButtonStyle.Primary),
       new ButtonBuilder().setCustomId("admin_reconnect_all").setLabel("♻️ Reconnect All").setStyle(ButtonStyle.Secondary),
       new ButtonBuilder().setCustomId("admin_stop_all").setLabel("🛑 Stop All").setStyle(ButtonStyle.Danger)
     ),
-    // Row 2: Chat
     new ActionRowBuilder().addComponents(
       new ButtonBuilder().setCustomId("admin_chat_all").setLabel("📢 Chat (All)").setStyle(ButtonStyle.Success)
     )
@@ -227,14 +240,12 @@ function getAdminStatsEmbed() {
 }
 
 // ----------------- Global Physics Loop (Optimization) -----------------
-// Runs physics for ALL bots in one loop to save CPU
 setInterval(() => {
     for (const [uid, s] of sessions) {
         if (!s.connected || !s.position) continue;
         
         const gravity = 0.08;
         
-        // Apply Gravity
         if (!s.onGround) {
            s.velocity.y -= gravity;
         }
@@ -243,7 +254,6 @@ setInterval(() => {
         
         s.position.add(s.velocity);
 
-        // Void Protection
         if (s.position.y < -64) {
            s.position.y = 320; 
            s.velocity.y = 0;
@@ -280,7 +290,6 @@ client.once("ready", async () => {
   ];
   await client.application.commands.set(cmds);
 
-  // Admin refresh loop
   setInterval(async () => {
     if (lastAdminMessage) {
         try {
@@ -289,7 +298,6 @@ client.once("ready", async () => {
     }
   }, 30000);
 
-  // Auto-Rejoin Logic (Persistence)
   console.log("📂 Checking ReJoin.json for previous sessions...");
   const previousSessions = Object.keys(activeSessionsStore);
   
@@ -300,7 +308,7 @@ client.once("ready", async () => {
           setTimeout(() => {
               startSession(uid, null, true);
           }, delay);
-          delay += 10000; // 10s stagger to prevent rate limits
+          delay += 10000; 
       }
   } else {
       console.log("⚪ No previous sessions found.");
@@ -309,9 +317,7 @@ client.once("ready", async () => {
 
 // ----------------- Microsoft Link -----------------
 async function linkMicrosoft(uid, interaction) {
-  // Ephemeral check to prevent overwriting the main message
   if (pendingLink.has(uid)) return interaction.editReply("⏳ Login already in progress.");
-  
   const authDir = getUserAuthDir(uid);
   const u = getUser(uid);
   let codeShown = false;
@@ -321,7 +327,6 @@ async function linkMicrosoft(uid, interaction) {
       const code = data.user_code || "(no code)";
       codeShown = true;
       const msg = `🔐 **Microsoft Authentication Required**\n\n1. Visit: ${uri}\n2. Enter Code: \`${code}\``;
-      // Use editReply here because we deferred in the Interaction Handler
       await interaction.editReply({ content: msg, components: [new ActionRowBuilder().addComponents(new ButtonBuilder().setLabel("🌐 Open link").setStyle(ButtonStyle.Link).setURL(uri))] }).catch(() => {});
   });
 
@@ -350,13 +355,10 @@ function cleanupSession(uid) {
 
 function stopSession(uid) {
   const s = sessions.get(uid);
-  
-  // REMOVE FROM PERSISTENCE
   if (activeSessionsStore[uid]) {
       delete activeSessionsStore[uid];
       saveActiveSessions();
   }
-  
   if (!s) return false;
   s.manualStop = true; 
   cleanupSession(uid);
@@ -375,7 +377,6 @@ function handleAutoReconnect(uid) {
     s.reconnectTimer = setTimeout(() => {
         if (sessions.has(uid)) {
             const checkS = sessions.get(uid);
-            // Verify persistence is still true
             if (!checkS.manualStop) {
                 checkS.reconnectTimer = null; 
                 startSession(uid, null, true); 
@@ -383,10 +384,9 @@ function handleAutoReconnect(uid) {
                 cleanupSession(uid);
             }
         }
-    }, 60000); // 1 Minute
+    }, 60000); 
 }
 
-// Helper to handle defer/reply logic safely
 async function safeReply(interaction, content) {
     if (!interaction) return;
     try {
@@ -399,7 +399,6 @@ async function safeReply(interaction, content) {
 async function startSession(uid, interaction, isReconnect = false) {
   const u = getUser(uid);
   
-  // 1. ADD TO PERSISTENCE IMMEDIATELY
   if (!activeSessionsStore[uid]) {
       activeSessionsStore[uid] = true;
       saveActiveSessions();
@@ -419,47 +418,49 @@ async function startSession(uid, interaction, isReconnect = false) {
     .setColor("#5865F2").setTitle("Bot Initialization")
     .setThumbnail("https://files.catbox.moe/9mqpoz.gif");
 
-  // Skip Ping Logic
   const SKIP_PING_DOMAINS = ['.progamer.me', '.playserver.pro', '.freeservers.cloud'];
   const shouldSkipPing = SKIP_PING_DOMAINS.some(domain => ip.toLowerCase().endsWith(domain));
 
   // --- STEP 1: PREPARATION & PING ---
-  try {
-      if (!isReconnect) {
-          if (shouldSkipPing) {
-              connectionEmbed.setDescription(`⏩ **Skipping Ping (Known Host)**\n🌐 **Target:** \`${ip}:${port}\``);
-          } else {
-              connectionEmbed.setDescription(`🔍 **Pinging server...**\n🌐 **Target:** \`${ip}:${port}\``);
-          }
-          await safeReply(interaction, { embeds: [connectionEmbed], content: null, components: [] });
-      }
-      
-      // Token Pre-load
-      const preAuth = new Authflow(uid, getUserAuthDir(uid), { flow: "live", authTitle: Titles?.MinecraftNintendoSwitch, deviceType: "Nintendo" });
-      try { await preAuth.getXboxToken(); } catch (e) {}
-
-      // Ping check
-      if (!shouldSkipPing) {
-          await bedrock.ping({ host: ip, port: parseInt(port) || 19132, timeout: 5000 });
-      }
-      
-      if (!isReconnect) {
-          const statusText = shouldSkipPing ? "Attempting connection..." : "Server Online! Connecting...";
-          connectionEmbed.setDescription(`✅ **${statusText}**\n🌐 **Target:** \`${ip}:${port}\``);
-          await safeReply(interaction, { embeds: [connectionEmbed] });
-      }
-  } catch (err) {
-      logToDiscord(`❌ Connection failure for <@${uid}>: Server ${ip}:${port} unreachable.`);
-      if (isReconnect) {
-          handleAutoReconnect(uid); 
+  
+  // Status UI update
+  if (!isReconnect) {
+      if (shouldSkipPing) {
+          connectionEmbed.setDescription(`⏩ **Skipping Ping (Known Host)**\n🌐 **Target:** \`${ip}:${port}\``);
       } else {
-          connectionEmbed.setDescription(`❌ **Connection Failed**\nThe server at \`${ip}:${port}\` is offline or unreachable.`);
-          connectionEmbed.setThumbnail(null); // Remove GIF on fail
-          await safeReply(interaction, { embeds: [connectionEmbed] });
-          delete activeSessionsStore[uid];
-          saveActiveSessions();
+          connectionEmbed.setDescription(`🔍 **Pinging server...**\n🌐 **Target:** \`${ip}:${port}\``);
       }
-      return; 
+      await safeReply(interaction, { embeds: [connectionEmbed], content: null, components: [] });
+  }
+  
+  // Token Pre-load
+  const preAuth = new Authflow(uid, getUserAuthDir(uid), { flow: "live", authTitle: Titles?.MinecraftNintendoSwitch, deviceType: "Nintendo" });
+  try { await preAuth.getXboxToken(); } catch (e) {}
+
+  // PING CHECK (STRICT)
+  if (!shouldSkipPing) {
+      const isOnline = await checkServerOnline(ip, parseInt(port) || 19132);
+      
+      if (!isOnline) {
+          logToDiscord(`❌ Connection failure for <@${uid}>: Server ${ip}:${port} unreachable/offline.`);
+          
+          if (isReconnect) {
+              handleAutoReconnect(uid); // Keep retrying silently if auto-rejoin
+          } else {
+              // Stop if manual start
+              connectionEmbed.setDescription(`❌ **Connection Failed**\nThe server at \`${ip}:${port}\` appears offline or is blocking pings.`);
+              connectionEmbed.setThumbnail(null);
+              await safeReply(interaction, { embeds: [connectionEmbed] });
+              delete activeSessionsStore[uid];
+              saveActiveSessions();
+          }
+          return; // STOP HERE
+      }
+  }
+  
+  if (!isReconnect) {
+      connectionEmbed.setDescription(`✅ **Server Online! Connecting...**\n🌐 **Target:** \`${ip}:${port}\``);
+      await safeReply(interaction, { embeds: [connectionEmbed] });
   }
 
   // --- STEP 2: CONNECT ---
@@ -499,9 +500,7 @@ async function startSession(uid, interaction, isReconnect = false) {
   };
   sessions.set(uid, currentSession);
 
-  // ==========================================
-  // 🤖 ANTI-AFK (Look, Jump, Swing)
-  // ==========================================
+  // Anti-AFK
   const performAntiAfk = () => {
       if (!sessions.has(uid)) return;
       const s = sessions.get(uid);
@@ -512,17 +511,14 @@ async function startSession(uid, interaction, isReconnect = false) {
       }
 
       try {
-          // Randomize Look
           s.yaw += (Math.random() - 0.5) * 20; 
           s.pitch += (Math.random() - 0.5) * 10;
 
-          // Random Jump (if on ground)
           if (s.onGround && Math.random() > 0.9) {
               s.velocity.y = 0.42;
               s.onGround = false;
           }
           
-          // Hand Swing (Animation)
           mc.write('animate', { action_id: 1, runtime_entity_id: s.entityId || 0n });
       } catch (e) {}
 
@@ -533,10 +529,9 @@ async function startSession(uid, interaction, isReconnect = false) {
   // --- EVENTS ---
   mc.on("spawn", () => {
     logToDiscord(`✅ Bot of <@${uid}> spawned on **${ip}:${port}**` + (isReconnect ? " (Auto-Rejoined)" : ""));
-    // Final Success Embed
     if (!isReconnect) {
         connectionEmbed.setDescription(`🟢 **Online** on \`${ip}:${port}\`\nPhysics & Hand Swing Active.`);
-        connectionEmbed.setThumbnail(null); // Remove GIF on success
+        connectionEmbed.setThumbnail(null);
         safeReply(interaction, { embeds: [connectionEmbed] });
     }
   });
@@ -548,7 +543,6 @@ async function startSession(uid, interaction, isReconnect = false) {
       currentSession.entityId = packet.runtime_entity_id;
       currentSession.connected = true;
       currentSession.isReconnecting = false;
-      
       performAntiAfk();
   });
   
@@ -586,7 +580,6 @@ async function startSession(uid, interaction, isReconnect = false) {
 // ----------------- Interactions (Lag Protected) -----------------
 client.on(Events.InteractionCreate, async (i) => {
   try {
-    // 1. Instant Defer for EVERYTHING except Modals
     if (i.isButton()) {
         if (i.customId === "settings" || i.customId === "admin_chat_all") { } 
         else if (i.customId === "link") { await i.deferReply({ ephemeral: true }); }
@@ -624,7 +617,8 @@ client.on(Events.InteractionCreate, async (i) => {
       if (i.customId === "admin_stop_all") { sessions.forEach((s, id) => stopSession(id)); return i.followUp({ content: "🛑 Stopped.", ephemeral: true }); }
       if (i.customId === "admin_reconnect_all") {
         i.followUp({ content: "♻️ Reconnecting...", ephemeral: true });
-        sessions.forEach((s, id) => { stopSession(id); setTimeout(() => startSession(id, null, true), 3000); });
+        const ids = Array.from(sessions.keys());
+        ids.forEach(id => { stopSession(id); setTimeout(() => startSession(id, null, true), 3000); });
         return;
       }
       if (i.customId === "confirm_start") return startSession(uid, i, false);
@@ -636,9 +630,10 @@ client.on(Events.InteractionCreate, async (i) => {
       if (i.customId === "link") return linkMicrosoft(uid, i);
       if (i.customId === "unlink") { unlinkMicrosoft(uid); return i.followUp({ content: "🗑 Unlinked.", ephemeral: true }); }
       if (i.customId === "cancel") return i.editReply({ content: "❌ Cancelled.", embeds: [], components: [] });
+      
       if (i.customId === "settings") {
         const u = getUser(uid);
-        const modal = new ModalBuilder().setCustomId("settings_modal").setTitle("Config");
+        const modal = new ModalBuilder().setCustomId("settings_modal").setTitle("Configuration");
         modal.addComponents(
           new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("ip").setLabel("IP").setStyle(TextInputStyle.Short).setValue(u.server?.ip || "")),
           new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("port").setLabel("Port").setStyle(TextInputStyle.Short).setValue(String(u.server?.port || 19132)))
@@ -670,7 +665,6 @@ client.on(Events.InteractionCreate, async (i) => {
 client.on(Events.MessageCreate, async (m) => {
     if (m.author.bot) return;
 
-    // AI Chat
     if (m.content.startsWith(":talk")) {
         const query = m.content.slice(5).trim(); if (!query) return;
         try {
@@ -681,7 +675,6 @@ client.on(Events.MessageCreate, async (m) => {
         return;
     }
 
-    // AFK Scanning
     if (botConfig.scanChannelId && m.channel.id === botConfig.scanChannelId) {
         if (['afk', 'afkbot'].some(w => m.content.toLowerCase().includes(w))) {
             try {
