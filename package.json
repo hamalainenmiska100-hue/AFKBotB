@@ -10,7 +10,7 @@
     "discord.js": "^14.11.0",
     "firebase-admin": "^11.11.0",
     "minecraft-data": "latest",
-    "prismarine-auth": "2.7.0^",
+    "prismarine-auth": "latest",
     "prismarine-chunk": "latest",
     "prismarine-registry": "latest",
     "vec3": "^0.1.8"
