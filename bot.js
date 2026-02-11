@@ -34,10 +34,9 @@ if (!DISCORD_TOKEN) {
 }
 
 // ----------------- Config -----------------
-const ALLOWED_GUILD_ID = "1462335230345089254";
-const ADMIN_ID = "1144987924123881564";
-const LOG_CHANNEL_ID = "1464615030111731753";
-const ADMIN_CHANNEL_ID = "1469013237625393163";
+// 🔓 Guild restrictions removed.
+const ADMIN_ID = "1144987924123881564"; // Only this user can use /admin
+const LOG_CHANNEL_ID = "1464615030111731753"; // Central log channel (optional)
 
 // ----------------- Storage -----------------
 const DATA = path.join(__dirname, "data");
@@ -115,21 +114,13 @@ process.on("uncaughtException", (err) => console.error("🔥 Uncaught Exception:
 
 async function logToDiscord(message) {
     try {
+        // Keeps a central log in the main server, if the bot is still in it.
         const channel = await client.channels.fetch(LOG_CHANNEL_ID);
         if (channel) {
             const embed = new EmbedBuilder().setColor("#5865F2").setDescription(message).setTimestamp();
             await channel.send({ embeds: [embed] });
         }
     } catch (e) { }
-}
-
-function denyIfWrongGuild(i) {
-    if (!i.inGuild() || i.guildId !== ALLOWED_GUILD_ID) {
-        const msg = "This bot cannot be used in this server ⛔️";
-        if (i.replied || i.deferred) return;
-        return i.reply({ ephemeral: true, content: msg }).catch(() => { });
-    }
-    return null;
 }
 
 // ----------------- UI helpers -----------------
@@ -556,7 +547,6 @@ async function startSession(uid, interaction, isReconnect = false) {
                     const chunk = s.chunks.get(`${chunkX},${chunkZ}`);
 
                     if (chunk) {
-                        // FIX: Try/Catch required for getBlock if coords are edge-case
                         try {
                             const block = chunk.getBlock(checkPos);
                             if (block && block.name.includes('bed')) {
@@ -645,22 +635,21 @@ async function startSession(uid, interaction, isReconnect = false) {
 // ----------------- Interactions -----------------
 client.on(Events.InteractionCreate, async (i) => {
     try {
-        const blocked = denyIfWrongGuild(i);
-        if (blocked) return;
         const uid = i.user.id;
 
         if (i.isChatInputCommand()) {
             if (i.commandName === "panel") return safeReply(i, panelRow(false));
             if (i.commandName === "java") return safeReply(i, panelRow(true));
             if (i.commandName === "admin") {
-                if (uid !== ADMIN_ID || i.channelId !== ADMIN_CHANNEL_ID) return safeReply(i, { content: "⛔ Access restricted.", ephemeral: true });
+                // 🔓 Admin Access Unlocked: Checks ID only, not Channel/Guild
+                if (uid !== ADMIN_ID) return safeReply(i, { content: "⛔ Access restricted.", ephemeral: true });
                 const msg = await i.reply({ embeds: [getAdminStatsEmbed()], components: adminPanelComponents(), fetchReply: true });
                 lastAdminMessage = msg;
                 return;
             }
         }
 
-        // --- Select Menu Handling (FIXED) ---
+        // --- Select Menu Handling ---
         if (i.isStringSelectMenu()) {
             if (i.customId === "admin_force_stop_select") {
                 const targetUid = i.values[0];
