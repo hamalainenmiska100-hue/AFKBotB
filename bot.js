@@ -50,15 +50,35 @@ const REJOIN_STORE = path.join(DATA, "ReJoin.json");
 if (!fs.existsSync(DATA)) fs.mkdirSync(DATA);
 if (!fs.existsSync(AUTH_ROOT)) fs.mkdirSync(AUTH_ROOT, { recursive: true });
 
-let users = fs.existsSync(STORE) ? JSON.parse(fs.readFileSync(STORE, "utf8")) : {};
-let activeSessionsStore = fs.existsSync(REJOIN_STORE) ? JSON.parse(fs.readFileSync(REJOIN_STORE, "utf8")) : {};
+// --- KORJATTU LATAUSLOGIIKKA (FIXED LOADING LOGIC) ---
+function loadJson(filePath) {
+  if (!fs.existsSync(filePath)) return {};
+  try {
+    const data = fs.readFileSync(filePath, "utf8");
+    return data ? JSON.parse(data) : {};
+  } catch (e) {
+    console.error(`⚠️ Error reading ${filePath}, resetting file:`, e.message);
+    return {};
+  }
+}
+
+let users = loadJson(STORE);
+let activeSessionsStore = loadJson(REJOIN_STORE);
 
 function save() {
-  fs.writeFileSync(STORE, JSON.stringify(users, null, 2));
+  try {
+    fs.writeFileSync(STORE, JSON.stringify(users, null, 2));
+  } catch (e) {
+    console.error("Failed to save users:", e);
+  }
 }
 
 function saveActiveSessions() {
-  fs.writeFileSync(REJOIN_STORE, JSON.stringify(activeSessionsStore, null, 2));
+  try {
+    fs.writeFileSync(REJOIN_STORE, JSON.stringify(activeSessionsStore, null, 2));
+  } catch (e) {
+    console.error("Failed to save sessions:", e);
+  }
 }
 
 function getUser(uid) {
@@ -94,7 +114,7 @@ const client = new Client({
     GatewayIntentBits.Guilds,
     GatewayIntentBits.DirectMessages,
     GatewayIntentBits.GuildMessages,
-    GatewayIntentBits.MessageContent // --- LISÄTTY: Tarvitaan viestien lukemiseen ---
+    GatewayIntentBits.MessageContent
   ]
 });
 
@@ -703,37 +723,24 @@ client.on(Events.InteractionCreate, async (i) => {
   } catch (e) { console.error(e); }
 });
 
-// --- LISÄTTY: Uusi viestien kuuntelija ---
 client.on(Events.MessageCreate, async (message) => {
-    // Älä reagoi botteihin (mukaan lukien itseensä)
     if (message.author.bot) return;
-
-    // Tarkista, onko viesti oikealla kanavalla
     if (message.channel.id !== '1462398161074000143') return;
     
     const content = message.content.toLowerCase();
     const triggerWords = ['afk', 'afkbot'];
 
-    // Tarkista, sisältääkö viesti jonkin avainsanoista
     if (triggerWords.some(word => content.includes(word))) {
         try {
-            // 1. Reagoi viestiin
             const reaction = await message.react('<a:loading:1470137639339299053>');
-            
-            // 2. Aseta ajastin 3 sekunniksi
             setTimeout(async () => {
                 try {
-                    // 3. Poista reaktio
                     await reaction.remove();
-                    // 4. Vastaa viestiin
                     await message.reply("What bout me? 😁");
-                } catch (e) {
-                    // Jätä huomiotta, jos reaktion poistaminen tai vastaaminen epäonnistuu
-                }
+                } catch (e) {}
             }, 3000);
-
         } catch (e) {
-            console.error("Could not react to message. Is the emoji on the server?", e.message);
+            console.error("Could not react to message:", e.message);
         }
     }
 });
