@@ -1,23 +1,19 @@
-# Use Node 22 on Debian Bookworm
-FROM node:22-bookworm
+# Use a lightweight Node image
+FROM node:18-alpine
 
-# Install build tools required for native modules (RakNet, etc.)
-RUN apt-get update && apt-get install -y \
-    build-essential \
-    cmake \
-    python3 \
-    && rm -rf /var/lib/apt/lists/*
-
+# Create app directory
 WORKDIR /app
 
-# Copy package.json first
-COPY package.json .
+# Install app dependencies
+COPY package.json ./
+RUN npm install
 
-# Clear npm cache and install dependencies
-RUN npm cache clean --force && npm install
+# Bundle app source
+COPY bot.js ./
 
-# Copy the rest of the application code
-COPY . .
+# Expose the HTTP port (for health checks)
+EXPOSE 8080
 
 # Start the bot
-CMD ["node", "bot.js"]
+CMD [ "npm", "start" ]
+
