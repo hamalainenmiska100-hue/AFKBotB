@@ -8,11 +8,9 @@ const fs = require('fs');
 const SERVER_HOST = process.env.SERVER_HOST || 'play.example.com'; 
 const SERVER_PORT = parseInt(process.env.SERVER_PORT) || 19132;
 const USERNAME = process.env.BOT_USERNAME || 'AFK_Bot';
-
-// Path to store login tokens (Mapped to Fly.io Volume)
 const AUTH_PATH = process.env.PERSISTENT_DATA_PATH || path.join(__dirname, 'auth');
 
-// --- WEB SERVER (REQUIRED FOR 24/7 CLOUD HOSTING) ---
+// --- WEB SERVER ---
 const requestListener = function (req, res) {
   res.writeHead(200);
   res.end(`Bot Status: Running\nTarget: ${SERVER_HOST}\nReconnects: ${reconnectCount}`);
@@ -20,7 +18,7 @@ const requestListener = function (req, res) {
 const server = http.createServer(requestListener);
 const HTTP_PORT = process.env.PORT || 8080;
 server.listen(HTTP_PORT, () => {
-  console.log(`Web server running on port ${HTTP_PORT} (Keeps the bot alive)`);
+  console.log(`Web server running on port ${HTTP_PORT}`);
 });
 
 // --- BOT LOGIC ---
@@ -28,7 +26,6 @@ let client;
 let reconnectCount = 0;
 let isReconnecting = false;
 
-// Ensure auth folder exists
 if (!fs.existsSync(AUTH_PATH)){
     fs.mkdirSync(AUTH_PATH, { recursive: true });
 }
@@ -36,19 +33,24 @@ if (!fs.existsSync(AUTH_PATH)){
 async function authenticate() {
   console.log(`[${new Date().toISOString()}] Starting Microsoft authentication...`);
   
+  // TÄRKEÄ: Lisätään deviceType ja authTitle oikein!
   const auth = new Authflow(USERNAME, AUTH_PATH, {
-    authTitle: Titles.MinecraftNintendoSwitch, // or Titles.MinecraftWindows
-    deviceType: 'Nintendo', // or 'Win32'
-    flow: 'live' // 'live' for device code flow (works headless)
+    authTitle: Titles.MinecraftNintendoSwitch,
+    deviceType: 'Nintendo',
+    flow: 'live'
   });
 
   try {
-    // Get Xbox Live token
+    // Haetaan Xbox-token ensin
     const xboxToken = await auth.getXboxToken();
     console.log('✅ Xbox authentication successful!');
     
-    // Get Minecraft Bedrock token
-    const mcToken = await auth.getMinecraftBedrockToken();
+    // TÄRKEÄ: Generoidaan ECDH-avain Bedrockia varten!
+    const crypto = require('crypto');
+    const { createEcdhKey } = require('prismarine-auth/src/common/Util');
+    
+    // Haetaan Minecraft Bedrock -token oikealla avaimella
+    const mcToken = await auth.getMinecraftBedrockToken(createEcdhKey());
     console.log('✅ Minecraft token acquired!');
     
     return { auth, xboxToken, mcToken };
@@ -64,23 +66,18 @@ async function connectBot() {
   console.log(`[${new Date().toISOString()}] Connecting to ${SERVER_HOST}:${SERVER_PORT} as ${USERNAME}...`);
 
   try {
-    // Authenticate first
-    const { auth } = await authenticate();
+    const { auth, mcToken } = await authenticate();
     
-    // Get the auth token data
-    const tokens = await auth.getMinecraftBedrockToken();
-    
+    // Luodaan client oikeilla tokeneilla
     client = bedrock.createClient({
       host: SERVER_HOST,
       port: SERVER_PORT,
       username: USERNAME,
       offline: false,
-      // Pass the auth flow to bedrock-protocol
+      // Käytetään auth-oliota
       authFlow: auth,
-      // Or use manual token injection:
-      skinData: {
-        // Optional: customize skin
-      }
+      // Tai manuaalisesti asetetut tokenit
+      skinData: mcToken.skinData || {}
     });
 
     client.on('play_status', (packet) => {
@@ -123,12 +120,10 @@ function startAfkLoop(entityId) {
     if (client && client.status !== 2) {
       try {
         client.queue('animate', {
-          action_id: 1, // Swing Arm
+          action_id: 1,
           runtime_entity_id: entityId
         });
-      } catch (e) {
-        // Queue failed, likely disconnected
-      }
+      } catch (e) {}
     }
   }, 4000);
 }
@@ -150,5 +145,4 @@ function scheduleReconnect() {
   }, delay);
 }
 
-// Start the bot
 connectBot();
