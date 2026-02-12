@@ -406,17 +406,18 @@ const minecraftHTML = `
                 35px 5px 0 #3d8c9e;
         }
         
-        .loading-dots::after {
-            content: '';
+                .loading-dots::after {
+            content: ' ';
             animation: dots 1.5s steps(4, end) infinite;
         }
         
         @keyframes dots {
-            0% { content: ''; }
+            0% { content: ' '; }
             25% { content: '.'; }
             50% { content: '..'; }
             75% { content: '...'; }
         }
+
         
         @media (max-width: 600px) {
             h1 { font-size: 2rem; }
