@@ -433,6 +433,224 @@ const minecraftHTML = `
         <div class="mc-panel">
             <div class="steve-container">
                 <div class="steve-head">
+                    <div class="steve;
+            letter-spacing: 1px;
+        }
+        
+        .info-value {
+            font-size: 1.8rem;
+            color: #ffffff;
+            text-shadow: 2px 2px 0 #000000;
+            word-break: break-all;
+        }
+        
+        .mc-button {
+            display: inline-block;
+            background: #7d7d7d;
+            border: 4px solid #373737;
+            border-top-color: #ffffff;
+            border-left-color: #ffffff;
+            color: #ffffff;
+            font-family: 'VT323', monospace;
+            font-size: 1.5rem;
+            padding: 12px 24px;
+            cursor: pointer;
+            text-decoration: none;
+            text-shadow: 2px 2px 0 #000000;
+            box-shadow: inset -4px -4px 0 #555555;
+            transition: all 0.1s;
+            width: 100%;
+            text-align: center;
+            margin-top: 10px;
+        }
+        
+        .mc-button:hover {
+            background: #8b8b8b;
+        }
+        
+        .mc-button:active {
+            background: #5d5d5d;
+            border: 4px solid #ffffff;
+            border-top-color: #373737;
+            border-left-color: #373737;
+            box-shadow: inset 4px 4px 0 #373737;
+        }
+        
+        .mc-button.danger {
+            background: #8b3a3a;
+        }
+        
+        .mc-button.danger:hover {
+            background: #a04545;
+        }
+        
+        .mc-button.success {
+            background: #3a8b3a;
+        }
+        
+        .mc-button.success:hover {
+            background: #45a045;
+        }
+        
+        .error-box {
+            background: #8b3a3a;
+            border: 4px solid #ff0000;
+            border-top-color: #ff6666;
+            border-left-color: #ff6666;
+            padding: 15px;
+            margin-top: 20px;
+            color: #ffffff;
+            display: none;
+        }
+        
+        .error-box.show {
+            display: block;
+        }
+        
+        .error-title {
+            font-size: 1.5rem;
+            margin-bottom: 10px;
+            color: #ffaaaa;
+        }
+        
+        .auth-box {
+            background: #3a5a8b;
+            border: 4px solid #0000ff;
+            border-top-color: #6666ff;
+            border-left-color: #6666ff;
+            padding: 20px;
+            margin: 20px 0;
+            color: #ffffff;
+            display: none;
+        }
+        
+        .auth-box.show {
+            display: block;
+            animation: slideIn 0.3s ease-out;
+        }
+        
+        @keyframes slideIn {
+            from { transform: translateY(-20px); opacity: 0; }
+            to { transform: translateY(0); opacity: 1; }
+        }
+        
+        .auth-code {
+            font-size: 3rem;
+            text-align: center;
+            background: #000000;
+            padding: 15px;
+            margin: 15px 0;
+            border: 4px solid #ffffff;
+            color: #00ff00;
+            text-shadow: 0 0 10px #00ff00;
+            letter-spacing: 8px;
+        }
+        
+        .auth-link {
+            display: block;
+            text-align: center;
+            font-size: 1.8rem;
+            color: #aaaaff;
+            text-decoration: underline;
+            margin: 10px 0;
+            word-break: break-all;
+        }
+        
+        .auth-instructions {
+            font-size: 1.3rem;
+            line-height: 1.6;
+            margin-bottom: 15px;
+        }
+        
+        .button-group {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 10px;
+            margin-top: 20px;
+        }
+        
+        .footer {
+            text-align: center;
+            margin-top: 30px;
+            color: #8b8b8b;
+            font-size: 1.2rem;
+            text-shadow: 1px 1px 0 #000000;
+        }
+        
+        .steve-container {
+            position: absolute;
+            top: -60px;
+            right: 20px;
+            width: 80px;
+            height: 80px;
+            animation: float 3s ease-in-out infinite;
+        }
+        
+        @keyframes float {
+            0%, 100% { transform: translateY(0px); }
+            50% { transform: translateY(-10px); }
+        }
+        
+        .steve-head {
+            width: 100%;
+            height: 100%;
+            background: #f9b98f;
+            border: 4px solid #000;
+            position: relative;
+        }
+        
+        .steve-face {
+            width: 100%;
+            height: 100%;
+            position: relative;
+            background: 
+                linear-gradient(to right, transparent 25%, #3d1f0f 25%, #3d1f0f 35%, transparent 35%),
+                linear-gradient(to right, transparent 65%, #3d1f0f 65%, #3d1f0f 75%, transparent 75%),
+                linear-gradient(to bottom, #5d3a1a 0%, #5d3a1a 30%, transparent 30%);
+            background-size: 100% 100%, 100% 100%, 100% 100%;
+        }
+        
+        .steve-face::after {
+            content: '';
+            position: absolute;
+            top: 35%;
+            left: 20%;
+            width: 25%;
+            height: 15%;
+            background: #ffffff;
+            box-shadow: 
+                35px 0 0 #ffffff,
+                0 5px 0 #3d8c9e,
+                35px 5px 0 #3d8c9e;
+        }
+        
+        .loading-dots::after {
+            content: '';
+            animation: dots 1.5s steps(4, end) infinite;
+        }
+        
+        @keyframes dots {
+            0% { content: ''; }
+            25% { content: '.'; }
+            50% { content: '..'; }
+            75% { content: '...'; }
+        }
+        
+        @media (max-width: 600px) {
+            h1 { font-size: 2rem; }
+            .status-text { font-size: 1.5rem; }
+            .steve-container { display: none; }
+            .button-group { grid-template-columns: 1fr; }
+        }
+    </style>
+</head>
+<body>
+    <div class="grass-border"></div>
+    
+    <div class="container">
+        <div class="mc-panel">
+            <div class="steve-container">
+                <div class="steve-head">
                     <div class="steve-face"></div>
                 </div>
             </div>
@@ -445,7 +663,243 @@ const minecraftHTML = `
                 <div class="status-text" id="statusText">Initializing...</div>
             </div>
             
-            <!-- Auth Linking Box -->
+            <div class="auth-box" id="authBox">
+                <div class="auth-instructions">
+                    🔐 <strong>Link your Xbox Account</strong><br>
+                    1. Go to the link below<br>
+                    2. Enter this code<br>
+                    3. Sign in with your Microsoft account
+                </div>
+                <a href="#" class="auth-link" id="authLink" target="_;
+            letter-spacing: 1px;
+        }
+        
+        .info-value {
+            font-size: 1.8rem;
+            color: #ffffff;
+            text-shadow: 2px 2px 0 #000000;
+            word-break: break-all;
+        }
+        
+        .mc-button {
+            display: inline-block;
+            background: #7d7d7d;
+            border: 4px solid #373737;
+            border-top-color: #ffffff;
+            border-left-color: #ffffff;
+            color: #ffffff;
+            font-family: 'VT323', monospace;
+            font-size: 1.5rem;
+            padding: 12px 24px;
+            cursor: pointer;
+            text-decoration: none;
+            text-shadow: 2px 2px 0 #000000;
+            box-shadow: inset -4px -4px 0 #555555;
+            transition: all 0.1s;
+            width: 100%;
+            text-align: center;
+            margin-top: 10px;
+        }
+        
+        .mc-button:hover {
+            background: #8b8b8b;
+        }
+        
+        .mc-button:active {
+            background: #5d5d5d;
+            border: 4px solid #ffffff;
+            border-top-color: #373737;
+            border-left-color: #373737;
+            box-shadow: inset 4px 4px 0 #373737;
+        }
+        
+        .mc-button.danger {
+            background: #8b3a3a;
+        }
+        
+        .mc-button.danger:hover {
+            background: #a04545;
+        }
+        
+        .mc-button.success {
+            background: #3a8b3a;
+        }
+        
+        .mc-button.success:hover {
+            background: #45a045;
+        }
+        
+        .error-box {
+            background: #8b3a3a;
+            border: 4px solid #ff0000;
+            border-top-color: #ff6666;
+            border-left-color: #ff6666;
+            padding: 15px;
+            margin-top: 20px;
+            color: #ffffff;
+            display: none;
+        }
+        
+        .error-box.show {
+            display: block;
+        }
+        
+        .error-title {
+            font-size: 1.5rem;
+            margin-bottom: 10px;
+            color: #ffaaaa;
+        }
+        
+        .auth-box {
+            background: #3a5a8b;
+            border: 4px solid #0000ff;
+            border-top-color: #6666ff;
+            border-left-color: #6666ff;
+            padding: 20px;
+            margin: 20px 0;
+            color: #ffffff;
+            display: none;
+        }
+        
+        .auth-box.show {
+            display: block;
+            animation: slideIn 0.3s ease-out;
+        }
+        
+        @keyframes slideIn {
+            from { transform: translateY(-20px); opacity: 0; }
+            to { transform: translateY(0); opacity: 1; }
+        }
+        
+        .auth-code {
+            font-size: 3rem;
+            text-align: center;
+            background: #000000;
+            padding: 15px;
+            margin: 15px 0;
+            border: 4px solid #ffffff;
+            color: #00ff00;
+            text-shadow: 0 0 10px #00ff00;
+            letter-spacing: 8px;
+        }
+        
+        .auth-link {
+            display: block;
+            text-align: center;
+            font-size: 1.8rem;
+            color: #aaaaff;
+            text-decoration: underline;
+            margin: 10px 0;
+            word-break: break-all;
+        }
+        
+        .auth-instructions {
+            font-size: 1.3rem;
+            line-height: 1.6;
+            margin-bottom: 15px;
+        }
+        
+        .button-group {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 10px;
+            margin-top: 20px;
+        }
+        
+        .footer {
+            text-align: center;
+            margin-top: 30px;
+            color: #8b8b8b;
+            font-size: 1.2rem;
+            text-shadow: 1px 1px 0 #000000;
+        }
+        
+        .steve-container {
+            position: absolute;
+            top: -60px;
+            right: 20px;
+            width: 80px;
+            height: 80px;
+            animation: float 3s ease-in-out infinite;
+        }
+        
+        @keyframes float {
+            0%, 100% { transform: translateY(0px); }
+            50% { transform: translateY(-10px); }
+        }
+        
+        .steve-head {
+            width: 100%;
+            height: 100%;
+            background: #f9b98f;
+            border: 4px solid #000;
+            position: relative;
+        }
+        
+        .steve-face {
+            width: 100%;
+            height: 100%;
+            position: relative;
+            background: 
+                linear-gradient(to right, transparent 25%, #3d1f0f 25%, #3d1f0f 35%, transparent 35%),
+                linear-gradient(to right, transparent 65%, #3d1f0f 65%, #3d1f0f 75%, transparent 75%),
+                linear-gradient(to bottom, #5d3a1a 0%, #5d3a1a 30%, transparent 30%);
+            background-size: 100% 100%, 100% 100%, 100% 100%;
+        }
+        
+        .steve-face::after {
+            content: '';
+            position: absolute;
+            top: 35%;
+            left: 20%;
+            width: 25%;
+            height: 15%;
+            background: #ffffff;
+            box-shadow: 
+                35px 0 0 #ffffff,
+                0 5px 0 #3d8c9e,
+                35px 5px 0 #3d8c9e;
+        }
+        
+        .loading-dots::after {
+            content: '';
+            animation: dots 1.5s steps(4, end) infinite;
+        }
+        
+        @keyframes dots {
+            0% { content: ''; }
+            25% { content: '.'; }
+            50% { content: '..'; }
+            75% { content: '...'; }
+        }
+        
+        @media (max-width: 600px) {
+            h1 { font-size: 2rem; }
+            .status-text { font-size: 1.5rem; }
+            .steve-container { display: none; }
+            .button-group { grid-template-columns: 1fr; }
+        }
+    </style>
+</head>
+<body>
+    <div class="grass-border"></div>
+    
+    <div class="container">
+        <div class="mc-panel">
+            <div class="steve-container">
+                <div class="steve-head">
+                    <div class="steve-face"></div>
+                </div>
+            </div>
+            
+            <h1>⛏️ AFK BOT STATUS</h1>
+            <p class="subtitle">Minecraft Bedrock Edition</p>
+            
+            <div class="status-box">
+                <div class="status-indicator" id="statusLight"></div>
+                <div class="status-text" id="statusText">Initializing...</div>
+            </div>
+            
             <div class="auth-box" id="authBox">
                 <div class="auth-instructions">
                     🔐 <strong>Link your Xbox Account</strong><br>
@@ -506,78 +960,13 @@ const minecraftHTML = `
     
     <script>
         let startTime = Date.now();
-        let checkAuthInterval = null;
         
         function updateUptime() {
             const elapsed = Math.floor((Date.now() - startTime) / 1000);
             const hours = Math.floor(elapsed / 3600).toString().padStart(2, '0');
             const minutes = Math.floor((elapsed % 3600) / 60).toString().padStart(2, '0');
             const seconds = (elapsed % 60).toString().padStart(2, '0');
-            document.getElementById('uptime').textContent = \`\${hours}:\${minutes}:\${seconds}\`;
-        }
-        
-        async function refreshStatus() {
-            try {
-                const response = await fetch('/api/status');
-                const data = await response.json();
-                
-                document.getElementById('username').textContent = data.username || '-';
-                document.getElementById('target').textContent = data.target || '-';
-                document.getElementById('reconnects').textContent = data.reconnects || '0';
-                
-                const light = document.getElementById('statusLight');
-                const text = document.getElementById('statusText');
-                const authBox = document.getElementById('authBox');
-                const linkBtn = document.getElementById('linkBtn');
-                
-                light.className = 'status-indicator';
-                authBox.classList.remove('show');
-                
-                if (data.isLinking && data.authCode) {
-                    light.classList.add('auth');
-                    text.textContent = '🔐 Waiting for Xbox Link...';
-                    text.style.color = '#55ffff';
-                    authBox.classList.add('show');
-                    document.getElementById('authCode').textContent = data.authCode;
-                    document.getElementById('authLink').href = data.authUrl || '00</div>
-                </div>
-            </div>
-            
-            <div class="button-group">
-                <button class="mc-button" onclick="refreshStatus()">
-                    🔄 Refresh
-                </button>
-                <button class="mc-button success" onclick="startLinking()" id="linkBtn">
-                    🔗 Link Xbox
-                </button>
-            </div>
-            
-            <button class="mc-button danger" onclick="unlinkAccount()">
-                🔓 Unlink Xbox Account
-            </button>
-            
-            <div class="error-box" id="errorBox">
-                <div class="error-title">⚠️ Last Error</div>
-                <div id="errorText">-</div>
-            </div>
-        </div>
-        
-        <div class="footer">
-            <p>Running on Fly.io | Made with ❤️ and blocks</p>
-            <p style="margin-top: 5px; font-size: 1rem;">Status updates every 5 seconds</p>
-        </div>
-    </div>
-    
-    <script>
-        let startTime = Date.now();
-        let checkAuthInterval = null;
-        
-        function updateUptime() {
-            const elapsed = Math.floor((Date.now() - startTime) / 1000);
-            const hours = Math.floor(elapsed / 3600).toString().padStart(2, '0');
-            const minutes = Math.floor((elapsed % 3600) / 60).toString().padStart(2, '0');
-            const seconds = (elapsed % 60).toString().padStart(2, '0');
-            document.getElementById('uptime').textContent = \`\${hours}:\${minutes}:\${seconds}\`;
+            document.getElementById('uptime').textContent = hours + ':' + minutes + ':' + seconds;
         }
         
         async function refreshStatus() {
@@ -692,6 +1081,7 @@ const minecraftHTML = `
 </body>
 </html>
 `;
+
 
 // --- AUTHENTICATION FUNCTIONS ---
 
