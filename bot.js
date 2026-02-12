@@ -1,4 +1,5 @@
 const bedrock = require('bedrock-protocol');
+const { Authflow, Titles } = require('prismarine-auth');
 const http = require('http');
 const path = require('path');
 const fs = require('fs');
@@ -9,11 +10,9 @@ const SERVER_PORT = parseInt(process.env.SERVER_PORT) || 19132;
 const USERNAME = process.env.BOT_USERNAME || 'AFK_Bot';
 
 // Path to store login tokens (Mapped to Fly.io Volume)
-// If running locally, it defaults to an 'auth' folder in the current directory
 const AUTH_PATH = process.env.PERSISTENT_DATA_PATH || path.join(__dirname, 'auth');
 
 // --- WEB SERVER (REQUIRED FOR 24/7 CLOUD HOSTING) ---
-// Cloud platforms need a port to bind to, or they will kill the app.
 const requestListener = function (req, res) {
   res.writeHead(200);
   res.end(`Bot Status: Running\nTarget: ${SERVER_HOST}\nReconnects: ${reconnectCount}`);
@@ -34,60 +33,94 @@ if (!fs.existsSync(AUTH_PATH)){
     fs.mkdirSync(AUTH_PATH, { recursive: true });
 }
 
-function connectBot() {
+async function authenticate() {
+  console.log(`[${new Date().toISOString()}] Starting Microsoft authentication...`);
+  
+  const auth = new Authflow(USERNAME, AUTH_PATH, {
+    authTitle: Titles.MinecraftNintendoSwitch, // or Titles.MinecraftWindows
+    deviceType: 'Nintendo', // or 'Win32'
+    flow: 'live' // 'live' for device code flow (works headless)
+  });
+
+  try {
+    // Get Xbox Live token
+    const xboxToken = await auth.getXboxToken();
+    console.log('✅ Xbox authentication successful!');
+    
+    // Get Minecraft Bedrock token
+    const mcToken = await auth.getMinecraftBedrockToken();
+    console.log('✅ Minecraft token acquired!');
+    
+    return { auth, xboxToken, mcToken };
+  } catch (error) {
+    console.error('❌ Authentication failed:', error.message);
+    throw error;
+  }
+}
+
+async function connectBot() {
   if (isReconnecting) return;
   
   console.log(`[${new Date().toISOString()}] Connecting to ${SERVER_HOST}:${SERVER_PORT} as ${USERNAME}...`);
 
   try {
+    // Authenticate first
+    const { auth } = await authenticate();
+    
+    // Get the auth token data
+    const tokens = await auth.getMinecraftBedrockToken();
+    
     client = bedrock.createClient({
       host: SERVER_HOST,
       port: SERVER_PORT,
       username: USERNAME,
-      offline: false, // Online mode requires Microsoft Auth
-      profilesFolder: AUTH_PATH, // CRITICAL: Save auth token to the Volume
-      // If we don't save this, the bot asks for a code on every restart
+      offline: false,
+      // Pass the auth flow to bedrock-protocol
+      authFlow: auth,
+      // Or use manual token injection:
+      skinData: {
+        // Optional: customize skin
+      }
     });
 
     client.on('play_status', (packet) => {
       if (packet.status === 'login_success') {
-        console.log('Login successful!');
-        reconnectCount = 0; // Reset counter on success
+        console.log('🎮 Login successful!');
+        reconnectCount = 0;
       }
     });
 
     client.on('start_game', (packet) => {
-      console.log('Bot has spawned! Starting AFK routine.');
+      console.log('🚀 Bot has spawned! Starting AFK routine.');
       startAfkLoop(packet.runtime_entity_id);
     });
 
     client.on('disconnect', (packet) => {
-      console.warn('Disconnected:', packet.message);
+      console.warn('⚠️  Disconnected:', packet.message);
       scheduleReconnect();
     });
 
     client.on('kick', (packet) => {
-      console.warn('Kicked:', packet.message);
+      console.warn('🦶 Kicked:', packet.message);
       scheduleReconnect();
     });
 
     client.on('error', (err) => {
-      console.error('Client Error:', err);
+      console.error('❌ Client Error:', err);
       scheduleReconnect();
     });
 
   } catch (e) {
-    console.error('Initialization Error:', e);
+    console.error('❌ Initialization Error:', e);
     scheduleReconnect();
   }
 }
 
 function startAfkLoop(entityId) {
-  // Clear any existing intervals if we are reconnecting
   if (client.afkInterval) clearInterval(client.afkInterval);
 
   client.afkInterval = setInterval(() => {
-    if (client && client.status !== 2) { // 2 = disconnected in some internal states, but safer to try/catch
+    if (client && client.status !== 2) {
       try {
         client.queue('animate', {
           action_id: 1, // Swing Arm
@@ -97,20 +130,18 @@ function startAfkLoop(entityId) {
         // Queue failed, likely disconnected
       }
     }
-  }, 4000); // Swing every 4 seconds
+  }, 4000);
 }
 
 function scheduleReconnect() {
   if (isReconnecting) return;
   isReconnecting = true;
   
-  // Exponential backoff or fixed delay? Fixed is usually fine for AFK bots.
   const delay = 30000; 
-  console.log(`Reconnecting in ${delay / 1000} seconds...`);
+  console.log(`🔄 Reconnecting in ${delay / 1000} seconds...`);
   
   setTimeout(() => {
     isReconnecting = false;
-    // Clean up old client
     if (client) {
       client.removeAllListeners();
       client = null;
@@ -121,5 +152,3 @@ function scheduleReconnect() {
 
 // Start the bot
 connectBot();
-
-
