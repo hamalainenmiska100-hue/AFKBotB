@@ -4,21 +4,22 @@ FROM node:18-alpine
 # Create app directory
 WORKDIR /app
 
+# Install build tools required for bedrock-protocol (raknet-native)
+# Alpine Linux needs these to compile C++ bindings
+RUN apk add --no-cache python3 make g++ gcc cmake git
+
 # Copy package config
 COPY package.json ./
 
-# FIX: Force install the latest valid version of bedrock-protocol
-# This bypasses the invalid version error in package.json
+# Install dependencies (now with compiler support)
 RUN npm install bedrock-protocol@latest
 
-# Copy the bot script
-# Note: Ensure your file is named 'afk_bot.js'. If you named it 'bot.js', change this line.
+# Copy your bot script (specifically named bot.js as requested)
 COPY bot.js ./
 
 # Expose the HTTP port (for health checks)
 EXPOSE 8080
 
-# Start the bot directly (more robust than npm start for this case)
+# Start the bot
 CMD [ "node", "bot.js" ]
-
 
