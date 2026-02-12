@@ -1,15 +1,16 @@
 {
-  "name": "bedrock-afk-bot",
+  "name": "fly-bedrock-afk",
   "version": "1.0.0",
-  "description": "Discordilla ohjattava Bedrock AFK-botti",
+  "description": "24/7 Bedrock AFK Bot",
   "main": "bot.js",
   "scripts": {
     "start": "node bot.js"
   },
   "dependencies": {
-    "bedrock-protocol": "latest",
-    "discord.js": "latest",
-    "prismarine-auth": "latest",
-    "vec3": "latest"
+    "bedrock-protocol": "^1.11.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
   }
 }
+
