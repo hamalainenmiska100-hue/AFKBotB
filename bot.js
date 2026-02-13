@@ -44,6 +44,7 @@ function getUser(uid) {
   if (!users[uid].connectionType) users[uid].connectionType = "online";
   if (!users[uid].bedrockVersion) users[uid].bedrockVersion = "auto";
   if (!users[uid].offlineUsername) users[uid].offlineUsername = `AFK_${uid.slice(-4)}`;
+  if (!users[uid].reconnectAttempts) users[uid].reconnectAttempts = 0;
   return users[uid];
 }
 
@@ -194,6 +195,22 @@ async function linkMicrosoft(uid, interaction) {
   pendingLink.set(uid, p);
 }
 
+// ----------------- MOTD / Ping Check -----------------
+async function checkServerStatus(ip, port) {
+  try {
+    const result = await bedrock.ping({ host: ip, port: port || 19132 });
+    return { 
+      online: true, 
+      motd: result.motd || "Unknown", 
+      players: result.players || { online: 0, max: 0 },
+      version: result.version,
+      latency: result.latency
+    };
+  } catch (e) {
+    return { online: false, error: e.message };
+  }
+}
+
 // ----------------- Bedrock session -----------------
 function cleanupSession(uid) {
   const s = sessions.get(uid);
@@ -202,6 +219,7 @@ function cleanupSession(uid) {
   if (s.reconnectTimer) clearTimeout(s.reconnectTimer);
   if (s.afkInterval) clearInterval(s.afkInterval);
   if (s.handSwingInterval) clearInterval(s.handSwingInterval);
+  if (s.pingCheckInterval) clearInterval(s.pingCheckInterval);
   try { s.client.close(); } catch {}
   sessions.delete(uid);
 }
@@ -209,32 +227,71 @@ function cleanupSession(uid) {
 function stopSession(uid) {
   if (!sessions.get(uid)) return false;
   const s = sessions.get(uid);
-  s.manualStop = true; // Estää automaattisen rejoinaamisen
+  s.manualStop = true;
   cleanupSession(uid);
+  // Reset reconnect attempts when manually stopped
+  const u = getUser(uid);
+  u.reconnectAttempts = 0;
+  save();
   return true;
 }
 
-function startSession(uid, interaction) {
+async function startSession(uid, interaction, isReconnect = false) {
   const u = getUser(uid);
   if (!u.server) {
-    if (interaction && !interaction.replied) interaction.editReply("⚠ Set settings first.");
+    if (interaction && !interaction.replied) {
+      const reply = isReconnect ? interaction.followUp : interaction.editReply;
+      await reply.call(interaction, { ephemeral: true, content: "⚠ Set settings first." }).catch(() => {});
+    }
     return;
   }
   
-  // Jos sessio on jo käynnissä eikä se ole uudelleenkytkentävaiheessa, estetään tuplakäynnistys
+  // Check if already running (unless it's a reconnect)
   const existing = sessions.get(uid);
-  if (existing && !existing.isReconnecting) {
-    if (interaction && !interaction.replied) interaction.editReply("⚠ You already have a running bot.");
+  if (existing && !existing.isReconnecting && !isReconnect) {
+    if (interaction && !interaction.replied) {
+      await interaction.editReply("⚠ You already have a running bot.").catch(() => {});
+    }
     return;
   }
 
   const { ip, port } = u.server;
+
+  // MOTD Check before connecting
+  if (interaction && !isReconnect) {
+    await interaction.editReply("🔍 Checking server status...").catch(() => {});
+  }
+  
+  const status = await checkServerStatus(ip, port);
+  
+  if (!status.online) {
+    const msg = `❌ Server **${ip}:${port}** is offline or unreachable.\nError: ${status.error || "Unknown"}`;
+    if (interaction) {
+      if (isReconnect) {
+        await interaction.followUp({ ephemeral: true, content: msg }).catch(() => {});
+      } else {
+        await interaction.editReply(msg).catch(() => {});
+      }
+    }
+    
+    // Schedule retry if this was an auto-reconnect attempt
+    if (isReconnect) {
+      handleAutoReconnect(uid, interaction);
+    }
+    return;
+  }
+
+  // Server is online, proceed with connection
+  if (interaction && !isReconnect) {
+    await interaction.editReply(`✅ Server online! MOTD: ${status.motd}\n👥 Players: ${status.players?.online || 0}/${status.players?.max || 0}\n🌐 Version: ${status.version || "Unknown"}\n\n⏳ Connecting...`).catch(() => {});
+  }
+
   const authDir = getUserAuthDir(uid);
 
   const opts = {
     host: ip,
-    port,
-    connectTimeout: 47000,
+    port: port || 19132,
+    connectTimeout: 30000, // Reduced from 47s to 30s
     keepAlive: true
   };
 
@@ -247,7 +304,22 @@ function startSession(uid, interaction) {
     opts.profilesFolder = authDir;
   }
 
-  const mc = bedrock.createClient(opts);
+  let mc;
+  try {
+    mc = bedrock.createClient(opts);
+  } catch (e) {
+    console.error(`[${uid}] Failed to create client:`, e);
+    if (interaction) {
+      const msg = `❌ Failed to create connection: ${e.message}`;
+      if (isReconnect) {
+        await interaction.followUp({ ephemeral: true, content: msg }).catch(() => {});
+      } else {
+        await interaction.editReply(msg).catch(() => {});
+      }
+    }
+    handleAutoReconnect(uid, interaction);
+    return;
+  }
   
   let currentSession = sessions.get(uid);
   if (!currentSession) {
@@ -256,25 +328,53 @@ function startSession(uid, interaction) {
       timeout: null, 
       startedAt: Date.now(), 
       manualStop: false,
+      isReconnecting: false,
+      connected: false,
       afkInterval: null,
-      handSwingInterval: null
+      handSwingInterval: null,
+      pingCheckInterval: null,
+      lastPing: Date.now()
     };
     sessions.set(uid, currentSession);
   } else {
     currentSession.client = mc;
     currentSession.isReconnecting = false;
+    currentSession.connected = false;
   }
 
-  const waitForEntity = setInterval(() => {
-    if (!mc.entity || !mc.entityId) return;
+  // Connection timeout - if not connected within 30s, retry
+  currentSession.timeout = setTimeout(() => {
+    if (sessions.has(uid) && !currentSession.connected && !currentSession.manualStop) {
+      console.log(`[${uid}] Connection timeout, triggering reconnect...`);
+      try { mc.close(); } catch {}
+      handleAutoReconnect(uid, interaction);
+    }
+  }, 30000);
 
-    clearInterval(waitForEntity);
+  // Handle successful spawn
+  mc.on("spawn", () => {
+    currentSession.connected = true;
+    currentSession.isReconnecting = false;
+    u.reconnectAttempts = 0; // Reset attempts on successful connection
+    save();
+    
+    clearTimeout(currentSession.timeout);
+    
+    if (interaction) {
+      const msg = `🟢 Connected to **${ip}:${port}** (Auto-move & hand swing active)`;
+      if (isReconnect) {
+        interaction.followUp({ ephemeral: true, content: msg }).catch(() => {});
+      } else if (!interaction.replied) {
+        interaction.editReply(msg).catch(() => {});
+      }
+    }
 
+    // Start AFK movement (every 60 seconds)
     let moveToggle = false;
     const afkInterval = setInterval(() => {
       try {
+        if (!mc.entity || !mc.entity.position) return;
         const pos = { ...mc.entity.position };
-        // Liikutetaan bottia hieman eteen tai taakse
         if (moveToggle) {
            pos.x += 0.5;
         } else {
@@ -293,79 +393,112 @@ function startSession(uid, interaction) {
           ridden_runtime_id: 0,
           teleport: false
         });
-      } catch {}
-    }, 60 * 1000); // Liikkuu minuutin välein
+      } catch (e) {
+        console.log(`[${uid}] Move error:`, e.message);
+      }
+    }, 60 * 1000);
 
     // Hand swing every 3 seconds
     const handSwingInterval = setInterval(() => {
       try {
+        if (!mc.entity) return;
         mc.write("animate", {
           action_id: 1, // 1 = swing arm
           runtime_entity_id: mc.entityId
         });
-      } catch {}
-    }, 3000); // Swing every 3 seconds
+      } catch (e) {
+        console.log(`[${uid}] Hand swing error:`, e.message);
+      }
+    }, 3000);
+
+    // Periodic ping check to detect disconnects faster
+    const pingCheckInterval = setInterval(async () => {
+      try {
+        const pingStatus = await checkServerStatus(ip, port);
+        currentSession.lastPing = Date.now();
+        
+        if (!pingStatus.online && !currentSession.manualStop) {
+          console.log(`[${uid}] Server appears offline in ping check, reconnecting...`);
+          mc.close();
+          handleAutoReconnect(uid, interaction);
+        }
+      } catch (e) {
+        console.log(`[${uid}] Ping check error:`, e.message);
+      }
+    }, 60000); // Check every minute
 
     currentSession.afkInterval = afkInterval;
     currentSession.handSwingInterval = handSwingInterval;
-
-    mc.once("close", () => {
-      clearInterval(afkInterval);
-      clearInterval(handSwingInterval);
-    });
-    mc.once("error", () => {
-      clearInterval(afkInterval);
-      clearInterval(handSwingInterval);
-    });
-  }, 1000);
-
-  currentSession.timeout = setTimeout(() => {
-    if (sessions.has(uid) && !currentSession.connected) {
-      if (interaction && !interaction.replied) interaction.editReply("❌ Connection error ⛔ (timeout). Retrying in 2min...");
-      mc.close();
-    }
-  }, 47000);
-
-  mc.on("spawn", () => {
-    currentSession.connected = true;
-    clearTimeout(currentSession.timeout);
-    if (interaction && !interaction.replied && !interaction.deferred) {
-        // Ensimmäinen yhteys
-    } else if (interaction) {
-        interaction.editReply(`🟢 Connected to **${ip}:${port}** (Auto-move & hand swing active)` ).catch(() => {});
-    }
+    currentSession.pingCheckInterval = pingCheckInterval;
   });
 
+  // Handle errors
   mc.on("error", (e) => {
-    clearTimeout(currentSession.timeout);
-    if (!currentSession.manualStop) {
-        console.log(`[${uid}] Virhe, yritetään uudelleen 2min päästä: ${e.message}`);
-        handleAutoReconnect(uid, interaction);
+    console.log(`[${uid}] Client error: ${e.message}`);
+    if (!currentSession.manualStop && !currentSession.isReconnecting) {
+      handleAutoReconnect(uid, interaction);
     }
   });
 
+  // Handle disconnect
   mc.on("close", () => {
     clearTimeout(currentSession.timeout);
+    if (!currentSession.manualStop && !currentSession.isReconnecting) {
+      console.log(`[${uid}] Connection closed, attempting reconnect...`);
+      handleAutoReconnect(uid, interaction);
+    }
+  });
+
+  // Handle kicks
+  mc.on("kick", (reason) => {
+    console.log(`[${uid}] Kicked:`, reason);
     if (!currentSession.manualStop) {
-        console.log(`[${uid}] Yhteys katkesi, yritetään uudelleen 2min päästä.`);
-        handleAutoReconnect(uid, interaction);
+      if (interaction) {
+        interaction.followUp({ ephemeral: true, content: `👢 Kicked from server: ${reason}` }).catch(() => {});
+      }
+      handleAutoReconnect(uid, interaction);
     }
   });
 }
 
 function handleAutoReconnect(uid, interaction) {
-    const s = sessions.get(uid);
-    if (!s || s.manualStop || s.reconnectTimer) return;
+  const s = sessions.get(uid);
+  if (!s || s.manualStop || s.isReconnecting) return;
 
-    s.isReconnecting = true;
-    s.connected = false;
-    
-    s.reconnectTimer = setTimeout(() => {
-        if (sessions.has(uid) && !s.manualStop) {
-            s.reconnectTimer = null;
-            startSession(uid, interaction);
-        }
-    }, 30000);
+  const u = getUser(uid);
+  
+  // Exponential backoff: 30s, 60s, 120s, 240s, max 5 minutes
+  const baseDelay = 30000;
+  const maxDelay = 300000;
+  const attempt = u.reconnectAttempts || 0;
+  const delay = Math.min(baseDelay * Math.pow(2, attempt), maxDelay);
+  
+  u.reconnectAttempts = attempt + 1;
+  save();
+  
+  console.log(`[${uid}] Reconnect attempt ${attempt + 1} in ${delay/1000}s...`);
+  
+  if (interaction) {
+    interaction.followUp({ 
+      ephemeral: true, 
+      content: `🔄 Connection lost. Reconnecting in ${delay/1000}s... (Attempt ${attempt + 1})` 
+    }).catch(() => {});
+  }
+
+  s.isReconnecting = true;
+  s.connected = false;
+  
+  // Clear old intervals
+  if (s.afkInterval) clearInterval(s.afkInterval);
+  if (s.handSwingInterval) clearInterval(s.handSwingInterval);
+  if (s.pingCheckInterval) clearInterval(s.pingCheckInterval);
+  
+  s.reconnectTimer = setTimeout(() => {
+    if (sessions.has(uid) && !s.manualStop) {
+      s.reconnectTimer = null;
+      startSession(uid, interaction, true);
+    }
+  }, delay);
 }
 
 // ----------------- Interactions -----------------
@@ -439,7 +572,7 @@ client.on(Events.InteractionCreate, async (i) => {
 
       if (i.customId === "start") {
         await i.deferReply({ ephemeral: true });
-        await i.editReply("⏳ Connecting…");
+        await i.editReply("⏳ Starting...");
         return startSession(uid, i);
       }
 
