@@ -1,16 +1,13 @@
 {
- "name": "fly-bedrock-afk",
- "version": "1.0.0",
- "description": "24/7 Bedrock AFK Bot",
- "main": "bot.js",
- "scripts": {
-   "start": "node bot.js"
- },
- "dependencies": {
-   "bedrock-protocol": "^1.11.0",
-   "prismarine-auth": "^2.5.0"
- },
- "engines": {
-   "node": ">=18.0.0"
- }
+  "name": "bedrock-panel-bot",
+  "version": "1.0.0",
+  "main": "bot.js",
+  "scripts": {
+    "start": "node bot.js"
+  },
+  "dependencies": {
+    "bedrock-protocol": "^3.0.0",
+    "discord.js": "^14.14.1",
+    "prismarine-auth": "^2.4.0"
+  }
 }
