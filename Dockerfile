@@ -1,25 +1,15 @@
-# Use a lightweight Node image
-FROM node:18-alpine
+FROM node:20
 
-# Create app directory
+# Asenna build-työkalut native moduleille
+RUN apt-get update && \
+    apt-get install -y \
+    build-essential \
+    cmake \
+    python3 \
+    && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /app
+COPY . .
+RUN npm install
 
-# Install build tools required for bedrock-protocol (raknet-native)
-# Alpine Linux needs these to compile C++ bindings
-RUN apk add --no-cache python3 make g++ gcc cmake git
-
-# Copy package config
-COPY package.json ./
-
-# Install dependencies (now with compiler support)
-RUN npm install bedrock-protocol@latest
-
-# Copy your bot script (specifically named bot.js as requested)
-COPY bot.js ./
-
-# Expose the HTTP port (for health checks)
-EXPOSE 8080
-
-# Start the bot
-CMD [ "node", "bot.js" ]
-
+CMD ["node", "bot.js"]
