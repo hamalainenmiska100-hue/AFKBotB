@@ -200,6 +200,8 @@ function cleanupSession(uid) {
   if (!s) return;
   if (s.timeout) clearTimeout(s.timeout);
   if (s.reconnectTimer) clearTimeout(s.reconnectTimer);
+  if (s.afkInterval) clearInterval(s.afkInterval);
+  if (s.handSwingInterval) clearInterval(s.handSwingInterval);
   try { s.client.close(); } catch {}
   sessions.delete(uid);
 }
@@ -249,7 +251,14 @@ function startSession(uid, interaction) {
   
   let currentSession = sessions.get(uid);
   if (!currentSession) {
-    currentSession = { client: mc, timeout: null, startedAt: Date.now(), manualStop: false };
+    currentSession = { 
+      client: mc, 
+      timeout: null, 
+      startedAt: Date.now(), 
+      manualStop: false,
+      afkInterval: null,
+      handSwingInterval: null
+    };
     sessions.set(uid, currentSession);
   } else {
     currentSession.client = mc;
@@ -287,8 +296,27 @@ function startSession(uid, interaction) {
       } catch {}
     }, 60 * 1000); // Liikkuu minuutin välein
 
-    mc.once("close", () => clearInterval(afkInterval));
-    mc.once("error", () => clearInterval(afkInterval));
+    // Hand swing every 3 seconds
+    const handSwingInterval = setInterval(() => {
+      try {
+        mc.write("animate", {
+          action_id: 1, // 1 = swing arm
+          runtime_entity_id: mc.entityId
+        });
+      } catch {}
+    }, 3000); // Swing every 3 seconds
+
+    currentSession.afkInterval = afkInterval;
+    currentSession.handSwingInterval = handSwingInterval;
+
+    mc.once("close", () => {
+      clearInterval(afkInterval);
+      clearInterval(handSwingInterval);
+    });
+    mc.once("error", () => {
+      clearInterval(afkInterval);
+      clearInterval(handSwingInterval);
+    });
   }, 1000);
 
   currentSession.timeout = setTimeout(() => {
@@ -304,7 +332,7 @@ function startSession(uid, interaction) {
     if (interaction && !interaction.replied && !interaction.deferred) {
         // Ensimmäinen yhteys
     } else if (interaction) {
-        interaction.editReply(`🟢 Connected to **${ip}:${port}** (Auto-move active)` ).catch(() => {});
+        interaction.editReply(`🟢 Connected to **${ip}:${port}** (Auto-move & hand swing active)` ).catch(() => {});
     }
   });
 
