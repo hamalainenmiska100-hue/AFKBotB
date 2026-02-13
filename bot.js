@@ -1,2316 +1,499 @@
-const bedrock = require('bedrock-protocol');
-const { Authflow, Titles } = require('prismarine-auth');
-const http = require('http');
-const path = require('path');
-const fs = require('fs');
-const crypto = require('crypto');
+const {
+  Client,
+  GatewayIntentBits,
+  ActionRowBuilder,
+  ButtonBuilder,
+  ButtonStyle,
+  Events,
+  SlashCommandBuilder,
+  ModalBuilder,
+  TextInputBuilder,
+  TextInputStyle,
+  StringSelectMenuBuilder
+} = require("discord.js");
 
-// --- CONFIGURATION ---
-const SERVER_HOST = process.env.SERVER_HOST || 'play.example.com'; 
-const SERVER_PORT = parseInt(process.env.SERVER_PORT) || 19132;
-const USERNAME = process.env.BOT_USERNAME || 'AFK_Bot';
-const AUTH_PATH = process.env.PERSISTENT_DATA_PATH || path.join(__dirname, 'auth');
+const bedrock = require("bedrock-protocol");
+const { Authflow, Titles } = require("prismarine-auth");
+const fs = require("fs");
+const path = require("path");
 
-// Bot state for frontend
-let botState = {
-  status: 'Initializing',
-  target: `${SERVER_HOST}:${SERVER_PORT}`,
-  username: USERNAME,
-  reconnects: 0,
-  online: false,
-  lastError: null,
-  startTime: Date.now(),
-  authCode: null,
-  authUrl: null,
-  isLinking: false
-};
-
-let client;
-let isReconnecting = false;
-let currentAuth = null;
-
-// Ensure auth folder exists
-if (!fs.existsSync(AUTH_PATH)){
-    fs.mkdirSync(AUTH_PATH, { recursive: true });
+const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
+if (!DISCORD_TOKEN) {
+  console.error("❌ DISCORD_TOKEN missing");
+  process.exit(1);
 }
 
-// --- MINECRAFT THEMED FRONTEND ---
-const minecraftHTML = `
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>AFK Bot Status | Minecraft</title>
-    <style>
-        @import url('https://fonts.googleapis.com/css2?family=VT323&display=swap');
-        
-        * {
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
-            image-rendering: pixelated;
-        }
-        
-        body {
-            font-family: 'VT323', monospace;
-            background: #1a1a1a;
-            min-height: 100vh;
-            display: flex;
-            justify-content: center;
-            align-items: center;
-            padding: 20px;
-            position: relative;
-            overflow-x: hidden;
-        }
-        
-        body::before {
-            content: '';
-            position: fixed;
-            top: 0;
-            left: 0;
-            width: 100%;
-            height: 100%;
-            background-image: 
-                repeating-linear-gradient(
-                    0deg,
-                    transparent,
-                    transparent 2px,
-                    rgba(0,0,0,0.1) 2px,
-                    rgba(0,0,0,0.1) 4px
-                ),
-                linear-gradient(180deg, #5d3a1a 0%, #4a2e15 50%, #3d2611 100%);
-            background-size: 100% 100%, 64px 64px;
-            z-index: -2;
-        }
-        
-        .grass-border {
-            position: fixed;
-            top: 0;
-            left: 0;
-            width: 100%;
-            height: 20px;
-            background: linear-gradient(180deg, #5d8c47 0%, #4a7038 50%, #3d5a2d 100%);
-            border-bottom: 4px solid #2d421f;
-            z-index: -1;
-            box-shadow: 0 4px 0 rgba(0,0,0,0.3);
-        }
-        
-        .container {
-            width: 100%;
-            max-width: 800px;
-            position: relative;
-        }
-        
-        .mc-panel {
-            background: #c6c6c6;
-            border: 4px solid #373737;
-            border-top-color: #ffffff;
-            border-left-color: #ffffff;
-            box-shadow: 
-                inset -4px -4px 0 #555555,
-                inset 4px 4px 0 #ffffff,
-                0 8px 0 rgba(0,0,0,0.5);
-            padding: 20px;
-            position: relative;
-        }
-        
-        .mc-panel::before {
-            content: '';
-            position: absolute;
-            top: 4px;
-            left: 4px;
-            right: 4px;
-            bottom: 4px;
-            border: 2px solid #8b8b8b;
-            pointer-events: none;
-        }
-        
-        h1 {
-            color: #3d3d3d;
-            font-size: 3rem;
-            text-align: center;
-            margin-bottom: 10px;
-            text-shadow: 2px 2px 0 #ffffff;
-            letter-spacing: 2px;
-        }
-        
-        .subtitle {
-            text-align: center;
-            color: #555;
-            font-size: 1.5rem;
-            margin-bottom: 30px;
-            text-shadow: 1px 1px 0 #ffffff;
-        }
-        
-        .status-box {
-            background: #8b8b8b;
-            border: 4px solid #373737;
-            border-top-color: #ffffff;
-            border-left-color: #ffffff;
-            padding: 15px;
-            margin-bottom: 20px;
-            display: flex;
-            align-items: center;
-            gap: 15px;
-        }
-        
-        .status-indicator {
-            width: 32px;
-            height: 32px;
-            background: #ff0000;
-            border: 3px solid #373737;
-            box-shadow: inset -2px -2px 0 rgba(0,0,0,0.3), inset 2px 2px 0 rgba(255,255,255,0.3);
-            animation: pulse 2s infinite;
-        }
-        
-        .status-indicator.online {
-            background: #00ff00;
-            animation: none;
-        }
-        
-        .status-indicator.connecting {
-            background: #ffff00;
-            animation: blink 1s infinite;
-        }
-        
-        .status-indicator.auth {
-            background: #00ffff;
-            animation: blink 0.5s infinite;
-        }
-        
-        @keyframes pulse {
-            0%, 100% { opacity: 1; }
-            50% { opacity: 0.6; }
-        }
-        
-        @keyframes blink {
-            0%, 100% { opacity: 1; }
-            50% { opacity: 0.3; }
-        }
-        
-        .status-text {
-            font-size: 2rem;
-            color: #ffffff;
-            text-shadow: 2px 2px 0 #000000;
-        }
-        
-        .info-grid {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-            gap: 15px;
-            margin-bottom: 20px;
-        }
-        
-        .info-box {
-            background: #373737;
-            border: 4px solid #555555;
-            border-top-color: #8b8b8b;
-            border-left-color: #8b8b8b;
-            padding: 12px;
-            color: #ffffff;
-        }
-        
-        .info-label {
-            font-size: 1.2rem;
-            color: #aaaaaa;
-            margin-bottom: 5px;
-            text-transform: uppercase;
-            letter-spacing: 1px;
-        }
-        
-        .info-value {
-            font-size: 1.8rem;
-            color: #ffffff;
-            text-shadow: 2px 2px 0 #000000;
-            word-break: break-all;
-        }
-        
-        .mc-button {
-            display: inline-block;
-            background: #7d7d7d;
-            border: 4px solid #373737;
-            border-top-color: #ffffff;
-            border-left-color: #ffffff;
-            color: #ffffff;
-            font-family: 'VT323', monospace;
-            font-size: 1.5rem;
-            padding: 12px 24px;
-            cursor: pointer;
-            text-decoration: none;
-            text-shadow: 2px 2px 0 #000000;
-            box-shadow: inset -4px -4px 0 #555555;
-            transition: all 0.1s;
-            width: 100%;
-            text-align: center;
-            margin-top: 10px;
-        }
-        
-        .mc-button:hover {
-            background: #8b8b8b;
-        }
-        
-        .mc-button:active {
-            background: #5d5d5d;
-            border: 4px solid #ffffff;
-            border-top-color: #373737;
-            border-left-color: #373737;
-            box-shadow: inset 4px 4px 0 #373737;
-        }
-        
-        .mc-button.danger {
-            background: #8b3a3a;
-        }
-        
-        .mc-button.danger:hover {
-            background: #a04545;
-        }
-        
-        .mc-button.success {
-            background: #3a8b3a;
-        }
-        
-        .mc-button.success:hover {
-            background: #45a045;
-        }
-        
-        .error-box {
-            background: #8b3a3a;
-            border: 4px solid #ff0000;
-            border-top-color: #ff6666;
-            border-left-color: #ff6666;
-            padding: 15px;
-            margin-top: 20px;
-            color: #ffffff;
-            display: none;
-        }
-        
-        .error-box.show {
-            display: block;
-        }
-        
-        .error-title {
-            font-size: 1.5rem;
-            margin-bottom: 10px;
-            color: #ffaaaa;
-        }
-        
-        .auth-box {
-            background: #3a5a8b;
-            border: 4px solid #0000ff;
-            border-top-color: #6666ff;
-            border-left-color: #6666ff;
-            padding: 20px;
-            margin: 20px 0;
-            color: #ffffff;
-            display: none;
-        }
-        
-        .auth-box.show {
-            display: block;
-            animation: slideIn 0.3s ease-out;
-        }
-        
-        @keyframes slideIn {
-            from { transform: translateY(-20px); opacity: 0; }
-            to { transform: translateY(0); opacity: 1; }
-        }
-        
-        .auth-code {
-            font-size: 3rem;
-            text-align: center;
-            background: #000000;
-            padding: 15px;
-            margin: 15px 0;
-            border: 4px solid #ffffff;
-            color: #00ff00;
-            text-shadow: 0 0 10px #00ff00;
-            letter-spacing: 8px;
-        }
-        
-        .auth-link {
-            display: block;
-            text-align: center;
-            font-size: 1.8rem;
-            color: #aaaaff;
-            text-decoration: underline;
-            margin: 10px 0;
-            word-break: break-all;
-        }
-        
-        .auth-instructions {
-            font-size: 1.3rem;
-            line-height: 1.6;
-            margin-bottom: 15px;
-        }
-        
-        .button-group {
-            display: grid;
-            grid-template-columns: 1fr 1fr;
-            gap: 10px;
-            margin-top: 20px;
-        }
-        
-        .footer {
-            text-align: center;
-            margin-top: 30px;
-            color: #8b8b8b;
-            font-size: 1.2rem;
-            text-shadow: 1px 1px 0 #000000;
-        }
-        
-        .steve-container {
-            position: absolute;
-            top: -60px;
-            right: 20px;
-            width: 80px;
-            height: 80px;
-            animation: float 3s ease-in-out infinite;
-        }
-        
-        @keyframes float {
-            0%, 100% { transform: translateY(0px); }
-            50% { transform: translateY(-10px); }
-        }
-        
-        .steve-head {
-            width: 100%;
-            height: 100%;
-            background: #f9b98f;
-            border: 4px solid #000;
-            position: relative;
-        }
-        
-        .steve-face {
-            width: 100%;
-            height: 100%;
-            position: relative;
-            background: 
-                linear-gradient(to right, transparent 25%, #3d1f0f 25%, #3d1f0f 35%, transparent 35%),
-                linear-gradient(to right, transparent 65%, #3d1f0f 65%, #3d1f0f 75%, transparent 75%),
-                linear-gradient(to bottom, #5d3a1a 0%, #5d3a1a 30%, transparent 30%);
-            background-size: 100% 100%, 100% 100%, 100% 100%;
-        }
-        
-        .steve-face::after {
-            content: '';
-            position: absolute;
-            top: 35%;
-            left: 20%;
-            width: 25%;
-            height: 15%;
-            background: #ffffff;
-            box-shadow: 
-                35px 0 0 #ffffff,
-                0 5px 0 #3d8c9e,
-                35px 5px 0 #3d8c9e;
-        }
-        
-                .loading-dots::after {
-            content: ' ';
-            animation: dots 1.5s steps(4, end) infinite;
-        }
-        
-        @keyframes dots {
-            0% { content: ' '; }
-            25% { content: '.'; }
-            50% { content: '..'; }
-            75% { content: '...'; }
-        }
+const ALLOWED_GUILD_ID = "1462335230345089254";
 
-        
-        @media (max-width: 600px) {
-            h1 { font-size: 2rem; }
-            .status-text { font-size: 1.5rem; }
-            .steve-container { display: none; }
-            .button-group { grid-template-columns: 1fr; }
-        }
-    </style>
-</head>
-<body>
-    <div class="grass-border"></div>
-    
-    <div class="container">
-        <div class="mc-panel">
-            <div class="steve-container">
-                <div class="steve-head">
-                    <div class="steve;
-            letter-spacing: 1px;
-        }
-        
-        .info-value {
-            font-size: 1.8rem;
-            color: #ffffff;
-            text-shadow: 2px 2px 0 #000000;
-            word-break: break-all;
-        }
-        
-        .mc-button {
-            display: inline-block;
-            background: #7d7d7d;
-            border: 4px solid #373737;
-            border-top-color: #ffffff;
-            border-left-color: #ffffff;
-            color: #ffffff;
-            font-family: 'VT323', monospace;
-            font-size: 1.5rem;
-            padding: 12px 24px;
-            cursor: pointer;
-            text-decoration: none;
-            text-shadow: 2px 2px 0 #000000;
-            box-shadow: inset -4px -4px 0 #555555;
-            transition: all 0.1s;
-            width: 100%;
-            text-align: center;
-            margin-top: 10px;
-        }
-        
-        .mc-button:hover {
-            background: #8b8b8b;
-        }
-        
-        .mc-button:active {
-            background: #5d5d5d;
-            border: 4px solid #ffffff;
-            border-top-color: #373737;
-            border-left-color: #373737;
-            box-shadow: inset 4px 4px 0 #373737;
-        }
-        
-        .mc-button.danger {
-            background: #8b3a3a;
-        }
-        
-        .mc-button.danger:hover {
-            background: #a04545;
-        }
-        
-        .mc-button.success {
-            background: #3a8b3a;
-        }
-        
-        .mc-button.success:hover {
-            background: #45a045;
-        }
-        
-        .error-box {
-            background: #8b3a3a;
-            border: 4px solid #ff0000;
-            border-top-color: #ff6666;
-            border-left-color: #ff6666;
-            padding: 15px;
-            margin-top: 20px;
-            color: #ffffff;
-            display: none;
-        }
-        
-        .error-box.show {
-            display: block;
-        }
-        
-        .error-title {
-            font-size: 1.5rem;
-            margin-bottom: 10px;
-            color: #ffaaaa;
-        }
-        
-        .auth-box {
-            background: #3a5a8b;
-            border: 4px solid #0000ff;
-            border-top-color: #6666ff;
-            border-left-color: #6666ff;
-            padding: 20px;
-            margin: 20px 0;
-            color: #ffffff;
-            display: none;
-        }
-        
-        .auth-box.show {
-            display: block;
-            animation: slideIn 0.3s ease-out;
-        }
-        
-        @keyframes slideIn {
-            from { transform: translateY(-20px); opacity: 0; }
-            to { transform: translateY(0); opacity: 1; }
-        }
-        
-        .auth-code {
-            font-size: 3rem;
-            text-align: center;
-            background: #000000;
-            padding: 15px;
-            margin: 15px 0;
-            border: 4px solid #ffffff;
-            color: #00ff00;
-            text-shadow: 0 0 10px #00ff00;
-            letter-spacing: 8px;
-        }
-        
-        .auth-link {
-            display: block;
-            text-align: center;
-            font-size: 1.8rem;
-            color: #aaaaff;
-            text-decoration: underline;
-            margin: 10px 0;
-            word-break: break-all;
-        }
-        
-        .auth-instructions {
-            font-size: 1.3rem;
-            line-height: 1.6;
-            margin-bottom: 15px;
-        }
-        
-        .button-group {
-            display: grid;
-            grid-template-columns: 1fr 1fr;
-            gap: 10px;
-            margin-top: 20px;
-        }
-        
-        .footer {
-            text-align: center;
-            margin-top: 30px;
-            color: #8b8b8b;
-            font-size: 1.2rem;
-            text-shadow: 1px 1px 0 #000000;
-        }
-        
-        .steve-container {
-            position: absolute;
-            top: -60px;
-            right: 20px;
-            width: 80px;
-            height: 80px;
-            animation: float 3s ease-in-out infinite;
-        }
-        
-        @keyframes float {
-            0%, 100% { transform: translateY(0px); }
-            50% { transform: translateY(-10px); }
-        }
-        
-        .steve-head {
-            width: 100%;
-            height: 100%;
-            background: #f9b98f;
-            border: 4px solid #000;
-            position: relative;
-        }
-        
-        .steve-face {
-            width: 100%;
-            height: 100%;
-            position: relative;
-            background: 
-                linear-gradient(to right, transparent 25%, #3d1f0f 25%, #3d1f0f 35%, transparent 35%),
-                linear-gradient(to right, transparent 65%, #3d1f0f 65%, #3d1f0f 75%, transparent 75%),
-                linear-gradient(to bottom, #5d3a1a 0%, #5d3a1a 30%, transparent 30%);
-            background-size: 100% 100%, 100% 100%, 100% 100%;
-        }
-        
-        .steve-face::after {
-            content: '';
-            position: absolute;
-            top: 35%;
-            left: 20%;
-            width: 25%;
-            height: 15%;
-            background: #ffffff;
-            box-shadow: 
-                35px 0 0 #ffffff,
-                0 5px 0 #3d8c9e,
-                35px 5px 0 #3d8c9e;
-        }
-        
-        .loading-dots::after {
-            content: '';
-            animation: dots 1.5s steps(4, end) infinite;
-        }
-        
-        @keyframes dots {
-            0% { content: ''; }
-            25% { content: '.'; }
-            50% { content: '..'; }
-            75% { content: '...'; }
-        }
-        
-        @media (max-width: 600px) {
-            h1 { font-size: 2rem; }
-            .status-text { font-size: 1.5rem; }
-            .steve-container { display: none; }
-            .button-group { grid-template-columns: 1fr; }
-        }
-    </style>
-</head>
-<body>
-    <div class="grass-border"></div>
-    
-    <div class="container">
-        <div class="mc-panel">
-            <div class="steve-container">
-                <div class="steve-head">
-                    <div class="steve-face"></div>
-                </div>
-            </div>
-            
-            <h1>⛏️ AFK BOT STATUS</h1>
-            <p class="subtitle">Minecraft Bedrock Edition</p>
-            
-            <div class="status-box">
-                <div class="status-indicator" id="statusLight"></div>
-                <div class="status-text" id="statusText">Initializing...</div>
-            </div>
-            
-            <div class="auth-box" id="authBox">
-                <div class="auth-instructions">
-                    🔐 <strong>Link your Xbox Account</strong><br>
-                    1. Go to the link below<br>
-                    2. Enter this code<br>
-                    3. Sign in with your Microsoft account
-                </div>
-                <a href="#" class="auth-link" id="authLink" target="_;
-            letter-spacing: 1px;
-        }
-        
-        .info-value {
-            font-size: 1.8rem;
-            color: #ffffff;
-            text-shadow: 2px 2px 0 #000000;
-            word-break: break-all;
-        }
-        
-        .mc-button {
-            display: inline-block;
-            background: #7d7d7d;
-            border: 4px solid #373737;
-            border-top-color: #ffffff;
-            border-left-color: #ffffff;
-            color: #ffffff;
-            font-family: 'VT323', monospace;
-            font-size: 1.5rem;
-            padding: 12px 24px;
-            cursor: pointer;
-            text-decoration: none;
-            text-shadow: 2px 2px 0 #000000;
-            box-shadow: inset -4px -4px 0 #555555;
-            transition: all 0.1s;
-            width: 100%;
-            text-align: center;
-            margin-top: 10px;
-        }
-        
-        .mc-button:hover {
-            background: #8b8b8b;
-        }
-        
-        .mc-button:active {
-            background: #5d5d5d;
-            border: 4px solid #ffffff;
-            border-top-color: #373737;
-            border-left-color: #373737;
-            box-shadow: inset 4px 4px 0 #373737;
-        }
-        
-        .mc-button.danger {
-            background: #8b3a3a;
-        }
-        
-        .mc-button.danger:hover {
-            background: #a04545;
-        }
-        
-        .mc-button.success {
-            background: #3a8b3a;
-        }
-        
-        .mc-button.success:hover {
-            background: #45a045;
-        }
-        
-        .error-box {
-            background: #8b3a3a;
-            border: 4px solid #ff0000;
-            border-top-color: #ff6666;
-            border-left-color: #ff6666;
-            padding: 15px;
-            margin-top: 20px;
-            color: #ffffff;
-            display: none;
-        }
-        
-        .error-box.show {
-            display: block;
-        }
-        
-        .error-title {
-            font-size: 1.5rem;
-            margin-bottom: 10px;
-            color: #ffaaaa;
-        }
-        
-        .auth-box {
-            background: #3a5a8b;
-            border: 4px solid #0000ff;
-            border-top-color: #6666ff;
-            border-left-color: #6666ff;
-            padding: 20px;
-            margin: 20px 0;
-            color: #ffffff;
-            display: none;
-        }
-        
-        .auth-box.show {
-            display: block;
-            animation: slideIn 0.3s ease-out;
-        }
-        
-        @keyframes slideIn {
-            from { transform: translateY(-20px); opacity: 0; }
-            to { transform: translateY(0); opacity: 1; }
-        }
-        
-        .auth-code {
-            font-size: 3rem;
-            text-align: center;
-            background: #000000;
-            padding: 15px;
-            margin: 15px 0;
-            border: 4px solid #ffffff;
-            color: #00ff00;
-            text-shadow: 0 0 10px #00ff00;
-            letter-spacing: 8px;
-        }
-        
-        .auth-link {
-            display: block;
-            text-align: center;
-            font-size: 1.8rem;
-            color: #aaaaff;
-            text-decoration: underline;
-            margin: 10px 0;
-            word-break: break-all;
-        }
-        
-        .auth-instructions {
-            font-size: 1.3rem;
-            line-height: 1.6;
-            margin-bottom: 15px;
-        }
-        
-        .button-group {
-            display: grid;
-            grid-template-columns: 1fr 1fr;
-            gap: 10px;
-            margin-top: 20px;
-        }
-        
-        .footer {
-            text-align: center;
-            margin-top: 30px;
-            color: #8b8b8b;
-            font-size: 1.2rem;
-            text-shadow: 1px 1px 0 #000000;
-        }
-        
-        .steve-container {
-            position: absolute;
-            top: -60px;
-            right: 20px;
-            width: 80px;
-            height: 80px;
-            animation: float 3s ease-in-out infinite;
-        }
-        
-        @keyframes float {
-            0%, 100% { transform: translateY(0px); }
-            50% { transform: translateY(-10px); }
-        }
-        
-        .steve-head {
-            width: 100%;
-            height: 100%;
-            background: #f9b98f;
-            border: 4px solid #000;
-            position: relative;
-        }
-        
-        .steve-face {
-            width: 100%;
-            height: 100%;
-            position: relative;
-            background: 
-                linear-gradient(to right, transparent 25%, #3d1f0f 25%, #3d1f0f 35%, transparent 35%),
-                linear-gradient(to right, transparent 65%, #3d1f0f 65%, #3d1f0f 75%, transparent 75%),
-                linear-gradient(to bottom, #5d3a1a 0%, #5d3a1a 30%, transparent 30%);
-            background-size: 100% 100%, 100% 100%, 100% 100%;
-        }
-        
-        .steve-face::after {
-            content: '';
-            position: absolute;
-            top: 35%;
-            left: 20%;
-            width: 25%;
-            height: 15%;
-            background: #ffffff;
-            box-shadow: 
-                35px 0 0 #ffffff,
-                0 5px 0 #3d8c9e,
-                35px 5px 0 #3d8c9e;
-        }
-        
-        .loading-dots::after {
-            content: '';
-            animation: dots 1.5s steps(4, end) infinite;
-        }
-        
-        @keyframes dots {
-            0% { content: ''; }
-            25% { content: '.'; }
-            50% { content: '..'; }
-            75% { content: '...'; }
-        }
-        
-        @media (max-width: 600px) {
-            h1 { font-size: 2rem; }
-            .status-text { font-size: 1.5rem; }
-            .steve-container { display: none; }
-            .button-group { grid-template-columns: 1fr; }
-        }
-    </style>
-</head>
-<body>
-    <div class="grass-border"></div>
-    
-    <div class="container">
-        <div class="mc-panel">
-            <div class="steve-container">
-                <div class="steve-head">
-                    <div class="steve-face"></div>
-                </div>
-            </div>
-            
-            <h1>⛏️ AFK BOT STATUS</h1>
-            <p class="subtitle">Minecraft Bedrock Edition</p>
-            
-            <div class="status-box">
-                <div class="status-indicator" id="statusLight"></div>
-                <div class="status-text" id="statusText">Initializing...</div>
-            </div>
-            
-            <div class="auth-box" id="authBox">
-                <div class="auth-instructions">
-                    🔐 <strong>Link your Xbox Account</strong><br>
-                    1. Go to the link below<br>
-                    2. Enter this code<br>
-                    3. Sign in with your Microsoft account
-                </div>
-                <a href="#" class="auth-link" id="authLink" target="_blank">https://www.microsoft.com/link</a>
-                <div class="auth-code" id="authCode">------</div>
-                <button class="mc-button" onclick="checkAuthStatus()">
-                    ✅ I've Linked My Account
-                </button>
-            </div>
-            
-            <div class="info-grid">
-                <div class="info-box">
-                    <div class="info-label">Username</div>
-                    <div class="info-value" id="username">-</div>
-                </div>
-                <div class="info-box">
-                    <div class="info-label">Target Server</div>
-                    <div class="info-value" id="target">-</div>
-                </div>
-                <div class="info-box">
-                    <div class="info-label">Reconnects</div>
-                    <div class="info-value" id="reconnects">0</div>
-                </div>
-                <div class="info-box">
-                    <div class="info-label">Uptime</div>
-                    <div class="info-value" id="uptime">00:00:00</div>
-                </div>
-            </div>
-            
-            <div class="button-group">
-                <button class="mc-button" onclick="refreshStatus()">
-                    🔄 Refresh
-                </button>
-                <button class="mc-button success" onclick="startLinking()" id="linkBtn">
-                    🔗 Link Xbox
-                </button>
-            </div>
-            
-            <button class="mc-button danger" onclick="unlinkAccount()">
-                🔓 Unlink Xbox Account
-            </button>
-            
-            <div class="error-box" id="errorBox">
-                <div class="error-title">⚠️ Last Error</div>
-                <div id="errorText">-</div>
-            </div>
-        </div>
-        
-        <div class="footer">
-            <p>Running on Fly.io | Made with ❤️ and blocks</p>
-            <p style="margin-top: 5px; font-size: 1rem;">Status updates every 5 seconds</p>
-        </div>
-    </div>
-    
-    <script>
-        let startTime = Date.now();
-        
-        function updateUptime() {
-            const elapsed = Math.floor((Date.now() - startTime) / 1000);
-            const hours = Math.floor(elapsed / 3600).toString().padStart(2, '0');
-            const minutes = Math.floor((elapsed % 3600) / 60).toString().padStart(2, '0');
-            const seconds = (elapsed % 60).toString().padStart(2, '0');
-            document.getElementById('uptime').textContent = hours + ':' + minutes + ':' + seconds;
-        }
-        
-        async function refreshStatus() {
-            try {
-                const response = await fetch('/api/status');
-                const data = await response.json();
-                
-                document.getElementById('username').textContent = data.username || '-';
-                document.getElementById('target').textContent = data.target || '-';
-                document.getElementById('reconnects').textContent = data.reconnects || '0';
-                
-                const light = document.getElementById('statusLight');
-                const text = document.getElementById('statusText');
-                const authBox = document.getElementById('authBox');
-                const linkBtn = document.getElementById('linkBtn');
-                
-                light.className = 'status-indicator';
-                authBox.classList.remove('show');
-                
-                if (data.isLinking && data.authCode) {
-                    light.classList.add('auth');
-                    text.textContent = '🔐 Waiting for Xbox Link...';
-                    text.style.color = '#55ffff';
-                    authBox.classList.add('show');
-                    document.getElementById('authCode').textContent = data.authCode;
-                    document.getElementById('authLink').href = data.authUrl || 'https://www.microsoft.com/link';
-                    linkBtn.disabled = true;
-                    linkBtn.style.opacity = '0.5';
-                } else if (data.online) {
-                    light.classList.add('online');
-                    text.textContent = '🟢 Online & AFK';
-                    text.style.color = '#55ff55';
-                    linkBtn.disabled = false;
-                    linkBtn.style.opacity = '1';
-                    linkBtn.textContent = '🔁 Re-Link Xbox';
-                } else if (data.status === 'Connecting' || data.status === 'Initializing' || data.status === 'Authenticating') {
-                    light.classList.add('connecting');
-                    text.textContent = '🟡 ' + data.status + '<span class="loading-dots"></span>';
-                    text.style.color = '#ffff55';
-                } else {
-                    light.classList.add('offline');
-                    text.textContent = '🔴 ' + (data.status || 'Offline');
-                    text.style.color = '#ff5555';
-                    linkBtn.disabled = false;
-                    linkBtn.style.opacity = '1';
-                }
-                
-                const errorBox = document.getElementById('errorBox');
-                if (data.lastError && !data.isLinking) {
-                    errorBox.classList.add('show');
-                    document.getElementById('errorText').textContent = data.lastError;
-                } else {
-                    errorBox.classList.remove('show');
-                }
-                
-                if (data.startTime) {
-                    startTime = data.startTime;
-                }
-            } catch (err) {
-                document.getElementById('statusText').textContent = '🔴 Connection Failed';
-                document.getElementById('statusLight').className = 'status-indicator';
-            }
-        }
-        
-        async function startLinking() {
-            try {
-                const response = await fetch('/api/link', { method: 'POST' });
-                const data = await response.json();
-                if (data.success) {
-                    refreshStatus();
-                }
-            } catch (err) {
-                alert('Failed to start linking process');
-            }
-        }
-        
-        async function checkAuthStatus() {
-            try {
-                const response = await fetch('/api/check-auth');
-                const data = await response.json();
-                if (data.authenticated) {
-                    alert('✅ Account linked successfully! Bot will connect shortly.');
-                    refreshStatus();
-                } else {
-                    alert('⏳ Still waiting... Please complete the login on Microsoft website.');
-                }
-            } catch (err) {
-                alert('Error checking auth status');
-            }
-        }
-        
-        async function unlinkAccount() {
-            if (!confirm('Are you sure you want to unlink your Xbox account? The bot will need to be re-authenticated.')) {
-                return;
-            }
-            try {
-                const response = await fetch('/api/unlink', { method: 'POST' });
-                const data = await response.json();
-                if (data.success) {
-                    alert('✅ Account unlinked. Click "Link Xbox" to authenticate again.');
-                    refreshStatus();
-                }
-            } catch (err) {
-                alert('Failed to unlink account');
-            }
-        }
-        
-        refreshStatus();
-        setInterval(refreshStatus, 5000);
-        setInterval(updateUptime, 1000);
-    </script>
-</body>
-</html>
-`;
+// ----------------- Storage -----------------
+const DATA = path.join(__dirname, "data");
+const AUTH_ROOT = path.join(DATA, "auth");
+const STORE = path.join(DATA, "users.json");
 
+if (!fs.existsSync(DATA)) fs.mkdirSync(DATA);
+if (!fs.existsSync(AUTH_ROOT)) fs.mkdirSync(AUTH_ROOT, { recursive: true });
 
-// --- AUTHENTICATION FUNCTIONS ---
+let users = fs.existsSync(STORE) ? JSON.parse(fs.readFileSync(STORE, "utf8")) : {};
+function save() {
+  fs.writeFileSync(STORE, JSON.stringify(users, null, 2));
+}
 
-function deleteAuthFiles() {
-  try {
-    if (fs.existsSync(AUTH_PATH)) {
-      const files = fs.readdirSync(AUTH_PATH);
-      for (const file of files) {
-        fs.unlinkSync(path.join(AUTH_PATH, file));
-      }
-      console.log('🗑️ Auth files deleted');
-      return true;
+function getUser(uid) {
+  if (!users[uid]) users[uid] = {};
+  if (!users[uid].delayMs) users[uid].delayMs = 5000;
+  if (!users[uid].connectionType) users[uid].connectionType = "online";
+  if (!users[uid].bedrockVersion) users[uid].bedrockVersion = "auto";
+  if (!users[uid].offlineUsername) users[uid].offlineUsername = `AFK_${uid.slice(-4)}`;
+  return users[uid];
+}
+
+function getUserAuthDir(uid) {
+  const dir = path.join(AUTH_ROOT, uid);
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+  return dir;
+}
+
+function unlinkMicrosoft(uid) {
+  const dir = getUserAuthDir(uid);
+  try { fs.rmSync(dir, { recursive: true, force: true }); } catch {}
+  const u = getUser(uid);
+  u.linked = false;
+  save();
+}
+
+// ----------------- Runtime -----------------
+const sessions = new Map();
+const pendingLink = new Map();
+const lastMsa = new Map();
+
+// ----------------- Discord client -----------------
+const client = new Client({
+  intents: [GatewayIntentBits.Guilds]
+});
+
+function denyIfWrongGuild(i) {
+  if (!i.inGuild() || i.guildId !== ALLOWED_GUILD_ID) {
+    const msg = "This bot cannot be used in this server ⛔️";
+    if (i.deferred) return i.editReply(msg).catch(() => {});
+    if (i.replied) return i.followUp({ ephemeral: true, content: msg }).catch(() => {});
+    return i.reply({ ephemeral: true, content: msg }).catch(() => {});
+  }
+  return null;
+}
+
+// ----------------- UI helpers -----------------
+function panelRow() {
+  return [
+    new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId("link").setLabel("🔑 Link Microsoft").setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId("unlink").setLabel("🗑 Unlink Microsoft").setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId("start").setLabel("▶ Start").setStyle(ButtonStyle.Success),
+      new ButtonBuilder().setCustomId("stop").setLabel("⏹ Stop").setStyle(ButtonStyle.Danger),
+      new ButtonBuilder().setCustomId("settings").setLabel("⚙ Settings").setStyle(ButtonStyle.Secondary)
+    ),
+    new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId("more").setLabel("➕ More").setStyle(ButtonStyle.Secondary)
+    )
+  ];
+}
+
+function msaComponents(uri) {
+  return [
+    new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setLabel("🌐 Open link").setStyle(ButtonStyle.Link).setURL(uri)
+    )
+  ];
+}
+
+function versionRow(current = "auto") {
+  const menu = new StringSelectMenuBuilder()
+    .setCustomId("set_version")
+    .setPlaceholder("🌐 Bedrock Version")
+    .addOptions(
+      { label: "Auto", value: "auto", default: current === "auto" },
+      { label: "1.21.x", value: "1.21.x", default: current === "1.21.x" },
+      { label: "1.20.x", value: "1.20.x", default: current === "1.20.x" },
+      { label: "1.19.x", value: "1.19.x", default: current === "1.19.x" }
+    );
+  return new ActionRowBuilder().addComponents(menu);
+}
+
+function connRow(current = "online") {
+  const menu = new StringSelectMenuBuilder()
+    .setCustomId("set_conn")
+    .setPlaceholder("🔌 Connection Type")
+    .addOptions(
+      { label: "Online (Microsoft)", value: "online", default: current === "online" },
+      { label: "Offline (Cracked)", value: "offline", default: current === "offline" }
+    );
+  return new ActionRowBuilder().addComponents(menu);
+}
+
+// ----------------- Slash commands -----------------
+client.once("ready", async () => {
+  console.log("🟢 Online as", client.user.tag);
+
+  const cmds = [
+    new SlashCommandBuilder().setName("panel").setDescription("Open Bedrock AFK panel")
+  ];
+
+  await client.application.commands.set(cmds);
+});
+
+// ----------------- Microsoft link -----------------
+async function linkMicrosoft(uid, interaction) {
+  if (pendingLink.has(uid)) {
+    await interaction.editReply("⏳ Login already in progress. Use the last code.");
+    return;
+  }
+
+  const authDir = getUserAuthDir(uid);
+  const u = getUser(uid);
+  let codeShown = false;
+
+  const flow = new Authflow(
+    uid,
+    authDir,
+    {
+      flow: "live",
+      authTitle: Titles?.MinecraftNintendoSwitch || "Bedrock AFK Bot",
+      deviceType: "Nintendo"
+    },
+    async (data) => {
+      const uri = data.verification_uri_complete || data.verification_uri || "https://www.microsoft.com/link";
+      const code = data.user_code || "(no code)";
+      lastMsa.set(uid, { uri, code, at: Date.now() });
+      codeShown = true;
+
+      const msg =
+        `🔐 **Microsoft login required**\n\n` +
+        `👉 ${uri}\n\n` +
+        `Your code: \`${code}\`\n\n` +
+        `⚠ **IMPORTANT:** Use a *second* Microsoft account.\n` +
+        `Do **NOT** use the account you normally play with.\n\n` +
+        `Come back here after login.`;
+
+      await interaction.editReply({ content: msg, components: msaComponents(uri) }).catch(() => {});
     }
-  } catch (err) {
-    console.error('Error deleting auth files:', err);
-    return false;
-  }
-}
+  );
 
-async function startAuthLinking() {
-  if (botState.isLinking) return;
-  
-  console.log('🔐 Starting Xbox account linking...');
-  botState.isLinking = true;
-  botState.status = 'Waiting for Auth';
-  
-  // Delete old auth first
-  deleteAuthFiles();
-  
-  try {
-    const auth = new Authflow(USERNAME, AUTH_PATH, {
-      authTitle: Titles.MinecraftNintendoSwitch,
-      deviceType: 'Nintendo',
-      flow: 'live'
-    });
-    
-    currentAuth = auth;
-    
-    // This will trigger the device code flow
-    const xboxToken = await auth.getXboxToken();
-    
-    // If we get here, auth is complete!
-    console.log('✅ Auth completed successfully!');
-    botState.isLinking = false;
-    botState.authCode = null;
-    botState.authUrl = null;
-    
-    // Start the bot
-    setTimeout(() => connectBot(), 1000);
-    
-  } catch (err) {
-    // Expected to fail initially as we need user to complete auth
-    console.log('Waiting for user to complete auth...');
-  }
-}
-
-// Override the getXboxToken to capture device code
-async function startDeviceCodeAuth() {
-  const auth = new Authflow(USERNAME, AUTH_PATH, {
-    authTitle: Titles.MinecraftNintendoSwitch,
-    deviceType: 'Nintendo',
-    flow: 'live'
-  });
-  
-  // Listen for device code event
-  auth.on('device_code', (deviceCode) => {
-    console.log('📱 Device code received:', deviceCode.user_code);
-    botState.authCode = deviceCode.user_code;
-    botState.authUrl = deviceCode.verification_uri;
-  });
-  
-  try {
-   00</div>
-                </div>
-            </div>
-            
-            <div class="button-group">
-                <button class="mc-button" onclick="refreshStatus()">
-                    🔄 Refresh
-                </button>
-                <button class="mc-button success" onclick="startLinking()" id="linkBtn">
-                    🔗 Link Xbox
-                </button>
-            </div>
-            
-            <button class="mc-button danger" onclick="unlinkAccount()">
-                🔓 Unlink Xbox Account
-            </button>
-            
-            <div class="error-box" id="errorBox">
-                <div class="error-title">⚠️ Last Error</div>
-                <div id="errorText">-</div>
-            </div>
-        </div>
-        
-        <div class="footer">
-            <p>Running on Fly.io | Made with ❤️ and blocks</p>
-            <p style="margin-top: 5px; font-size: 1rem;">Status updates every 5 seconds</p>
-        </div>
-    </div>
-    
-    <script>
-        let startTime = Date.now();
-        let checkAuthInterval = null;
-        
-        function updateUptime() {
-            const elapsed = Math.floor((Date.now() - startTime) / 1000);
-            const hours = Math.floor(elapsed / 3600).toString().padStart(2, '0');
-            const minutes = Math.floor((elapsed % 3600) / 60).toString().padStart(2, '0');
-            const seconds = (elapsed % 60).toString().padStart(2, '0');
-            document.getElementById('uptime').textContent = \`\${hours}:\${minutes}:\${seconds}\`;
-        }
-        
-        async function refreshStatus() {
-            try {
-                const response = await fetch('/api/status');
-                const data = await response.json();
-                
-                document.getElementById('username').textContent = data.username || '-';
-                document.getElementById('target').textContent = data.target || '-';
-                document.getElementById('reconnects').textContent = data.reconnects || '0';
-                
-                const light = document.getElementById('statusLight');
-                const text = document.getElementById('statusText');
-                const authBox = document.getElementById('authBox');
-                const linkBtn = document.getElementById('linkBtn');
-                
-                light.className = 'status-indicator';
-                authBox.classList.remove('show');
-                
-                if (data.isLinking && data.authCode) {
-                    light.classList.add('auth');
-                    text.textContent = '🔐 Waiting for Xbox Link...';
-                    text.style.color = '#55ffff';
-                    authBox.classList.add('show');
-                    document.getElementById('authCode').textContent = data.authCode;
-                    document.getElementById('authLink').href = data.authUrl || 'https://www.microsoft.com/link';
-                    linkBtn.disabled = true;
-                    linkBtn.style.opacity = '0.5';
-                } else if (data.online) {
-                    light.classList.add('online');
-                    text.textContent = '🟢 Online & AFK';
-                    text.style.color = '#55ff55';
-                    linkBtn.disabled = false;
-                    linkBtn.style.opacity = '1';
-                    linkBtn.textContent = '🔁 Re-Link Xbox';
-                } else if (data.status === 'Connecting' || data.status === 'Initializing' || data.status === 'Authenticating') {
-                    light.classList.add('connecting');
-                    text.textContent = '🟡 ' + data.status + '<span class="loading-dots"></span>';
-                    text.style.color = '#ffff55';
-                } else {
-                    light.classList.add('offline');
-                    text.textContent = '🔴 ' + (data.status || 'Offline');
-                    text.style.color = '#ff5555';
-                    linkBtn.disabled = false;
-                    linkBtn.style.opacity = '1';
-                }
-                
-                const errorBox = document.getElementById('errorBox');
-                if (data.lastError && !data.isLinking) {
-                    errorBox.classList.add('show');
-                    document.getElementById('errorText').textContent = data.lastError;
-                } else {
-                    errorBox.classList.remove('show');
-                }
-                
-                if (data.startTime) {
-                    startTime = data.startTime;
-                }
-            } catch (err) {
-                document.getElementById('statusText').textContent = '🔴 Connection Failed';
-                document.getElementById('statusLight').className = 'status-indicator';
-            }
-        }
-        
-        async function startLinking() {
-            try {
-                const response = await fetch('/api/link', { method: 'POST' });
-                const data = await response.json();
-                if (data.success) {
-                    refreshStatus();
-                }
-            } catch (err) {
-                alert('Failed to start linking process');
-            }
-        }
-        
-        async function checkAuthStatus() {
-            try {
-                const response = await fetch('/api/check-auth');
-                const data = await response.json();
-                if (data.authenticated) {
-                    alert('✅ Account linked successfully! Bot will connect shortly.');
-                    refreshStatus();
-                } else {
-                    alert('⏳ Still waiting... Please complete the login on Microsoft website.');
-                }
-            } catch (err) {
-                alert('Error checking auth status');
-            }
-        }
-        
-        async function unlinkAccount() {
-            if (!confirm('Are you sure you want to unlink your Xbox account? The bot will need to be re-authenticated.')) {
-                return;
-            }
-            try {
-                const response = await fetch('/api/unlink', { method: 'POST' });
-                const data = await response.json();
-                if (data.success) {
-                    alert('✅ Account unlinked. Click "Link Xbox" to authenticate again.');
-                    refreshStatus();
-                }
-            } catch (err) {
-                alert('Failed to unlink account');
-            }
-        }
-        
-        refreshStatus();
-        setInterval(refreshStatus, 5000);
-        setInterval(updateUptime, 1000);
-    </script>
-</body>
-</html>
-`;
-
-// --- AUTHENTICATION FUNCTIONS ---
-
-function deleteAuthFiles() {
-  try {
-    if (fs.existsSync(AUTH_PATH)) {
-      const files = fs.readdirSync(AUTH_PATH);
-      for (const file of files) {
-        fs.unlinkSync(path.join(AUTH_PATH, file));
-      }
-      console.log('🗑️ Auth files deleted');
-      return true;
+  const p = (async () => {
+    try {
+      if (!codeShown) await interaction.editReply("⏳ Requesting Microsoft login code…");
+      await flow.getMsaToken();
+      u.linked = true;
+      save();
+      await interaction.followUp({ ephemeral: true, content: "✅ Microsoft account linked!" }).catch(() => {});
+    } catch (e) {
+      await interaction.editReply(`❌ Microsoft login failed:\n${String(e?.message || e)}`).catch(() => {});
+    } finally {
+      pendingLink.delete(uid);
     }
-  } catch (err) {
-    console.error('Error deleting auth files:', err);
-    return false;
-  }
+  })();
+
+  pendingLink.set(uid, p);
 }
 
-async function startAuthLinking() {
-  if (botState.isLinking) return;
-  
-  console.log('🔐 Starting Xbox account linking...');
-  botState.isLinking = true;
-  botState.status = 'Waiting for Auth';
-  
-  // Delete old auth first
-  deleteAuthFiles();
-  
-  try {
-    const auth = new Authflow(USERNAME, AUTH_PATH, {
-      authTitle: Titles.MinecraftNintendoSwitch,
-      deviceType: 'Nintendo',
-      flow: 'live'
-    });
-    
-    currentAuth = auth;
-    
-    // This will trigger the device code flow
-    const xboxToken = await auth.getXboxToken();
-    
-    // If we get here, auth is complete!
-    console.log('✅ Auth completed successfully!');
-    botState.isLinking = false;
-    botState.authCode = null;
-    botState.authUrl = null;
-    
-    // Start the bot
-    setTimeout(() => connectBot(), 1000);
-    
-  } catch (err) {
-    // Expected to fail initially as we need user to complete auth
-    console.log('Waiting for user to complete auth...');
-  }
+// ----------------- Bedrock session -----------------
+function cleanupSession(uid) {
+  const s = sessions.get(uid);
+  if (!s) return;
+  if (s.timeout) clearTimeout(s.timeout);
+  if (s.reconnectTimer) clearTimeout(s.reconnectTimer);
+  try { s.client.close(); } catch {}
+  sessions.delete(uid);
 }
 
-// Override the getXboxToken to capture device code
-async function startDeviceCodeAuth() {
-  const auth = new Authflow(USERNAME, AUTH_PATH, {
-    authTitle: Titles.MinecraftNintendoSwitch,
-    deviceType: 'Nintendo',
-    flow: 'live'
-  });
-  
-  // Listen for device code event
-  auth.on('device_code', (deviceCode) => {
-    console.log('📱 Device code received:', deviceCode.user_code);
-    botState.authCode = deviceCode.user_code;
-    botState.authUrl = deviceCode.verification_uri;
-  });
-  
-  try {
-    await auth.getXboxToken();
-  } catch (e) {
-    // Will wait for user
-  }
-  
-  return auth;
+function stopSession(uid) {
+  if (!sessions.get(uid)) return false;
+  const s = sessions.get(uid);
+  s.manualStop = true; // Estää automaattisen rejoinaamisen
+  cleanupSession(uid);
+  return true;
 }
 
-// --- WEB SERVER ---
-const requestListener = async function (req, res) {
-  // Set CORS headers
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
-  
-  if (req.method === 'OPTIONS') {
-    res.writeHead(200);
-    res.end();
+function startSession(uid, interaction) {
+  const u = getUser(uid);
+  if (!u.server) {
+    if (interaction && !interaction.replied) interaction.editReply("⚠ Set settings first.");
     return;
   }
   
-  if (req.url === '/api/status') {
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify(botState));
-  } else if (req.url === '/api/link' && req.method === 'POST') {
-    // Start linking process
-    if (!botState.isLinking) {
-      startAuthLinking();
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ success: true, message: 'Linking started' }));
-    } else {
-      res.writeHead(400, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ success: false, message: 'Already linking' }));
-    }
-  } else if (req.url === '/api/check-auth' && req.method === 'GET') {
-    // Check if auth files exist
-    const hasAuth = fs.existsSync(AUTH_PATH) && fs.readdirSync(AUTH_PATH).length > 0;
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ authenticated: hasAuth }));
-  } else if (req.url === '/api/unlink' && req.method === 'POST') {
-    // Unlink account
-    const success = deleteAuthFiles();
-    botState.isLinking = false;
-    botState.authCode = null;
-    botState.authUrl = null;
-    botState.online = false;
-    botState.status = 'Unlinked';
-    
-    // Disconnect current client
-    if (client) {
-      client.removeAllListeners();
-      client = null;
-    }
-    
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ success }));
-  } else {
-    res.writeHead(200, { 'Content-Type': 'text/html' });
-    res.end(minecraftHTML);
-  }
-};
-
-const server = http.createServer(requestListener);
-const HTTP_PORT = process.env.PORT || 8080;
-server.listen(HTTP_PORT, () => {
-  console.log(`🌐 Web server running on port ${HTTP_PORT}`);
-  console.log(`📊 Status page: http://localhost:${HTTP_PORT}`);
-});
-
-// --- BOT LOGIC ---
-
-async function connectBot() {
-  if (isReconnecting || botState.isLinking) return;
-  
-  console.log(`[${new Date().toISOString()}] Connecting to ${SERVER_HOST}:${SERVER_PORT} as ${USERNAME}...`);
-  botState.status = 'Connecting';
-
-  try {
-    // Check if we have auth
-    const hasAuth = fs.existsSync(AUTH_PATH) && fs.readdirSync(AUTH_PATH).length > 0;
-    if (!hasAuth) {
-      console.log('⚠️ No auth found, waiting for linking...');
-      botState.status = 'Needs Auth';
-      botState.lastError = 'Please link your Xbox account using the web interface';
-      return;
-    }
-    
-    const auth = new Authflow(USERNAME, AUTH_PATH, {
-      authTitle: Titles.MinecraftNintendoSwitch,
-      deviceType: 'Nintendo',
-      flow: 'live'
-    });
-    
-    // Try to get token (will use cached if available)
-    await auth.getXboxToken();
-    console.log('✅ Auth token valid!');
-    
-    client = bedrock.createClient({
-      host: SERVER_HOST,
-      port: SERVER_PORT,
-      username: USERNAME,
-      offline: false,
-      profilesFolder: AUTH_PATH,
-      authTitle: Titles.MinecraftNintendoSwitch,
-     00</div>
-                </div>
-            </div>
-            
-            <div class="button-group">
-                <button class="mc-button" onclick="refreshStatus()">
-                    🔄 Refresh
-                </button>
-                <button class="mc-button success" onclick="startLinking()" id="linkBtn">
-                    🔗 Link Xbox
-                </button>
-            </div>
-            
-            <button class="mc-button danger" onclick="unlinkAccount()">
-                🔓 Unlink Xbox Account
-            </button>
-            
-            <div class="error-box" id="errorBox">
-                <div class="error-title">⚠️ Last Error</div>
-                <div id="errorText">-</div>
-            </div>
-        </div>
-        
-        <div class="footer">
-            <p>Running on Fly.io | Made with ❤️ and blocks</p>
-            <p style="margin-top: 5px; font-size: 1rem;">Status updates every 5 seconds</p>
-        </div>
-    </div>
-    
-    <script>
-        let startTime = Date.now();
-        let checkAuthInterval = null;
-        
-        function updateUptime() {
-            const elapsed = Math.floor((Date.now() - startTime) / 1000);
-            const hours = Math.floor(elapsed / 3600).toString().padStart(2, '0');
-            const minutes = Math.floor((elapsed % 3600) / 60).toString().padStart(2, '0');
-            const seconds = (elapsed % 60).toString().padStart(2, '0');
-            document.getElementById('uptime').textContent = \`\${hours}:\${minutes}:\${seconds}\`;
-        }
-        
-        async function refreshStatus() {
-            try {
-                const response = await fetch('/api/status');
-                const data = await response.json();
-                
-                document.getElementById('username').textContent = data.username || '-';
-                document.getElementById('target').textContent = data.target || '-';
-                document.getElementById('reconnects').textContent = data.reconnects || '0';
-                
-                const light = document.getElementById('statusLight');
-                const text = document.getElementById('statusText');
-                const authBox = document.getElementById('authBox');
-                const linkBtn = document.getElementById('linkBtn');
-                
-                light.className = 'status-indicator';
-                authBox.classList.remove('show');
-                
-                if (data.isLinking && data.authCode) {
-                    light.classList.add('auth');
-                    text.textContent = '🔐 Waiting for Xbox Link...';
-                    text.style.color = '#55ffff';
-                    authBox.classList.add('show');
-                    document.getElementById('authCode').textContent = data.authCode;
-                    document.getElementById('authLink').href = data.authUrl || 'https://www.microsoft.com/link';
-                    linkBtn.disabled = true;
-                    linkBtn.style.opacity = '0.5';
-                } else if (data.online) {
-                    light.classList.add('online');
-                    text.textContent = '🟢 Online & AFK';
-                    text.style.color = '#55ff55';
-                    linkBtn.disabled = false;
-                    linkBtn.style.opacity = '1';
-                    linkBtn.textContent = '🔁 Re-Link Xbox';
-                } else if (data.status === 'Connecting' || data.status === 'Initializing' || data.status === 'Authenticating') {
-                    light.classList.add('connecting');
-                    text.textContent = '🟡 ' + data.status + '<span class="loading-dots"></span>';
-                    text.style.color = '#ffff55';
-                } else {
-                    light.classList.add('offline');
-                    text.textContent = '🔴 ' + (data.status || 'Offline');
-                    text.style.color = '#ff5555';
-                    linkBtn.disabled = false;
-                    linkBtn.style.opacity = '1';
-                }
-                
-                const errorBox = document.getElementById('errorBox');
-                if (data.lastError && !data.isLinking) {
-                    errorBox.classList.add('show');
-                    document.getElementById('errorText').textContent = data.lastError;
-                } else {
-                    errorBox.classList.remove('show');
-                }
-                
-                if (data.startTime) {
-                    startTime = data.startTime;
-                }
-            } catch (err) {
-                document.getElementById('statusText').textContent = '🔴 Connection Failed';
-                document.getElementById('statusLight').className = 'status-indicator';
-            }
-        }
-        
-        async function startLinking() {
-            try {
-                const response = await fetch('/api/link', { method: 'POST' });
-                const data = await response.json();
-                if (data.success) {
-                    refreshStatus();
-                }
-            } catch (err) {
-                alert('Failed to start linking process');
-            }
-        }
-        
-        async function checkAuthStatus() {
-            try {
-                const response = await fetch('/api/check-auth');
-                const data = await response.json();
-                if (data.authenticated) {
-                    alert('✅ Account linked successfully! Bot will connect shortly.');
-                    refreshStatus();
-                } else {
-                    alert('⏳ Still waiting... Please complete the login on Microsoft website.');
-                }
-            } catch (err) {
-                alert('Error checking auth status');
-            }
-        }
-        
-        async function unlinkAccount() {
-            if (!confirm('Are you sure you want to unlink your Xbox account? The bot will need to be re-authenticated.')) {
-                return;
-            }
-            try {
-                const response = await fetch('/api/unlink', { method: 'POST' });
-                const data = await response.json();
-                if (data.success) {
-                    alert('✅ Account unlinked. Click "Link Xbox" to authenticate again.');
-                    refreshStatus();
-                }
-            } catch (err) {
-                alert('Failed to unlink account');
-            }
-        }
-        
-        refreshStatus();
-        setInterval(refreshStatus, 5000);
-        setInterval(updateUptime, 1000);
-    </script>
-</body>
-</html>
-`;
-
-// --- AUTHENTICATION FUNCTIONS ---
-
-function deleteAuthFiles() {
-  try {
-    if (fs.existsSync(AUTH_PATH)) {
-      const files = fs.readdirSync(AUTH_PATH);
-      for (const file of files) {
-        fs.unlinkSync(path.join(AUTH_PATH, file));
-      }
-      console.log('🗑️ Auth files deleted');
-      return true;
-    }
-  } catch (err) {
-    console.error('Error deleting auth files:', err);
-    return false;
-  }
-}
-
-async function startAuthLinking() {
-  if (botState.isLinking) return;
-  
-  console.log('🔐 Starting Xbox account linking...');
-  botState.isLinking = true;
-  botState.status = 'Waiting for Auth';
-  
-  // Delete old auth first
-  deleteAuthFiles();
-  
-  try {
-    const auth = new Authflow(USERNAME, AUTH_PATH, {
-      authTitle: Titles.MinecraftNintendoSwitch,
-      deviceType: 'Nintendo',
-      flow: 'live'
-    });
-    
-    currentAuth = auth;
-    
-    // This will trigger the device code flow
-    const xboxToken = await auth.getXboxToken();
-    
-    // If we get here, auth is complete!
-    console.log('✅ Auth completed successfully!');
-    botState.isLinking = false;
-    botState.authCode = null;
-    botState.authUrl = null;
-    
-    // Start the bot
-    setTimeout(() => connectBot(), 1000);
-    
-  } catch (err) {
-    // Expected to fail initially as we need user to complete auth
-    console.log('Waiting for user to complete auth...');
-  }
-}
-
-// Override the getXboxToken to capture device code
-async function startDeviceCodeAuth() {
-  const auth = new Authflow(USERNAME, AUTH_PATH, {
-    authTitle: Titles.MinecraftNintendoSwitch,
-    deviceType: 'Nintendo',
-    flow: 'live'
-  });
-  
-  // Listen for device code event
-  auth.on('device_code', (deviceCode) => {
-    console.log('📱 Device code received:', deviceCode.user_code);
-    botState.authCode = deviceCode.user_code;
-    botState.authUrl = deviceCode.verification_uri;
-  });
-  
-  try {
-    await auth.getXboxToken();
-  } catch (e) {
-    // Will wait for user
-  }
-  
-  return auth;
-}
-
-// --- WEB SERVER ---
-const requestListener = async function (req, res) {
-  // Set CORS headers
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
-  
-  if (req.method === 'OPTIONS') {
-    res.writeHead(200);
-    res.end();
+  // Jos sessio on jo käynnissä eikä se ole uudelleenkytkentävaiheessa, estetään tuplakäynnistys
+  const existing = sessions.get(uid);
+  if (existing && !existing.isReconnecting) {
+    if (interaction && !interaction.replied) interaction.editReply("⚠ You already have a running bot.");
     return;
   }
-  
-  if (req.url === '/api/status') {
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify(botState));
-  } else if (req.url === '/api/link' && req.method === 'POST') {
-    // Start linking process
-    if (!botState.isLinking) {
-      startAuthLinking();
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ success: true, message: 'Linking started' }));
-    } else {
-      res.writeHead(400, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ success: false, message: 'Already linking' }));
-    }
-  } else if (req.url === '/api/check-auth' && req.method === 'GET') {
-    // Check if auth files exist
-    const hasAuth = fs.existsSync(AUTH_PATH) && fs.readdirSync(AUTH_PATH).length > 0;
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ authenticated: hasAuth }));
-  } else if (req.url === '/api/unlink' && req.method === 'POST') {
-    // Unlink account
-    const success = deleteAuthFiles();
-    botState.isLinking = false;
-    botState.authCode = null;
-    botState.authUrl = null;
-    botState.online = false;
-    botState.status = 'Unlinked';
-    
-    // Disconnect current client
-    if (client) {
-      client.removeAllListeners();
-      client = null;
-    }
-    
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ success }));
+
+  const { ip, port } = u.server;
+  const authDir = getUserAuthDir(uid);
+
+  const opts = {
+    host: ip,
+    port,
+    connectTimeout: 47000,
+    keepAlive: true
+  };
+
+  if (u.connectionType === "offline") {
+    opts.username = u.offlineUsername || `AFK_${uid.slice(-4)}`;
+    opts.offline = true;
   } else {
-    res.writeHead(200, { 'Content-Type': 'text/html' });
-    res.end(minecraftHTML);
+    opts.username = uid;
+    opts.offline = false;
+    opts.profilesFolder = authDir;
   }
-};
 
-const server = http.createServer(requestListener);
-const HTTP_PORT = process.env.PORT || 8080;
-server.listen(HTTP_PORT, () => {
-  console.log(`🌐 Web server running on port ${HTTP_PORT}`);
-  console.log(`📊 Status page: http://localhost:${HTTP_PORT}`);
-});
-
-// --- BOT LOGIC ---
-
-async function connectBot() {
-  if (isReconnecting || botState.isLinking) return;
+  const mc = bedrock.createClient(opts);
   
-  console.log(`[${new Date().toISOString()}] Connecting to ${SERVER_HOST}:${SERVER_PORT} as ${USERNAME}...`);
-  botState.status = 'Connecting';
-
-  try {
-    // Check if we have auth
-    const hasAuth = fs.existsSync(AUTH_PATH) && fs.readdirSync(AUTH_PATH).length > 0;
-    if (!hasAuth) {
-      console.log('⚠️ No auth found, waiting for linking...');
-      botState.status = 'Needs Auth';
-      botState.lastError = 'Please link your Xbox account using the web interface';
-      return;
-    }
-    
-    const auth = new Authflow(USERNAME, AUTH_PATH, {
-      authTitle: Titles.MinecraftNintendoSwitch,
-      deviceType: 'Nintendo',
-      flow: 'live'
-    });
-    
-    // Try to get token (will use cached if available)
-    await auth.getXboxToken();
-    console.log('✅ Auth token valid!');
-    
-    client = bedrock.createClient({
-      host: SERVER_HOST,
-      port: SERVER_PORT,
-      username: USERNAME,
-      offline: false,
-      profilesFolder: AUTH_PATH,
-      authTitle: Titles.MinecraftNintendoSwitch,
-      flow: 'live'
-    });
-
-    client.on('play_status', (packet) => {
-      if (packet.status === 'login_success') {
-        console.log('🎮 Login successful!');
-        botState.status = 'Online';
-        botState.online = true;
-        botState.lastError = null;
-        botState.reconnects = 0;
-      }
-    });
-
-    client.on('start_game', (packet) => {
-      console.log('🚀 Bot has spawned! Starting AFK routine.');
-      startAfkLoop(packet.runtime_entity_id);
-    });
-
-    client.on('disconnect', (packet) => {
-      console.warn('⚠️  Disconnected:', packet.message);
-      botState.status = 'Disconnected';
-      botState.online = false;
-      scheduleReconnect();
-    });
-
-    client.on('kick', (packet) => {
-      console.warn('🦶 Kicked:', packet.message);
-      botState.status = 'Kicked';
-      botState.online = false;
-      botState.lastError = packet.message;
-      scheduleReconnect();
-    });
-
-    client.on('error', (err) => {
-      console.error('❌ Client Error:', err);
-      botState.status = 'Error';
-      botState.online = false;
-      botState.lastError = err.message;
-      scheduleReconnect();
-    });
-
-  } catch (e) {
-    console.error('❌ Initialization Error:', e);
-    botState.status = 'Auth Failed';
-    botState.lastError = e.message;
-    
-    // If auth error, prompt for re-linking
-    if (e.message.includes('auth') || e.message.includes('token') || e.message.includes('flow')) {
-      botState.lastError = 'Authentication failed. Please unlink and link your account again.';
-    }
-    
-    scheduleReconnect();
+  let currentSession = sessions.get(uid);
+  if (!currentSession) {
+    currentSession = { client: mc, timeout: null, startedAt: Date.now(), manualStop: false };
+    sessions.set(uid, currentSession);
+  } else {
+    currentSession.client = mc;
+    currentSession.isReconnecting = false;
   }
-}
 
-function startAfkLoop(entityId) {
-  if (client.afkInterval) clearInterval(client.afkInterval);
+  const waitForEntity = setInterval(() => {
+    if (!mc.entity || !mc.entityId) return;
 
-  client.afkInterval = setInterval(() => {
-    if (client && client.status !== 2) {
+    clearInterval(waitForEntity);
+
+    let moveToggle = false;
+    const afkInterval = setInterval(() => {
       try {
-        client.queue('animate', {
-          action_id: 1,
-          runtime_entity_id: entityId
+        const pos = { ...mc.entity.position };
+        // Liikutetaan bottia hieman eteen tai taakse
+        if (moveToggle) {
+           pos.x += 0.5;
+        } else {
+           pos.x -= 0.5;
+        }
+        moveToggle = !moveToggle;
+
+        mc.write("move_player", {
+          runtime_id: mc.entityId,
+          position: pos,
+          pitch: 0,
+          yaw: Math.random() * 360,
+          head_yaw: Math.random() * 360,
+          mode: 0,
+          on_ground: true,
+          ridden_runtime_id: 0,
+          teleport: false
         });
-      } catch (e) {}
+      } catch {}
+    }, 60 * 1000); // Liikkuu minuutin välein
+
+    mc.once("close", () => clearInterval(afkInterval));
+    mc.once("error", () => clearInterval(afkInterval));
+  }, 1000);
+
+  currentSession.timeout = setTimeout(() => {
+    if (sessions.has(uid) && !currentSession.connected) {
+      if (interaction && !interaction.replied) interaction.editReply("❌ Connection error ⛔ (timeout). Retrying in 2min...");
+      mc.close();
     }
-  }, 4000);
+  }, 47000);
+
+  mc.on("spawn", () => {
+    currentSession.connected = true;
+    clearTimeout(currentSession.timeout);
+    if (interaction && !interaction.replied && !interaction.deferred) {
+        // Ensimmäinen yhteys
+    } else if (interaction) {
+        interaction.editReply(`🟢 Connected to **${ip}:${port}** (Auto-move active)` ).catch(() => {});
+    }
+  });
+
+  mc.on("error", (e) => {
+    clearTimeout(currentSession.timeout);
+    if (!currentSession.manualStop) {
+        console.log(`[${uid}] Virhe, yritetään uudelleen 2min päästä: ${e.message}`);
+        handleAutoReconnect(uid, interaction);
+    }
+  });
+
+  mc.on("close", () => {
+    clearTimeout(currentSession.timeout);
+    if (!currentSession.manualStop) {
+        console.log(`[${uid}] Yhteys katkesi, yritetään uudelleen 2min päästä.`);
+        handleAutoReconnect(uid, interaction);
+    }
+  });
 }
 
-function scheduleReconnect() {
-  if (isReconnecting || botState.isLinking) return;
-  isReconnecting = true;
-  botState.reconnects++;
-  
-  const delay = 30000; 
-  console.log(`🔄 Reconnecting in ${delay / 1000} seconds...`);
-  botState.status = 'Reconnecting...';
-  
-  setTimeout(() => {
-    isReconnecting = false;
-   00</div>
-                </div>
-            </div>
-            
-            <div class="button-group">
-                <button class="mc-button" onclick="refreshStatus()">
-                    🔄 Refresh
-                </button>
-                <button class="mc-button success" onclick="startLinking()" id="linkBtn">
-                    🔗 Link Xbox
-                </button>
-            </div>
-            
-            <button class="mc-button danger" onclick="unlinkAccount()">
-                🔓 Unlink Xbox Account
-            </button>
-            
-            <div class="error-box" id="errorBox">
-                <div class="error-title">⚠️ Last Error</div>
-                <div id="errorText">-</div>
-            </div>
-        </div>
-        
-        <div class="footer">
-            <p>Running on Fly.io | Made with ❤️ and blocks</p>
-            <p style="margin-top: 5px; font-size: 1rem;">Status updates every 5 seconds</p>
-        </div>
-    </div>
+function handleAutoReconnect(uid, interaction) {
+    const s = sessions.get(uid);
+    if (!s || s.manualStop || s.reconnectTimer) return;
+
+    s.isReconnecting = true;
+    s.connected = false;
     
-    <script>
-        let startTime = Date.now();
-        let checkAuthInterval = null;
-        
-        function updateUptime() {
-            const elapsed = Math.floor((Date.now() - startTime) / 1000);
-            const hours = Math.floor(elapsed / 3600).toString().padStart(2, '0');
-            const minutes = Math.floor((elapsed % 3600) / 60).toString().padStart(2, '0');
-            const seconds = (elapsed % 60).toString().padStart(2, '0');
-            document.getElementById('uptime').textContent = \`\${hours}:\${minutes}:\${seconds}\`;
+    s.reconnectTimer = setTimeout(() => {
+        if (sessions.has(uid) && !s.manualStop) {
+            s.reconnectTimer = null;
+            startSession(uid, interaction);
         }
-        
-        async function refreshStatus() {
-            try {
-                const response = await fetch('/api/status');
-                const data = await response.json();
-                
-                document.getElementById('username').textContent = data.username || '-';
-                document.getElementById('target').textContent = data.target || '-';
-                document.getElementById('reconnects').textContent = data.reconnects || '0';
-                
-                const light = document.getElementById('statusLight');
-                const text = document.getElementById('statusText');
-                const authBox = document.getElementById('authBox');
-                const linkBtn = document.getElementById('linkBtn');
-                
-                light.className = 'status-indicator';
-                authBox.classList.remove('show');
-                
-                if (data.isLinking && data.authCode) {
-                    light.classList.add('auth');
-                    text.textContent = '🔐 Waiting for Xbox Link...';
-                    text.style.color = '#55ffff';
-                    authBox.classList.add('show');
-                    document.getElementById('authCode').textContent = data.authCode;
-                    document.getElementById('authLink').href = data.authUrl || 'https://www.microsoft.com/link';
-                    linkBtn.disabled = true;
-                    linkBtn.style.opacity = '0.5';
-                } else if (data.online) {
-                    light.classList.add('online');
-                    text.textContent = '🟢 Online & AFK';
-                    text.style.color = '#55ff55';
-                    linkBtn.disabled = false;
-                    linkBtn.style.opacity = '1';
-                    linkBtn.textContent = '🔁 Re-Link Xbox';
-                } else if (data.status === 'Connecting' || data.status === 'Initializing' || data.status === 'Authenticating') {
-                    light.classList.add('connecting');
-                    text.textContent = '🟡 ' + data.status + '<span class="loading-dots"></span>';
-                    text.style.color = '#ffff55';
-                } else {
-                    light.classList.add('offline');
-                    text.textContent = '🔴 ' + (data.status || 'Offline');
-                    text.style.color = '#ff5555';
-                    linkBtn.disabled = false;
-                    linkBtn.style.opacity = '1';
-                }
-                
-                const errorBox = document.getElementById('errorBox');
-                if (data.lastError && !data.isLinking) {
-                    errorBox.classList.add('show');
-                    document.getElementById('errorText').textContent = data.lastError;
-                } else {
-                    errorBox.classList.remove('show');
-                }
-                
-                if (data.startTime) {
-                    startTime = data.startTime;
-                }
-            } catch (err) {
-                document.getElementById('statusText').textContent = '🔴 Connection Failed';
-                document.getElementById('statusLight').className = 'status-indicator';
-            }
-        }
-        
-        async function startLinking() {
-            try {
-                const response = await fetch('/api/link', { method: 'POST' });
-                const data = await response.json();
-                if (data.success) {
-                    refreshStatus();
-                }
-            } catch (err) {
-                alert('Failed to start linking process');
-            }
-        }
-        
-        async function checkAuthStatus() {
-            try {
-                const response = await fetch('/api/check-auth');
-                const data = await response.json();
-                if (data.authenticated) {
-                    alert('✅ Account linked successfully! Bot will connect shortly.');
-                    refreshStatus();
-                } else {
-                    alert('⏳ Still waiting... Please complete the login on Microsoft website.');
-                }
-            } catch (err) {
-                alert('Error checking auth status');
-            }
-        }
-        
-        async function unlinkAccount() {
-            if (!confirm('Are you sure you want to unlink your Xbox account? The bot will need to be re-authenticated.')) {
-                return;
-            }
-            try {
-                const response = await fetch('/api/unlink', { method: 'POST' });
-                const data = await response.json();
-                if (data.success) {
-                    alert('✅ Account unlinked. Click "Link Xbox" to authenticate again.');
-                    refreshStatus();
-                }
-            } catch (err) {
-                alert('Failed to unlink account');
-            }
-        }
-        
-        refreshStatus();
-        setInterval(refreshStatus, 5000);
-        setInterval(updateUptime, 1000);
-    </script>
-</body>
-</html>
-`;
+    }, 30000);
+}
 
-// --- AUTHENTICATION FUNCTIONS ---
-
-function deleteAuthFiles() {
+// ----------------- Interactions -----------------
+client.on(Events.InteractionCreate, async (i) => {
   try {
-    if (fs.existsSync(AUTH_PATH)) {
-      const files = fs.readdirSync(AUTH_PATH);
-      for (const file of files) {
-        fs.unlinkSync(path.join(AUTH_PATH, file));
+    const blocked = denyIfWrongGuild(i);
+    if (blocked) return;
+
+    const uid = i.user.id;
+
+    if (i.isChatInputCommand()) {
+      if (i.commandName === "panel") {
+        return i.reply({
+          content: "🎛 **Bedrock AFK Panel**",
+          components: panelRow()
+        });
       }
-      console.log('🗑️ Auth files deleted');
-      return true;
     }
-  } catch (err) {
-    console.error('Error deleting auth files:', err);
-    return false;
-  }
-}
 
-async function startAuthLinking() {
-  if (botState.isLinking) return;
-  
-  console.log('🔐 Starting Xbox account linking...');
-  botState.isLinking = true;
-  botState.status = 'Waiting for Auth';
-  
-  // Delete old auth first
-  deleteAuthFiles();
-  
-  try {
-    const auth = new Authflow(USERNAME, AUTH_PATH, {
-      authTitle: Titles.MinecraftNintendoSwitch,
-      deviceType: 'Nintendo',
-      flow: 'live'
-    });
-    
-    currentAuth = auth;
-    
-    // This will trigger the device code flow
-    const xboxToken = await auth.getXboxToken();
-    
-    // If we get here, auth is complete!
-    console.log('✅ Auth completed successfully!');
-    botState.isLinking = false;
-    botState.authCode = null;
-    botState.authUrl = null;
-    
-    // Start the bot
-    setTimeout(() => connectBot(), 1000);
-    
-  } catch (err) {
-    // Expected to fail initially as we need user to complete auth
-    console.log('Waiting for user to complete auth...');
-  }
-}
+    if (i.isButton()) {
+      if (i.customId === "link") {
+        await i.deferReply({ ephemeral: true });
+        await i.editReply("⏳ Requesting Microsoft login…");
+        return linkMicrosoft(uid, i);
+      }
 
-// Override the getXboxToken to capture device code
-async function startDeviceCodeAuth() {
-  const auth = new Authflow(USERNAME, AUTH_PATH, {
-    authTitle: Titles.MinecraftNintendoSwitch,
-    deviceType: 'Nintendo',
-    flow: 'live'
-  });
-  
-  // Listen for device code event
-  auth.on('device_code', (deviceCode) => {
-    console.log('📱 Device code received:', deviceCode.user_code);
-    botState.authCode = deviceCode.user_code;
-    botState.authUrl = deviceCode.verification_uri;
-  });
-  
-  try {
-    await auth.getXboxToken();
+      if (i.customId === "unlink") {
+        unlinkMicrosoft(uid);
+        return i.reply({ ephemeral: true, content: "🗑 Microsoft account unlinked for your user." });
+      }
+
+      if (i.customId === "settings") {
+        const u = getUser(uid);
+        const pre = {
+          ip: u.server?.ip || "",
+          port: u.server?.port || 19132,
+          offlineUsername: u.offlineUsername || ""
+        };
+
+        const modal = new ModalBuilder().setCustomId("settings_modal").setTitle("⚙ Bedrock Settings");
+
+        const ip = new TextInputBuilder()
+          .setCustomId("ip")
+          .setLabel("Server IP")
+          .setStyle(TextInputStyle.Short)
+          .setRequired(true)
+          .setValue(pre.ip);
+
+        const port = new TextInputBuilder()
+          .setCustomId("port")
+          .setLabel("Port (19132)")
+          .setStyle(TextInputStyle.Short)
+          .setRequired(true)
+          .setValue(String(pre.port));
+
+        const offlineUser = new TextInputBuilder()
+          .setCustomId("offline")
+          .setLabel("Offline username (cracked)")
+          .setStyle(TextInputStyle.Short)
+          .setRequired(false)
+          .setValue(pre.offlineUsername);
+
+        modal.addComponents(
+          new ActionRowBuilder().addComponents(ip),
+          new ActionRowBuilder().addComponents(port),
+          new ActionRowBuilder().addComponents(offlineUser)
+        );
+
+        return i.showModal(modal);
+      }
+
+      if (i.customId === "start") {
+        await i.deferReply({ ephemeral: true });
+        await i.editReply("⏳ Connecting…");
+        return startSession(uid, i);
+      }
+
+      if (i.customId === "stop") {
+        const ok = stopSession(uid);
+        if (!ok) return i.reply({ ephemeral: true, content: "No bots running." });
+        return i.reply({ ephemeral: true, content: "⏹ Stopped." });
+      }
+
+      if (i.customId === "more") {
+        const u = getUser(uid);
+        return i.reply({
+          ephemeral: true,
+          content: "➕ **More options**",
+          components: [
+            new ActionRowBuilder().addComponents(
+              new ButtonBuilder().setCustomId("invisible").setLabel("👻 Make bot invisible").setStyle(ButtonStyle.Secondary)
+            ),
+            versionRow(u.bedrockVersion),
+            connRow(u.connectionType)
+          ]
+        });
+      }
+
+      if (i.customId === "invisible") {
+        const s = sessions.get(uid);
+        if (!s) return i.reply({ ephemeral: true, content: "Bot is not running." });
+        try {
+          s.client.write("command_request", {
+            command: "/gamemode survival @s",
+            internal: false,
+            version: 2
+          });
+          return i.reply({ ephemeral: true, content: "Attempted to hide bot." });
+        } catch {
+          return i.reply({ ephemeral: true, content: "Commands not allowed." });
+        }
+      }
+    }
+
+    if (i.isStringSelectMenu()) {
+      const u = getUser(uid);
+      if (i.customId === "set_version") {
+        u.bedrockVersion = i.values[0];
+        save();
+        return i.reply({ ephemeral: true, content: `Version set to ${u.bedrockVersion}` });
+      }
+      if (i.customId === "set_conn") {
+        u.connectionType = i.values[0];
+        save();
+        return i.reply({ ephemeral: true, content: `Connection set to ${u.connectionType}` });
+      }
+    }
+
+    if (i.isModalSubmit() && i.customId === "settings_modal") {
+      const ip = i.fields.getTextInputValue("ip").trim();
+      const port = parseInt(i.fields.getTextInputValue("port").trim(), 10);
+      const offline = i.fields.getTextInputValue("offline").trim();
+
+      if (!ip || !Number.isFinite(port)) {
+        return i.reply({ ephemeral: true, content: "Bad IP or port." });
+      }
+
+      const u = getUser(uid);
+      u.server = { ip, port };
+      if (offline) u.offlineUsername = offline;
+      save();
+
+      return i.reply({ ephemeral: true, content: `Saved ${ip}:${port}` });
+    }
+
   } catch (e) {
-    // Will wait for user
-  }
-  
-  return auth;
-}
-
-// --- WEB SERVER ---
-const requestListener = async function (req, res) {
-  // Set CORS headers
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
-  
-  if (req.method === 'OPTIONS') {
-    res.writeHead(200);
-    res.end();
-    return;
-  }
-  
-  if (req.url === '/api/status') {
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify(botState));
-  } else if (req.url === '/api/link' && req.method === 'POST') {
-    // Start linking process
-    if (!botState.isLinking) {
-      startAuthLinking();
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ success: true, message: 'Linking started' }));
-    } else {
-      res.writeHead(400, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ success: false, message: 'Already linking' }));
+    console.error("Interaction error:", e);
+    if (!i.replied && !i.deferred) {
+      await i.reply({ ephemeral: true, content: "Internal error." }).catch(() => {});
+    } else if (i.deferred) {
+      await i.editReply("Internal error.").catch(() => {});
     }
-  } else if (req.url === '/api/check-auth' && req.method === 'GET') {
-    // Check if auth files exist
-    const hasAuth = fs.existsSync(AUTH_PATH) && fs.readdirSync(AUTH_PATH).length > 0;
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ authenticated: hasAuth }));
-  } else if (req.url === '/api/unlink' && req.method === 'POST') {
-    // Unlink account
-    const success = deleteAuthFiles();
-    botState.isLinking = false;
-    botState.authCode = null;
-    botState.authUrl = null;
-    botState.online = false;
-    botState.status = 'Unlinked';
-    
-    // Disconnect current client
-    if (client) {
-      client.removeAllListeners();
-      client = null;
-    }
-    
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ success }));
-  } else {
-    res.writeHead(200, { 'Content-Type': 'text/html' });
-    res.end(minecraftHTML);
   }
-};
-
-const server = http.createServer(requestListener);
-const HTTP_PORT = process.env.PORT || 8080;
-server.listen(HTTP_PORT, () => {
-  console.log(`🌐 Web server running on port ${HTTP_PORT}`);
-  console.log(`📊 Status page: http://localhost:${HTTP_PORT}`);
 });
 
-// --- BOT LOGIC ---
+process.on("unhandledRejection", (e) => console.error("unhandledRejection:", e));
+process.on("uncaughtException", (e) => console.error("uncaughtException:", e));
 
-async function connectBot() {
-  if (isReconnecting || botState.isLinking) return;
-  
-  console.log(`[${new Date().toISOString()}] Connecting to ${SERVER_HOST}:${SERVER_PORT} as ${USERNAME}...`);
-  botState.status = 'Connecting';
-
-  try {
-    // Check if we have auth
-    const hasAuth = fs.existsSync(AUTH_PATH) && fs.readdirSync(AUTH_PATH).length > 0;
-    if (!hasAuth) {
-      console.log('⚠️ No auth found, waiting for linking...');
-      botState.status = 'Needs Auth';
-      botState.lastError = 'Please link your Xbox account using the web interface';
-      return;
-    }
-    
-    const auth = new Authflow(USERNAME, AUTH_PATH, {
-      authTitle: Titles.MinecraftNintendoSwitch,
-      deviceType: 'Nintendo',
-      flow: 'live'
-    });
-    
-    // Try to get token (will use cached if available)
-    await auth.getXboxToken();
-    console.log('✅ Auth token valid!');
-    
-    client = bedrock.createClient({
-      host: SERVER_HOST,
-      port: SERVER_PORT,
-      username: USERNAME,
-      offline: false,
-      profilesFolder: AUTH_PATH,
-      authTitle: Titles.MinecraftNintendoSwitch,
-      flow: 'live'
-    });
-
-    client.on('play_status', (packet) => {
-      if (packet.status === 'login_success') {
-        console.log('🎮 Login successful!');
-        botState.status = 'Online';
-        botState.online = true;
-        botState.lastError = null;
-        botState.reconnects = 0;
-      }
-    });
-
-    client.on('start_game', (packet) => {
-      console.log('🚀 Bot has spawned! Starting AFK routine.');
-      startAfkLoop(packet.runtime_entity_id);
-    });
-
-    client.on('disconnect', (packet) => {
-      console.warn('⚠️  Disconnected:', packet.message);
-      botState.status = 'Disconnected';
-      botState.online = false;
-      scheduleReconnect();
-    });
-
-    client.on('kick', (packet) => {
-      console.warn('🦶 Kicked:', packet.message);
-      botState.status = 'Kicked';
-      botState.online = false;
-      botState.lastError = packet.message;
-      scheduleReconnect();
-    });
-
-    client.on('error', (err) => {
-      console.error('❌ Client Error:', err);
-      botState.status = 'Error';
-      botState.online = false;
-      botState.lastError = err.message;
-      scheduleReconnect();
-    });
-
-  } catch (e) {
-    console.error('❌ Initialization Error:', e);
-    botState.status = 'Auth Failed';
-    botState.lastError = e.message;
-    
-    // If auth error, prompt for re-linking
-    if (e.message.includes('auth') || e.message.includes('token') || e.message.includes('flow')) {
-      botState.lastError = 'Authentication failed. Please unlink and link your account again.';
-    }
-    
-    scheduleReconnect();
-  }
-}
-
-function startAfkLoop(entityId) {
-  if (client.afkInterval) clearInterval(client.afkInterval);
-
-  client.afkInterval = setInterval(() => {
-    if (client && client.status !== 2) {
-      try {
-        client.queue('animate', {
-          action_id: 1,
-          runtime_entity_id: entityId
-        });
-      } catch (e) {}
-    }
-  }, 4000);
-}
-
-function scheduleReconnect() {
-  if (isReconnecting || botState.isLinking) return;
-  isReconnecting = true;
-  botState.reconnects++;
-  
-  const delay = 30000; 
-  console.log(`🔄 Reconnecting in ${delay / 1000} seconds...`);
-  botState.status = 'Reconnecting...';
-  
-  setTimeout(() => {
-    isReconnecting = false;
-    if (client) {
-      client.removeAllListeners();
-      client = null;
-    }
-    connectBot();
-  }, delay);
-}
-
-// Start
-connectBot();
+client.login(DISCORD_TOKEN);
