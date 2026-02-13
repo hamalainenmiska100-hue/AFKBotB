@@ -215,12 +215,19 @@ async function checkServerStatus(ip, port) {
 function cleanupSession(uid) {
   const s = sessions.get(uid);
   if (!s) return;
+  
   if (s.timeout) clearTimeout(s.timeout);
   if (s.reconnectTimer) clearTimeout(s.reconnectTimer);
   if (s.afkInterval) clearInterval(s.afkInterval);
   if (s.handSwingInterval) clearInterval(s.handSwingInterval);
   if (s.pingCheckInterval) clearInterval(s.pingCheckInterval);
-  try { s.client.close(); } catch {}
+  
+  // Set closing flag to prevent event handlers from triggering reconnect
+  if (s.client) {
+    s.client._closing = true;
+    try { s.client.close(); } catch {}
+  }
+  
   sessions.delete(uid);
 }
 
@@ -240,8 +247,8 @@ async function startSession(uid, interaction, isReconnect = false) {
   const u = getUser(uid);
   if (!u.server) {
     if (interaction && !interaction.replied) {
-      const reply = isReconnect ? interaction.followUp : interaction.editReply;
-      await reply.call(interaction, { ephemeral: true, content: "⚠ Set settings first." }).catch(() => {});
+      const method = isReconnect ? 'followUp' : 'editReply';
+      await interaction[method]({ ephemeral: true, content: "⚠ Set settings first." }).catch(() => {});
     }
     return;
   }
@@ -267,11 +274,8 @@ async function startSession(uid, interaction, isReconnect = false) {
   if (!status.online) {
     const msg = `❌ Server **${ip}:${port}** is offline or unreachable.\nError: ${status.error || "Unknown"}`;
     if (interaction) {
-      if (isReconnect) {
-        await interaction.followUp({ ephemeral: true, content: msg }).catch(() => {});
-      } else {
-        await interaction.editReply(msg).catch(() => {});
-      }
+      const method = isReconnect ? 'followUp' : 'editReply';
+      await interaction[method]({ ephemeral: true, content: msg }).catch(() => {});
     }
     
     // Schedule retry if this was an auto-reconnect attempt
@@ -291,7 +295,7 @@ async function startSession(uid, interaction, isReconnect = false) {
   const opts = {
     host: ip,
     port: port || 19132,
-    connectTimeout: 30000, // Reduced from 47s to 30s
+    connectTimeout: 30000,
     keepAlive: true
   };
 
@@ -311,11 +315,8 @@ async function startSession(uid, interaction, isReconnect = false) {
     console.error(`[${uid}] Failed to create client:`, e);
     if (interaction) {
       const msg = `❌ Failed to create connection: ${e.message}`;
-      if (isReconnect) {
-        await interaction.followUp({ ephemeral: true, content: msg }).catch(() => {});
-      } else {
-        await interaction.editReply(msg).catch(() => {});
-      }
+      const method = isReconnect ? 'followUp' : 'editReply';
+      await interaction[method]({ ephemeral: true, content: msg }).catch(() => {});
     }
     handleAutoReconnect(uid, interaction);
     return;
@@ -333,13 +334,15 @@ async function startSession(uid, interaction, isReconnect = false) {
       afkInterval: null,
       handSwingInterval: null,
       pingCheckInterval: null,
-      lastPing: Date.now()
+      lastPing: Date.now(),
+      disconnectReason: null
     };
     sessions.set(uid, currentSession);
   } else {
     currentSession.client = mc;
     currentSession.isReconnecting = false;
     currentSession.connected = false;
+    currentSession.disconnectReason = null;
   }
 
   // Connection timeout - if not connected within 30s, retry
@@ -417,10 +420,9 @@ async function startSession(uid, interaction, isReconnect = false) {
         const pingStatus = await checkServerStatus(ip, port);
         currentSession.lastPing = Date.now();
         
-        if (!pingStatus.online && !currentSession.manualStop) {
+        if (!pingStatus.online && !currentSession.manualStop && !mc._closing) {
           console.log(`[${uid}] Server appears offline in ping check, reconnecting...`);
           mc.close();
-          handleAutoReconnect(uid, interaction);
         }
       } catch (e) {
         console.log(`[${uid}] Ping check error:`, e.message);
@@ -432,10 +434,24 @@ async function startSession(uid, interaction, isReconnect = false) {
     currentSession.pingCheckInterval = pingCheckInterval;
   });
 
+  // Handle disconnect packet (proper kick detection)
+  mc.on("disconnect", (packet) => {
+    const reason = packet.message || "Unknown reason";
+    console.log(`[${uid}] Disconnected: ${reason}`);
+    currentSession.disconnectReason = reason;
+    
+    if (!currentSession.manualStop && !mc._closing) {
+      if (interaction) {
+        interaction.followUp({ ephemeral: true, content: `👢 Disconnected: ${reason}` }).catch(() => {});
+      }
+      handleAutoReconnect(uid, interaction);
+    }
+  });
+
   // Handle errors
   mc.on("error", (e) => {
     console.log(`[${uid}] Client error: ${e.message}`);
-    if (!currentSession.manualStop && !currentSession.isReconnecting) {
+    if (!currentSession.manualStop && !currentSession.isReconnecting && !mc._closing) {
       handleAutoReconnect(uid, interaction);
     }
   });
@@ -443,19 +459,15 @@ async function startSession(uid, interaction, isReconnect = false) {
   // Handle disconnect
   mc.on("close", () => {
     clearTimeout(currentSession.timeout);
-    if (!currentSession.manualStop && !currentSession.isReconnecting) {
-      console.log(`[${uid}] Connection closed, attempting reconnect...`);
-      handleAutoReconnect(uid, interaction);
+    
+    // Don't reconnect if manually stopped, already reconnecting, or client is closing
+    if (currentSession.manualStop || currentSession.isReconnecting || mc._closing) {
+      return;
     }
-  });
-
-  // Handle kicks
-  mc.on("kick", (reason) => {
-    console.log(`[${uid}] Kicked:`, reason);
-    if (!currentSession.manualStop) {
-      if (interaction) {
-        interaction.followUp({ ephemeral: true, content: `👢 Kicked from server: ${reason}` }).catch(() => {});
-      }
+    
+    // If we never connected, or disconnected without a reason, try to reconnect
+    if (!currentSession.connected || !currentSession.disconnectReason) {
+      console.log(`[${uid}] Connection closed unexpectedly, attempting reconnect...`);
       handleAutoReconnect(uid, interaction);
     }
   });
@@ -463,7 +475,7 @@ async function startSession(uid, interaction, isReconnect = false) {
 
 function handleAutoReconnect(uid, interaction) {
   const s = sessions.get(uid);
-  if (!s || s.manualStop || s.isReconnecting) return;
+  if (!s || s.manualStop || s.isReconnecting || s.client?._closing) return;
 
   const u = getUser(uid);
   
