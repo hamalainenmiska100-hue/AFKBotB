@@ -23,7 +23,7 @@ if (!DISCORD_TOKEN) {
   process.exit(1);
 }
 
-const ALLOWED_GUILD_ID = "1462335230345089254";
+const ALLOWED_GUILD_ID = "1464973275397357772";
 
 // ----------------- Storage -----------------
 const DATA = path.join(__dirname, "data");
