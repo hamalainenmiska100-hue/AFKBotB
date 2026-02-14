@@ -18,6 +18,27 @@ const { Authflow, Titles } = require("prismarine-auth");
 const fs = require("fs");
 const path = require("path");
 
+// --- Firebase Admin SDK ---
+const admin = require("firebase-admin");
+
+// Initialize Firebase with service account from environment variable
+const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT || '{}');
+
+if (!serviceAccount.project_id) {
+  console.error("❌ FIREBASE_SERVICE_ACCOUNT environment variable missing or invalid");
+  process.exit(1);
+}
+
+admin.initializeApp({
+  credential: admin.credential.cert(serviceAccount),
+  databaseURL: "https://blimp-d9854-default-rtdb.firebaseio.com"
+});
+
+const db = admin.database();
+const sessionsRef = db.ref("sessions");
+
+console.log("✅ Firebase Realtime Database connected");
+
 // --- Dependencies for Chunk Scanning & Bed Detection ---
 let Vec3, PrismarineChunk, PrismarineRegistry, MinecraftData;
 let advancedFeaturesEnabled = false;
@@ -49,20 +70,53 @@ const ADMIN_CHANNEL_ID = "1469013237625393163";
 const DATA = path.join(__dirname, "data");
 const AUTH_ROOT = path.join(DATA, "auth");
 const STORE = path.join(DATA, "users.json");
-const REJOIN_STORE = path.join(DATA, "ReJoin.json");
 
 if (!fs.existsSync(DATA)) fs.mkdirSync(DATA);
 if (!fs.existsSync(AUTH_ROOT)) fs.mkdirSync(AUTH_ROOT, { recursive: true });
 
 let users = fs.existsSync(STORE) ? JSON.parse(fs.readFileSync(STORE, "utf8")) : {};
-let activeSessionsStore = fs.existsSync(REJOIN_STORE) ? JSON.parse(fs.readFileSync(REJOIN_STORE, "utf8")) : {};
+
+// Local cache for active sessions from Firebase
+let activeSessionsStore = {};
 
 function save() {
   fs.writeFileSync(STORE, JSON.stringify(users, null, 2));
 }
 
-function saveActiveSessions() {
-  fs.writeFileSync(REJOIN_STORE, JSON.stringify(activeSessionsStore, null, 2));
+// Firebase: Save session to Realtime Database
+async function saveSessionToFirebase(uid, sessionData) {
+  try {
+    await sessionsRef.child(uid).set({
+      ...sessionData,
+      timestamp: Date.now()
+    });
+    console.log(`[Firebase] Session saved for ${uid}`);
+  } catch (e) {
+    console.error(`[Firebase] Error saving session for ${uid}:`, e.message);
+  }
+}
+
+// Firebase: Remove session from Realtime Database
+async function removeSessionFromFirebase(uid) {
+  try {
+    await sessionsRef.child(uid).remove();
+    console.log(`[Firebase] Session removed for ${uid}`);
+  } catch (e) {
+    console.error(`[Firebase] Error removing session for ${uid}:`, e.message);
+  }
+}
+
+// Firebase: Load all active sessions
+async function loadSessionsFromFirebase() {
+  try {
+    const snapshot = await sessionsRef.once("value");
+    activeSessionsStore = snapshot.val() || {};
+    console.log(`[Firebase] Loaded ${Object.keys(activeSessionsStore).length} active sessions`);
+    return activeSessionsStore;
+  } catch (e) {
+    console.error("[Firebase] Error loading sessions:", e.message);
+    return {};
+  }
 }
 
 function getUser(uid) {
@@ -183,7 +237,7 @@ function getAdminStatsEmbed() {
     .addFields(
       { name: "📊 Performance", value: `**RAM:** ${ramMB} MB\n**Uptime:** ${hours}h ${minutes}m`, inline: true },
       { name: "🤖 Active Sessions", value: `**Total Bots:** ${sessions.size}`, inline: true },
-      { name: "💾 Persisted Sessions", value: `**Saved for Restart:** ${Object.keys(activeSessionsStore).length}`, inline: true }
+      { name: "💾 Persisted Sessions (Firebase)", value: `**Saved for Restart:** ${Object.keys(activeSessionsStore).length}`, inline: true }
     )
     .setFooter({ text: "Auto-refreshing every 30s • Administrative Access Only" })
     .setTimestamp();
@@ -202,6 +256,10 @@ function getAdminStatsEmbed() {
 // ----------------- Events: Ready & Startup Rejoin -----------------
 client.once("ready", async () => {
   console.log("🟢 Online as", client.user.tag);
+  console.log("📂 Loading sessions from Firebase...");
+
+  // Load sessions from Firebase
+  await loadSessionsFromFirebase();
 
   const cmds = [
     new SlashCommandBuilder().setName("panel").setDescription("Open Bedrock AFK panel"),
@@ -218,7 +276,7 @@ client.once("ready", async () => {
     }
   }, 30000);
 
-  console.log("📂 Checking ReJoin.json for previous sessions...");
+  console.log("📂 Checking Firebase for previous sessions...");
   const previousSessions = Object.keys(activeSessionsStore);
 
   if (previousSessions.length > 0) {
@@ -276,23 +334,29 @@ function cleanupSession(uid) {
   sessions.delete(uid);
 }
 
-function stopSession(uid) {
+// MODIFIED: Stop session - removes from Firebase only on manual stop
+async function stopSession(uid, isManual = true) {
   const s = sessions.get(uid);
 
-  if (activeSessionsStore[uid]) {
+  // Only remove from Firebase on manual stop (user clicked stop button)
+  if (isManual) {
+    await removeSessionFromFirebase(uid);
+    if (activeSessionsStore[uid]) {
       delete activeSessionsStore[uid];
-      saveActiveSessions();
+    }
   }
 
   if (!s) return false;
-  s.manualStop = true; 
+  s.manualStop = isManual; 
   cleanupSession(uid);
   return true;
 }
 
-function stopAllSessions() {
+async function stopAllSessions() {
   const uids = Array.from(sessions.keys());
-  uids.forEach(uid => stopSession(uid));
+  for (const uid of uids) {
+    await stopSession(uid, true); // Manual stop for all
+  }
   return uids.length;
 }
 
@@ -330,15 +394,20 @@ async function safeReply(interaction, content) {
 async function startSession(uid, interaction, isReconnect = false) {
   const u = getUser(uid);
 
+  // Save session to Firebase for persistence (only if not already there)
   if (!activeSessionsStore[uid]) {
-      activeSessionsStore[uid] = true;
-      saveActiveSessions();
+    await saveSessionToFirebase(uid, { 
+      server: u.server,
+      startedAt: Date.now(),
+      isReconnect: isReconnect 
+    });
+    activeSessionsStore[uid] = true;
   }
 
   if (!u.server) {
       if (!isReconnect && interaction) await safeReply(interaction, "⚠ Please configure your server settings first.");
+      await removeSessionFromFirebase(uid);
       delete activeSessionsStore[uid];
-      saveActiveSessions();
       return;
   }
 
@@ -661,7 +730,7 @@ client.on(Events.InteractionCreate, async (i) => {
       }
 
       if (i.customId === "admin_stop_all") {
-        const count = stopAllSessions();
+        const count = await stopAllSessions();
         await i.reply({ ephemeral: true, content: `🛑 Stopped ${count} bot(s).` });
         if (lastAdminMessage) {
           try {
@@ -702,8 +771,9 @@ client.on(Events.InteractionCreate, async (i) => {
 
       if (i.customId === "cancel") return i.update({ content: "❌ Cancelled.", embeds: [], components: [] }).catch(() => {});
 
+      // MODIFIED: Stop button now properly removes from Firebase
       if (i.customId === "stop") {
-        const ok = stopSession(uid);
+        const ok = await stopSession(uid, true); // true = manual stop, removes from Firebase
         return safeReply(i, { ephemeral: true, content: ok ? "⏹ **Session Terminated.**" : "No active sessions." });
       }
 
@@ -731,7 +801,7 @@ client.on(Events.InteractionCreate, async (i) => {
     if (i.isStringSelectMenu()) {
       if (i.customId === "admin_force_stop_select") {
         const targetUid = i.values[0];
-        const ok = stopSession(targetUid);
+        const ok = await stopSession(targetUid, true); // Manual stop
         await i.reply({ ephemeral: true, content: ok ? `🛑 Stopped bot for user ${targetUid}.` : "No active session found for that user." });
         if (lastAdminMessage) {
           try {
