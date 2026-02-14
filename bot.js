@@ -132,7 +132,7 @@ function denyIfWrongGuild(i) {
 function panelRow(isJava = false) {
   const title = isJava ? "Java AFKBot Panel 🎛️" : "Bedrock AFKBot Panel 🎛️";
   const startCustomId = isJava ? "start_java" : "start_bedrock";
-  
+
   return {
     content: `**${title}**`,
     components: [
@@ -176,7 +176,7 @@ function getAdminStatsEmbed() {
   const uptime = process.uptime();
   const hours = Math.floor(uptime / 3600);
   const minutes = Math.floor((uptime % 3600) / 60);
-  
+
   const embed = new EmbedBuilder()
     .setTitle("🛠 Admin Panel")
     .setColor("#2f3136")
@@ -220,7 +220,7 @@ client.once("ready", async () => {
 
   console.log("📂 Checking ReJoin.json for previous sessions...");
   const previousSessions = Object.keys(activeSessionsStore);
-  
+
   if (previousSessions.length > 0) {
       console.log(`♻️ Found ${previousSessions.length} bots to restore. Starting them now...`);
       let delay = 0;
@@ -266,7 +266,7 @@ async function linkMicrosoft(uid, interaction) {
 function cleanupSession(uid) {
   const s = sessions.get(uid);
   if (!s) return;
-  
+
   if (s.reconnectTimer) clearTimeout(s.reconnectTimer);
   if (s.physicsLoop) clearInterval(s.physicsLoop);
   if (s.afkTimeout) clearTimeout(s.afkTimeout);
@@ -278,7 +278,7 @@ function cleanupSession(uid) {
 
 function stopSession(uid) {
   const s = sessions.get(uid);
-  
+
   if (activeSessionsStore[uid]) {
       delete activeSessionsStore[uid];
       saveActiveSessions();
@@ -299,9 +299,9 @@ function stopAllSessions() {
 function handleAutoReconnect(uid) {
     const s = sessions.get(uid);
     if (!s || s.manualStop) return;
-    
+
     if (s.reconnectTimer) clearTimeout(s.reconnectTimer);
-    
+
     s.isReconnecting = true;
     logToDiscord(`⏳ Bot of <@${uid}> disconnected. Reconnecting in 60s...`);
 
@@ -329,7 +329,7 @@ async function safeReply(interaction, content) {
 // ----------------- MAIN SESSION FUNCTION -----------------
 async function startSession(uid, interaction, isReconnect = false) {
   const u = getUser(uid);
-  
+
   if (!activeSessionsStore[uid]) {
       activeSessionsStore[uid] = true;
       saveActiveSessions();
@@ -348,7 +348,7 @@ async function startSession(uid, interaction, isReconnect = false) {
       if (interaction) return safeReply(interaction, "⚠️ **Session Conflict**: Active session already exists.").catch(() => {});
       return;
   }
-  
+
   const connectionEmbed = new EmbedBuilder()
     .setColor("#5865F2")
     .setTitle("Bot Initialization")
@@ -359,9 +359,9 @@ async function startSession(uid, interaction, isReconnect = false) {
           connectionEmbed.setDescription(`🔍 **Pinging server...**\n🌐 **Target:** \`${ip}:${port}\``);
           await safeReply(interaction, { embeds: [connectionEmbed], content: null, components: [] });
       }
-      
+
       await bedrock.ping({ host: ip, port: parseInt(port) || 19132, timeout: 5000 });
-      
+
       if (!isReconnect && interaction) {
           connectionEmbed.setDescription(`✅ **Server found! Joining...**\n🌐 **Target:** \`${ip}:${port}\``);
           await safeReply(interaction, { embeds: [connectionEmbed] });
@@ -374,7 +374,7 @@ async function startSession(uid, interaction, isReconnect = false) {
   }
 
   const authDir = getUserAuthDir(uid);
-  
+
   const opts = { 
       host: ip, 
       port: parseInt(port), 
@@ -392,7 +392,7 @@ async function startSession(uid, interaction, isReconnect = false) {
   }
 
   const mc = bedrock.createClient(opts);
-  
+
   const currentSession = { 
       client: mc, 
       startedAt: Date.now(), 
@@ -428,7 +428,7 @@ async function startSession(uid, interaction, isReconnect = false) {
           logToDiscord(`Could not initialize chunk manager for <@${uid}>. Bed detection disabled.`);
           currentSession.Chunk = null;
       }
-      
+
       mc.on('level_chunk', (packet) => {
           if (!currentSession.Chunk) return;
           try {
@@ -439,7 +439,7 @@ async function startSession(uid, interaction, isReconnect = false) {
               // Silently ignore corrupted chunks
           }
       });
-      
+
       currentSession.chunkGCLoop = setInterval(() => {
           if (currentSession.chunks.size > 50) {
               currentSession.chunks.clear();
@@ -448,7 +448,7 @@ async function startSession(uid, interaction, isReconnect = false) {
 
       currentSession.physicsLoop = setInterval(() => {
           if (!currentSession.connected || !currentSession.position) return;
-          
+
           const gravity = 0.08; 
           const moveVector = { x: 0, z: 0 };
 
@@ -468,7 +468,7 @@ async function startSession(uid, interaction, isReconnect = false) {
           }
 
           if (currentSession.velocity && currentSession.velocity.y < -3.92) currentSession.velocity.y = -3.92;
-          
+
           if (currentSession.velocity) {
               currentSession.position.add(currentSession.velocity);
           }
@@ -495,7 +495,7 @@ async function startSession(uid, interaction, isReconnect = false) {
   const performAntiAfk = () => {
       if (!sessions.has(uid)) return;
       const s = sessions.get(uid);
-      
+
       if (!s.connected || !s.position) {
           s.afkTimeout = setTimeout(performAntiAfk, 5000);
           return;
@@ -516,8 +516,15 @@ async function startSession(uid, interaction, isReconnect = false) {
                   s.onGround = false;
               }
           }
-          
-          mc.write('animate', { action_id: 1, runtime_entity_id: s.entityId || 0 });
+
+          // FIXED: Proper hand swing implementation for Bedrock Edition
+          // Using 'animate' packet with correct parameters (action_id: 1 = swing arm)
+          if (s.entityId) {
+              mc.queue('animate', {
+                  action_id: 1,
+                  runtime_entity_id: s.entityId
+              });
+          }
       } catch (e) {}
 
       const nextDelay = Math.random() * 20000 + 10000;
@@ -538,18 +545,18 @@ async function startSession(uid, interaction, isReconnect = false) {
           for (let y = -searchRadius; y <= searchRadius; y++) {
               for (let z = -searchRadius; z <= searchRadius; z++) {
                   const checkPos = playerPos.offset(x, y, z);
-                  
+
                   const chunkX = Math.floor(checkPos.x / 16);
                   const chunkZ = Math.floor(checkPos.z / 16);
                   const chunk = s.chunks.get(`${chunkX},${chunkZ}`);
-                  
+
                   if (chunk) {
                       try {
                           const block = chunk.getBlock(checkPos);
                           if (block && block.name && block.name.includes('bed')) {
                               logToDiscord(`🛌 Bed found for <@${uid}> at ${checkPos}. Attempting to sleep.`);
                               s.isTryingToSleep = true;
-                              
+
                               mc.write('inventory_transaction', {
                                   transaction: {
                                       transaction_type: 'item_use_on_block', action_type: 0,
@@ -592,10 +599,10 @@ async function startSession(uid, interaction, isReconnect = false) {
       currentSession.entityId = packet.runtime_entity_id;
       currentSession.connected = true;
       currentSession.isReconnecting = false;
-      
+
       performAntiAfk();
   });
-  
+
   mc.on("move_player", (packet) => {
       if (packet.runtime_id === currentSession.entityId && currentSession.position) {
           if (packet.position.y > currentSession.position.y) {
@@ -608,7 +615,7 @@ async function startSession(uid, interaction, isReconnect = false) {
           currentSession.position.set(packet.position.x, packet.position.y, packet.position.z);
       }
   });
-  
+
   mc.on("respawn", (packet) => {
       logToDiscord(`💀 Bot of <@${uid}> died and respawned.`);
       if (currentSession.position) {
@@ -694,7 +701,7 @@ client.on(Events.InteractionCreate, async (i) => {
       }
 
       if (i.customId === "cancel") return i.update({ content: "❌ Cancelled.", embeds: [], components: [] }).catch(() => {});
-      
+
       if (i.customId === "stop") {
         const ok = stopSession(uid);
         return safeReply(i, { ephemeral: true, content: ok ? "⏹ **Session Terminated.**" : "No active sessions." });
@@ -751,14 +758,14 @@ client.on(Events.InteractionCreate, async (i) => {
 client.on(Events.MessageCreate, async (message) => {
     if (message.author.bot) return;
     if (message.channel.id !== '1462398161074000143') return;
-    
+
     const content = message.content.toLowerCase();
     const triggerWords = ['afk', 'afkbot'];
 
     if (triggerWords.some(word => content.includes(word))) {
         try {
             const reaction = await message.react('<a:loading:1470137639339299053>');
-            
+
             setTimeout(async () => {
                 try {
                     await reaction.remove();
