@@ -31,6 +31,7 @@ admin.initializeApp({
 
 const db = admin.database();
 const sessionsRef = db.ref("sessions");
+const authRef = db.ref("auth"); // NEW: Store auth tokens in Firebase
 
 console.log("✅ Firebase Realtime Database connected");
 
@@ -63,15 +64,11 @@ const ADMIN_CHANNEL_ID = "1469013237625393163";
 
 // ----------------- Storage -----------------
 const DATA = path.join(__dirname, "data");
-const AUTH_ROOT = path.join(DATA, "auth");
 const STORE = path.join(DATA, "users.json");
 
 if (!fs.existsSync(DATA)) fs.mkdirSync(DATA);
-if (!fs.existsSync(AUTH_ROOT)) fs.mkdirSync(AUTH_ROOT, { recursive: true });
 
 let users = fs.existsSync(STORE) ? JSON.parse(fs.readFileSync(STORE, "utf8")) : {};
-
-// Local cache for active sessions from Firebase
 let activeSessionsStore = {};
 
 function save() {
@@ -114,6 +111,38 @@ async function loadSessionsFromFirebase() {
   }
 }
 
+// NEW: Firebase-based auth token storage for persistent Xbox login
+async function saveAuthToFirebase(uid, authData) {
+  try {
+    await authRef.child(uid).set({
+      ...authData,
+      savedAt: Date.now()
+    });
+    console.log(`[Firebase] Auth saved for ${uid}`);
+  } catch (e) {
+    console.error(`[Firebase] Error saving auth for ${uid}:`, e.message);
+  }
+}
+
+async function loadAuthFromFirebase(uid) {
+  try {
+    const snapshot = await authRef.child(uid).once("value");
+    return snapshot.val();
+  } catch (e) {
+    console.error(`[Firebase] Error loading auth for ${uid}:`, e.message);
+    return null;
+  }
+}
+
+async function removeAuthFromFirebase(uid) {
+  try {
+    await authRef.child(uid).remove();
+    console.log(`[Firebase] Auth removed for ${uid}`);
+  } catch (e) {
+    console.error(`[Firebase] Error removing auth for ${uid}:`, e.message);
+  }
+}
+
 function getUser(uid) {
   if (!users[uid]) users[uid] = {};
   users[uid].connectionType = "online"; 
@@ -121,14 +150,59 @@ function getUser(uid) {
   return users[uid];
 }
 
-function getUserAuthDir(uid) {
-  const dir = path.join(AUTH_ROOT, uid);
+// MODIFIED: Use Firebase for auth instead of local filesystem
+async function getUserAuthDir(uid) {
+  // Check if we have auth in Firebase
+  const authData = await loadAuthFromFirebase(uid);
+  if (authData && authData.tokens) {
+    // Create temporary directory with cached tokens
+    const dir = path.join(DATA, "auth", uid);
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+
+    // Write cached tokens to file for prismarine-auth to use
+    try {
+      fs.writeFileSync(path.join(dir, "tokens.json"), JSON.stringify(authData.tokens, null, 2));
+      if (authData.profile) {
+        fs.writeFileSync(path.join(dir, "profile.json"), JSON.stringify(authData.profile, null, 2));
+      }
+    } catch (e) {
+      console.error(`Error writing auth cache for ${uid}:`, e.message);
+    }
+    return dir;
+  }
+
+  // Fallback to empty directory
+  const dir = path.join(DATA, "auth", uid);
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
   return dir;
 }
 
-function unlinkMicrosoft(uid) {
-  const dir = getUserAuthDir(uid);
+// MODIFIED: Save auth to Firebase when linking
+async function saveAuthCache(uid, authDir) {
+  try {
+    const tokensPath = path.join(authDir, "tokens.json");
+    const profilePath = path.join(authDir, "profile.json");
+
+    let authData = { tokens: null, profile: null };
+
+    if (fs.existsSync(tokensPath)) {
+      authData.tokens = JSON.parse(fs.readFileSync(tokensPath, "utf8"));
+    }
+    if (fs.existsSync(profilePath)) {
+      authData.profile = JSON.parse(fs.readFileSync(profilePath, "utf8"));
+    }
+
+    if (authData.tokens) {
+      await saveAuthToFirebase(uid, authData);
+    }
+  } catch (e) {
+    console.error(`Error saving auth cache for ${uid}:`, e.message);
+  }
+}
+
+async function unlinkMicrosoft(uid) {
+  await removeAuthFromFirebase(uid);
+  const dir = path.join(DATA, "auth", uid);
   try { fs.rmSync(dir, { recursive: true, force: true }); } catch {}
   const u = getUser(uid);
   u.linked = false;
@@ -253,7 +327,6 @@ client.once("ready", async () => {
   console.log("🟢 Online as", client.user.tag);
   console.log("📂 Loading sessions from Firebase...");
 
-  // Load sessions from Firebase
   await loadSessionsFromFirebase();
 
   const cmds = [
@@ -289,7 +362,8 @@ client.once("ready", async () => {
 // ----------------- Microsoft link -----------------
 async function linkMicrosoft(uid, interaction) {
   if (pendingLink.has(uid)) return interaction.editReply("⏳ Login already in progress. Use the last code.");
-  const authDir = getUserAuthDir(uid);
+
+  const authDir = await getUserAuthDir(uid);
   const u = getUser(uid);
   let codeShown = false;
 
@@ -306,7 +380,12 @@ async function linkMicrosoft(uid, interaction) {
     try {
       if (!codeShown) await interaction.editReply("⏳ Requesting code…");
       await flow.getMsaToken();
-      u.linked = true; save();
+
+      // NEW: Save auth tokens to Firebase after successful login
+      await saveAuthCache(uid, authDir);
+
+      u.linked = true; 
+      save();
       await interaction.followUp({ ephemeral: true, content: "✅ Microsoft account linked!" });
     } catch (e) {
       await interaction.editReply(`❌ Login failed: ${e.message}`).catch(() => {});
@@ -329,7 +408,7 @@ function cleanupSession(uid) {
   sessions.delete(uid);
 }
 
-// MODIFIED: Stop session - removes from Firebase only on manual stop
+// FIXED: Only remove from Firebase on explicit manual stop
 async function stopSession(uid, isManual = true) {
   const s = sessions.get(uid);
 
@@ -339,6 +418,9 @@ async function stopSession(uid, isManual = true) {
     if (activeSessionsStore[uid]) {
       delete activeSessionsStore[uid];
     }
+    console.log(`[Stop] Manual stop for ${uid} - removed from Firebase`);
+  } else {
+    console.log(`[Stop] Automatic stop for ${uid} - keeping in Firebase for reconnect`);
   }
 
   if (!s) return false;
@@ -350,11 +432,12 @@ async function stopSession(uid, isManual = true) {
 async function stopAllSessions() {
   const uids = Array.from(sessions.keys());
   for (const uid of uids) {
-    await stopSession(uid, true); // Manual stop for all
+    await stopSession(uid, true);
   }
   return uids.length;
 }
 
+// FIXED: Don't remove from Firebase on auto-reconnect failure
 function handleAutoReconnect(uid) {
     const s = sessions.get(uid);
     if (!s || s.manualStop) return;
@@ -363,14 +446,17 @@ function handleAutoReconnect(uid) {
 
     s.isReconnecting = true;
     logToDiscord(`⏳ Bot of <@${uid}> disconnected. Reconnecting in 60s...`);
+    console.log(`[Reconnect] Scheduling reconnect for ${uid} in 60s`);
 
     s.reconnectTimer = setTimeout(() => {
         if (sessions.has(uid)) {
             const checkS = sessions.get(uid);
             if (!checkS.manualStop) {
+                console.log(`[Reconnect] Executing reconnect for ${uid}`);
                 checkS.reconnectTimer = null; 
                 startSession(uid, null, true); 
             } else {
+                console.log(`[Reconnect] Manual stop detected for ${uid}, cancelling reconnect`);
                 cleanupSession(uid);
             }
         }
@@ -387,19 +473,25 @@ async function safeReply(interaction, content) {
 
 // ----------------- MAIN SESSION FUNCTION -----------------
 async function startSession(uid, interaction, isReconnect = false) {
+  console.log(`[StartSession] Starting for ${uid}, isReconnect: ${isReconnect}`);
+
   const u = getUser(uid);
 
   // Save session to Firebase for persistence (only if not already there)
   if (!activeSessionsStore[uid]) {
+    console.log(`[StartSession] Saving new session to Firebase for ${uid}`);
     await saveSessionToFirebase(uid, { 
       server: u.server,
       startedAt: Date.now(),
       isReconnect: isReconnect 
     });
     activeSessionsStore[uid] = true;
+  } else {
+    console.log(`[StartSession] Session already exists in Firebase for ${uid}`);
   }
 
   if (!u.server) {
+      console.log(`[StartSession] No server configured for ${uid}`);
       if (!isReconnect && interaction) await safeReply(interaction, "⚠ Please configure your server settings first.");
       await removeSessionFromFirebase(uid);
       delete activeSessionsStore[uid];
@@ -409,6 +501,7 @@ async function startSession(uid, interaction, isReconnect = false) {
   const { ip, port } = u.server;
 
   if (sessions.has(uid) && !isReconnect) {
+      console.log(`[StartSession] Active session already exists for ${uid}`);
       if (interaction) return safeReply(interaction, "⚠️ **Session Conflict**: Active session already exists.").catch(() => {});
       return;
   }
@@ -431,13 +524,27 @@ async function startSession(uid, interaction, isReconnect = false) {
           await safeReply(interaction, { embeds: [connectionEmbed] });
       }
   } catch (err) {
+      console.error(`[StartSession] Server ${ip}:${port} unreachable for ${uid}`);
       logToDiscord(`❌ Connection failure for <@${uid}>: Server ${ip}:${port} unreachable.`);
-      if (isReconnect) handleAutoReconnect(uid); 
-      else if (interaction) await safeReply(interaction, { content: `❌ **Connection Failed**: The server at \`${ip}:${port}\` is currently offline.`, embeds: [] });
+
+      // FIXED: Don't remove from Firebase on ping failure - let it retry
+      if (isReconnect) {
+        console.log(`[StartSession] Scheduling reconnect for ${uid} after ping failure`);
+        // Create a minimal session object just for reconnect logic
+        const dummySession = { manualStop: false, isReconnecting: true };
+        sessions.set(uid, dummySession);
+        handleAutoReconnect(uid);
+      } else if (interaction) {
+        await safeReply(interaction, { content: `❌ **Connection Failed**: The server at \`${ip}:${port}\` is currently offline.`, embeds: [] });
+        // Remove from Firebase only on initial manual start failure
+        await removeSessionFromFirebase(uid);
+        delete activeSessionsStore[uid];
+      }
       return; 
   }
 
-  const authDir = getUserAuthDir(uid);
+  // MODIFIED: Get auth dir (now loads from Firebase if available)
+  const authDir = await getUserAuthDir(uid);
 
   const opts = { 
       host: ip, 
@@ -582,7 +689,6 @@ async function startSession(uid, interaction, isReconnect = false) {
           }
 
           // FIXED: Proper hand swing implementation for Bedrock Edition
-          // Using 'animate' packet with correct parameters (action_id: 1 = swing arm)
           if (s.entityId) {
               mc.queue('animate', {
                   action_id: 1,
@@ -691,11 +797,13 @@ async function startSession(uid, interaction, isReconnect = false) {
   });
 
   mc.on("error", (e) => {
+    console.error(`[Session ${uid}] Connection error:`, e.message);
     if (!currentSession.manualStop) handleAutoReconnect(uid); 
     logToDiscord(`❌ Bot of <@${uid}> error: \`${e.message}\``);
   });
 
   mc.on("close", () => {
+    console.log(`[Session ${uid}] Connection closed`);
     if (!currentSession.manualStop) handleAutoReconnect(uid);
     logToDiscord(`🔌 Bot of <@${uid}> connection closed.`);
   });
@@ -766,9 +874,10 @@ client.on(Events.InteractionCreate, async (i) => {
 
       if (i.customId === "cancel") return i.update({ content: "❌ Cancelled.", embeds: [], components: [] }).catch(() => {});
 
-      // MODIFIED: Stop button now properly removes from Firebase
+      // EXPLICIT MANUAL STOP - removes from Firebase
       if (i.customId === "stop") {
-        const ok = await stopSession(uid, true); // true = manual stop, removes from Firebase
+        console.log(`[Button] Stop pressed by ${uid}`);
+        const ok = await stopSession(uid, true); // true = manual stop
         return safeReply(i, { ephemeral: true, content: ok ? "⏹ **Session Terminated.**" : "No active sessions." });
       }
 
@@ -778,7 +887,7 @@ client.on(Events.InteractionCreate, async (i) => {
       }
 
       if (i.customId === "unlink") {
-        unlinkMicrosoft(uid);
+        await unlinkMicrosoft(uid);
         return safeReply(i, { ephemeral: true, content: "🗑 Unlinked." });
       }
 
