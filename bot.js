@@ -18,16 +18,11 @@ const { Authflow, Titles } = require("prismarine-auth");
 const fs = require("fs");
 const path = require("path");
 
-// --- Firebase Admin SDK ---
+// --- Firebase Admin SDK (Hardcoded Service Account) ---
 const admin = require("firebase-admin");
 
-// Initialize Firebase with service account from environment variable
-const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT || '{}');
-
-if (!serviceAccount.project_id) {
-  console.error("❌ FIREBASE_SERVICE_ACCOUNT environment variable missing or invalid");
-  process.exit(1);
-}
+// Service account credentials in one line
+const serviceAccount = {"type":"service_account","project_id":"blimp-d9854","private_key_id":"9e6d82c8e7ac2eee89965fd5dcbf3149d9b715aa","private_key":"-----BEGIN PRIVATE KEY-----\nMIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQCzZCs1tXtsBTx4\nGjAkVX0xDxtqvqNvbNDsItv5VgziR0iu3hpWudl+czM4pr4CEvPV05f1Tgchaltd\nxT4XQmWyGbMoZ0JJhjiQtDBQ0oG+30PpCeuXNLQC4XzjpIh/pp3hcnbF3lS3fCrE\n728rUSWAlcJfQKKGyDQHsjYRQmAnhVdo3vBATr3uuLz5lIwiOmgYi6Ju/PRcy7Jj\nttPY37MjKZyaxYAuX+sf0xPR2Yt1jztX6OQ17MPKKzRODH+mPJPV6I7zoSU7S16d\nTVgFQ/1AKriPW2KJ366WidhXqU2L9Y+/c71ohM+AgLkJ6GVbB1Mf8C5UFFyDoJxR\nNP9O8d7hAgMBAAECggEAN47ZVwv6yoygmq25pTcYy73bBuc95L91wPxW1lTRLq9X\nEllVHPD4LBJvlacGh8vo2ptqn51n1fCDlXoF7dwxdMRC2UuJmw3HrQExSYa4ii3J\ncX4SCcVXzuCY9kO5xpcKpIz3vfZKlH0PHejtrCO4kqdPCIMTEt0kSBHobtX4w6Qi\nlOmCoNxj1WoWu3ghV9aO3vpHE5Y3VzdcDgHApEatL0pO5yvvMtSTZRYmBtPeQBXq\nKt0j3xn8kW66qmJVewyd69rnqsdE1ohDsV1ODwlcAE8Sx2tZSYq8BmSNtquZM9iC\nT7RQtigxCiTwGrtrG8SfLU1Lc497tQ980xQUOStyJQKBgQDbNyq7hswH0eN3iQ/R\nzxexUIrxt1EEZ6q9X/oXX9VYRFAkm7lkYIvVXvopAs4bHI83Ds6G5/D6kDsxaZvF\n1gGBPyPcLF0TpVACgijpdWX3mJ1Spb8B2jhURO3hW2a3KoPhI/z2I0p3VUYKXFjE\n0BVlzrXP0VEwtod11CwdeTLj9wKBgQDRfkZETyw0Z/SPvxwlSyC2VUNZBeeO+RfI\nw74qd8M2qOyJZVApfeRaPpoKnkkJzpYRHY9gNxFrxgXn3KVMGnFR+XPLPQgP8t+F\nTcUMnrt8799kZI7PY6L+iNh3cWPspVrADEbVEBEMRiUfxIJy6FusL69Ucps5Keze\nXKJGJzpt5wKBgD5ehcPw6B/ZcZRS5LNW7nC+b6mx9FUCgat7oRYBaBvC4+Jmg+qx\nJVfBu/7rE2TXTU/m4I+1cfR4EL9QQseYybjSFAvSe3DZedgc3DL/+dDmFOysx5lp\nUtl2+w9BCApZCEiICrKk+8zT8CeGeqMUaOIcW9ISxbzMUeIOSbbhAr+lAoGBALRV\njek5eiT2o8ily3Wy8UrjpKDae1VQyY+SKH3oMEw6J7uyUcoVy99/ahzf2qGtivLa\nzlQVs1Jh2S2Ze1VCoe/d2zbFp84K1SysIIbXkS9gUZ3bDjAqZeHULPrMyiaoxLDz\nIHpCZVp6e3SYNW7y5A8Z0UTRjxsrIvLbLPlUxXBbAoGBAIsuT4tPFf+x+o8ftV5/\nCkdSJmO/7tLvdx0ffEnBcuJOyl+0NelCRwe2a8FkLC6WtOR8+Qb8UZpA9dNOT/Ve\ntc5WR8N8NTNkmaNQYbch3BMIO2rG1joTdnDUyisZuQUNUVbmUCb2RoUF4+VjkKzl\nXTlpeMWvJECcGJNCU8+GGewJ\n-----END PRIVATE KEY-----\n","client_email":"firebase-adminsdk-fbsvc@blimp-d9854.iam.gserviceaccount.com","client_id":"117313970377423396902","auth_uri":"https://accounts.google.com/o/oauth2/auth","token_uri":"https://oauth2.googleapis.com/token","auth_provider_x509_cert_url":"https://www.googleapis.com/oauth2/v1/certs","client_x509_cert_url":"https://www.googleapis.com/robot/v1/metadata/x509/firebase-adminsdk-fbsvc%40blimp-d9854.iam.gserviceaccount.com","universe_domain":"googleapis.com"};
 
 admin.initializeApp({
   credential: admin.credential.cert(serviceAccount),
