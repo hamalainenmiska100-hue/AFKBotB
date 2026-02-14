@@ -13,6 +13,7 @@
  * - Smart reconnection system
  * - Chunk management and bed detection
  * - Physics simulation
+ * - INSTANT RESPAWN on death
  * ============================================================================
  */
 
@@ -454,7 +455,9 @@ async function safeReply(interaction, content) {
   try {
     if (interaction.replied || interaction.deferred) await interaction.editReply(content);
     else await interaction.reply(content);
-  } catch (e) {}
+  } catch (e) {
+    console.error(`[SafeReply] Failed to send message:`, e.message);
+  }
 }
 
 // ============================================================================
@@ -463,7 +466,6 @@ async function safeReply(interaction, content) {
 
 /**
  * Input flags for player_auth_input packet
- * These represent various player input states
  */
 const InputFlags = {
   ASCEND: 0x00000001,
@@ -558,68 +560,6 @@ const ActionTypes = {
   RECEIVED_SERVER_DATA: 36,
 };
 
-/**
- * Entity event types for entity_event packet
- */
-const EntityEventTypes = {
-  HURT_ANIMATION: 2,
-  DEATH_ANIMATION: 3,
-  ARM_SWING: 4,
-  TAME_FAIL: 6,
-  TAME_SUCCESS: 7,
-  SHAKE_WET: 8,
-  USE_ITEM: 9,
-  EAT_BLOCK_ANIMATION: 10,
-  FISH_HOOK_BUBBLE: 11,
-  FISH_HOOK_POSITION: 12,
-  FISH_HOOK_HOOK: 13,
-  FISH_HOOK_LURED: 14,
-  SQUID_INK_CLOUD: 15,
-  ZOMBIE_VILLAGER_CURE: 16,
-  RESPAWN: 18,
-  IRON_GOLEM_OFFER_FLOWER: 19,
-  IRON_GOLEM_WITHDRAW_FLOWER: 20,
-  LOVE_PARTICLES: 21,
-  VILLAGER_HURT: 22,
-  VILLAGER_STOP_TRADING: 23,
-  WITCH_SPELL_PARTICLES: 24,
-  FIREWORK_PARTICLES: 25,
-  SILVERFISH_MERGE_WITH_STONE: 27,
-  GUARDIAN_ATTACK_ANIMATION: 28,
-  WITCH_DRINK_POTION: 29,
-  WITCH_THROW_POTION: 30,
-  MINECART_TNT_PRIME_FUSE: 31,
-  PLAYER_ADD_XP_LEVELS: 34,
-  ELDER_GUARDIAN_CURSE: 35,
-  AGENT_ARM_SWING: 36,
-  ENDER_DRAGON_BREATH: 37,
-  DUST_PARTICLES: 38,
-  ARROW_SHAKE: 39,
-  EATING_ITEM: 57,
-  BABY_ANIMAL_FEED: 60,
-  DEATH_SMOKE_CLOUD: 61,
-  COMPLETE_TRADE: 62,
-  REMOVE_LEASH: 63,
-  CARAVAN: 64,
-  CONSUME_TOTEM: 65,
-  CHECK_TREASURE_HUNTER_ACHIEVEMENT: 66,
-  ENTITY_SPAWN: 67,
-  DRAGON_FLAMING: 68,
-  MERGE_ITEMS: 69,
-  BALLOON_POP: 71,
-  FIND_TREASURE_BRIBE: 72,
-};
-
-/**
- * Interact action types for interact packet
- */
-const InteractActionTypes = {
-  LEAVE_VEHICLE: 3,
-  MOUSE_OVER_ENTITY: 4,
-  NPC_OPEN: 5,
-  OPEN_INVENTORY: 6,
-};
-
 // ----------------- MAIN SESSION FUNCTION -----------------
 async function startSession(uid, interaction, isReconnect = false) {
   console.log(`[StartSession] Starting for ${uid}, isReconnect: ${isReconnect}`);
@@ -653,6 +593,9 @@ async function startSession(uid, interaction, isReconnect = false) {
     return;
   }
 
+  // Store interaction reference for later updates
+  let statusMessage = null;
+  
   const connectionEmbed = new EmbedBuilder()
     .setColor("#5865F2")
     .setTitle("Bot Initialization")
@@ -669,6 +612,7 @@ async function startSession(uid, interaction, isReconnect = false) {
     if (!isReconnect && interaction) {
       connectionEmbed.setDescription(`✅ **Server found! Joining...**\n🌐 **Target:** \`${ip}:${port}\``);
       await safeReply(interaction, { embeds: [connectionEmbed] });
+      statusMessage = interaction; // Store for later update
     }
   } catch (err) {
     console.error(`[StartSession] Server ${ip}:${port} unreachable for ${uid}`);
@@ -697,7 +641,7 @@ async function startSession(uid, interaction, isReconnect = false) {
     profilesFolder: authDir,
     username: uid,
     offline: false,
-    autoInitPlayer: false, // We handle initialization manually for better control
+    autoInitPlayer: false,
     compressionLevel: 7,
     batchingInterval: 20,
   };
@@ -762,6 +706,7 @@ async function startSession(uid, interaction, isReconnect = false) {
     difficulty: 0,
     levelChunkCount: 0,
     initialized: false,
+    statusInteraction: statusMessage, // Store for Discord updates
   };
   sessions.set(uid, currentSession);
 
@@ -769,7 +714,6 @@ async function startSession(uid, interaction, isReconnect = false) {
   // PACKET EVENT HANDLERS
   // ============================================================================
 
-  // --- Connection Events ---
   mc.on("connect", () => {
     console.log(`[${uid}] Connected to server`);
   });
@@ -782,26 +726,22 @@ async function startSession(uid, interaction, isReconnect = false) {
     console.log(`[${uid}] Joined server, ready for game packets`);
   });
 
-  // --- Play Status Handler (Critical for proper initialization) ---
+  // --- Play Status Handler ---
   mc.on("play_status", (packet) => {
     console.log(`[${uid}] Play status: ${packet.status}`);
     
-    // Status 3 = player_spawn - time to initialize
     if (packet.status === "player_spawn" || packet.status === 3) {
       console.log(`[${uid}] Received player_spawn status, initializing...`);
       
-      // Send loading screen packets to fix immortal state
       mc.queue("serverbound_loading_screen", { type: 1 });
       mc.queue("serverbound_loading_screen", { type: 2 });
       
-      // Send interact packet
       mc.queue("interact", {
-        action_id: InteractActionTypes.MOUSE_OVER_ENTITY,
+        action_id: 4, // MOUSE_OVER_ENTITY
         target_entity_id: 0n,
         position: { x: 0, y: 0, z: 0 }
       });
       
-      // Send set_local_player_as_initialized
       if (currentSession.runtimeEntityId) {
         mc.queue("set_local_player_as_initialized", {
           runtime_entity_id: currentSession.runtimeEntityId
@@ -831,13 +771,8 @@ async function startSession(uid, interaction, isReconnect = false) {
       currentSession.targetPosition = currentSession.position.clone();
     }
     
-    // Send request_chunk_radius
     mc.queue("request_chunk_radius", { chunk_radius: 4 });
-    
-    // Send client_cache_status
     mc.queue("client_cache_status", { enabled: false });
-    
-    // Send tick_sync
     mc.queue("tick_sync", { request_time: BigInt(Date.now()), response_time: 0n });
   });
 
@@ -847,8 +782,24 @@ async function startSession(uid, interaction, isReconnect = false) {
     currentSession.connected = true;
     currentSession.isReconnecting = false;
     
+    // Update Discord status immediately
+    if (!isReconnect && currentSession.statusInteraction) {
+      const onlineEmbed = new EmbedBuilder()
+        .setColor("#00FF00")
+        .setTitle("🟢 Bot Online")
+        .setDescription(`Successfully connected to \`${ip}:${port}\``)
+        .setTimestamp();
+      
+      safeReply(currentSession.statusInteraction, { 
+        content: null, 
+        embeds: [onlineEmbed], 
+        components: [] 
+      }).catch(err => {
+        console.error(`[${uid}] Failed to update Discord status:`, err.message);
+      });
+    }
+    
     logToDiscord(`✅ Bot of <@${uid}> spawned on **${ip}:${port}**` + (isReconnect ? " (Auto-Rejoined)" : ""));
-    if (!isReconnect && interaction) safeReply(interaction, { content: `🟢 **Online** on \`${ip}:${port}\``, embeds: [] });
     
     // Start all AFK systems
     startAfkSystems(uid);
@@ -881,10 +832,37 @@ async function startSession(uid, interaction, isReconnect = false) {
     currentSession.tick = Number(packet.response_time);
   });
 
-  // --- Respawn Handler ---
+  // --- INSTANT RESPAWN: Set Health Handler ---
+  mc.on("set_health", (packet) => {
+    console.log(`[${uid}] Health set to ${packet.health}`);
+    
+    // INSTANT RESPAWN when health reaches 0 or below
+    if (packet.health <= 0) {
+      console.log(`[${uid}] Bot died! Respawning immediately...`);
+      logToDiscord(`💀 Bot of <@${uid}> died - respawning instantly`);
+      
+      // Send respawn action immediately
+      if (currentSession.runtimeEntityId) {
+        try {
+          mc.queue("player_action", {
+            runtime_entity_id: currentSession.runtimeEntityId,
+            action: ActionTypes.RESPAWN,
+            position: { x: 0, y: 0, z: 0 },
+            result_position: { x: 0, y: 0, z: 0 },
+            face: 0
+          });
+          console.log(`[${uid}] Respawn packet sent`);
+        } catch (e) {
+          console.error(`[${uid}] Failed to send respawn:`, e.message);
+        }
+      }
+    }
+  });
+
+  // --- Respawn Handler (Server confirms respawn) ---
   mc.on("respawn", (packet) => {
-    console.log(`[${uid}] Respawned`);
-    logToDiscord(`💀 Bot of <@${uid}> died and respawned.`);
+    console.log(`[${uid}] Server confirmed respawn`);
+    
     if (currentSession.position) {
       currentSession.position.set(packet.position.x, packet.position.y, packet.position.z);
       currentSession.targetPosition = currentSession.position.clone();
@@ -892,15 +870,20 @@ async function startSession(uid, interaction, isReconnect = false) {
       currentSession.isSleeping = false;
       currentSession.isTryingToSleep = false;
     }
+    
+    // Reset physics state
+    currentSession.isJumping = false;
+    currentSession.isSneaking = false;
+    currentSession.isSprinting = false;
+    
+    logToDiscord(`✅ Bot of <@${uid}> respawned successfully`);
   });
 
   // --- Text/Chat Handler ---
   mc.on("text", (packet) => {
-    // Auto-respond to certain messages for realism
     if (packet.source_name && packet.source_name !== mc.username) {
       const msg = packet.message.toLowerCase();
       if (msg.includes(mc.username.toLowerCase()) || msg.includes("afk")) {
-        // Small chance to respond
         if (Math.random() < 0.1) {
           setTimeout(() => {
             sendChatMessage(uid, "I'm AFK right now, be back soon!");
@@ -908,11 +891,6 @@ async function startSession(uid, interaction, isReconnect = false) {
         }
       }
     }
-  });
-
-  // --- Entity Event Handler ---
-  mc.on("entity_event", (packet) => {
-    // Handle entity events if needed
   });
 
   // --- Error Handler ---
@@ -937,83 +915,56 @@ async function startSession(uid, interaction, isReconnect = false) {
     cleanupSession(uid);
   });
 
-  // --- Packet Handler (for debugging) ---
-  mc.on("packet", (packet) => {
-    // Uncomment for debugging
-    // console.log(`[${uid}] Packet:`, packet.name);
+  // --- Change Dimension Handler ---
+  mc.on("change_dimension", (packet) => {
+    console.log(`[${uid}] Dimension change to ${packet.dimension}`);
+    currentSession.dimension = packet.dimension;
+    
+    // Send dimension change acknowledgment
+    if (currentSession.runtimeEntityId) {
+      try {
+        mc.queue("player_action", {
+          runtime_entity_id: currentSession.runtimeEntityId,
+          action: ActionTypes.DIMENSION_CHANGE_ACK,
+          position: { x: 0, y: 0, z: 0 },
+          result_position: { x: 0, y: 0, z: 0 },
+          face: 0
+        });
+      } catch (e) {}
+    }
   });
 
-  // --- Chunk Radius Update ---
+  // --- Other Handlers ---
   mc.on("chunk_radius_update", (packet) => {
     console.log(`[${uid}] Chunk radius updated to ${packet.chunk_radius}`);
   });
 
-  // --- Network Settings ---
   mc.on("network_settings", (packet) => {
     console.log(`[${uid}] Network settings received`);
   });
 
-  // --- Set Health ---
-  mc.on("set_health", (packet) => {
-    console.log(`[${uid}] Health set to ${packet.health}`);
-  });
-
-  // --- Update Attributes ---
-  mc.on("update_attributes", (packet) => {
-    // Handle attribute updates
-  });
-
-  // --- Adventure Settings ---
   mc.on("adventure_settings", (packet) => {
     console.log(`[${uid}] Adventure settings received`);
   });
 
-  // --- Set Player Game Type ---
   mc.on("set_player_game_type", (packet) => {
     currentSession.gameMode = packet.gamemode;
     console.log(`[${uid}] Game mode changed to ${packet.gamemode}`);
   });
 
-  // --- Change Dimension ---
-  mc.on("change_dimension", (packet) => {
-    console.log(`[${uid}] Dimension change to ${packet.dimension}`);
-    currentSession.dimension = packet.dimension;
-  });
-
-  // --- Set Difficulty ---
   mc.on("set_difficulty", (packet) => {
     currentSession.difficulty = packet.difficulty;
   });
 
-  // --- Set Spawn Position ---
   mc.on("set_spawn_position", (packet) => {
     currentSession.spawnPosition = packet.spawn_position;
   });
 
-  // --- Container Open ---
   mc.on("container_open", (packet) => {
-    // Close container immediately for AFK
     mc.queue("container_close", { window_id: packet.window_id });
   });
 
-  // --- Mob Effect ---
-  mc.on("mob_effect", (packet) => {
-    // Handle mob effects
-  });
-
-  // --- Level Event ---
-  mc.on("level_event", (packet) => {
-    // Handle level events
-  });
-
-  // --- Level Sound Event ---
-  mc.on("level_sound_event", (packet) => {
-    // Handle sound events
-  });
-
-  // --- Correct Player Move Prediction ---
   mc.on("correct_player_move_prediction", (packet) => {
-    // Apply correction
     if (currentSession.position) {
       currentSession.position.set(packet.position.x, packet.position.y, packet.position.z);
       currentSession.yaw = packet.yaw;
@@ -1022,280 +973,33 @@ async function startSession(uid, interaction, isReconnect = false) {
     }
   });
 
-  // --- Motion Prediction Hints ---
-  mc.on("motion_prediction_hints", (packet) => {
-    // Handle motion hints
-  });
-
-  // --- Player Fog ---
-  mc.on("player_fog", (packet) => {
-    // Handle fog
-  });
-
-  // --- Camera Shake ---
-  mc.on("camera_shake", (packet) => {
-    // Handle camera shake
-  });
-
-  // --- Animate Entity ---
-  mc.on("animate_entity", (packet) => {
-    // Handle entity animation
-  });
-
-  // --- NPC Dialogue ---
   mc.on("npc_dialogue", (packet) => {
-    // Close NPC dialogue
     mc.queue("npc_dialogue", { 
       npc_runtime_entity_id: packet.npc_runtime_entity_id,
-      action_type: 0 // Close
+      action_type: 0
     });
   });
 
-  // --- Modal Form Request ---
   mc.on("modal_form_request", (packet) => {
-    // Close forms immediately for AFK
     mc.queue("modal_form_response", {
       form_id: packet.form_id,
       data: null
     });
   });
 
-  // --- Server Settings Request ---
   mc.on("server_settings_request", (packet) => {
-    mc.queue("server_settings_response", {
-      settings: ""
-    });
+    mc.queue("server_settings_response", { settings: "" });
   });
 
-  // --- Emote List ---
-  mc.on("emote_list", (packet) => {
-    // Store available emotes
-  });
-
-  // --- Update Player Game Type ---
-  mc.on("update_player_game_type", (packet) => {
-    if (packet.player_unique_id === currentSession.runtimeEntityId) {
-      currentSession.gameMode = packet.gamemode;
-    }
-  });
-
-  // --- Item Stack Response ---
-  mc.on("item_stack_response", (packet) => {
-    // Handle item stack responses
-  });
-
-  // --- Player Armor Damage ---
-  mc.on("player_armor_damage", (packet) => {
-    // Handle armor damage
-  });
-
-  // --- Code Builder ---
-  mc.on("code_builder", (packet) => {
-    // Handle code builder
-  });
-
-  // --- Simulation Type ---
-  mc.on("simulation_type", (packet) => {
-    // Handle simulation type
-  });
-
-  // --- Simple Event ---
-  mc.on("simple_event", (packet) => {
-    // Handle simple events
-  });
-
-  // --- Event ---
-  mc.on("event", (packet) => {
-    // Handle events
-  });
-
-  // --- Boss Event ---
-  mc.on("boss_event", (packet) => {
-    // Handle boss events
-  });
-
-  // --- Show Credits ---
-  mc.on("show_credits", (packet) => {
-    // Handle credits
-  });
-
-  // --- Available Commands ---
-  mc.on("available_commands", (packet) => {
-    // Store available commands
-  });
-
-  // --- Command Request ---
-  mc.on("command_request", (packet) => {
-    // Handle command requests
-  });
-
-  // --- Command Block Update ---
-  mc.on("command_block_update", (packet) => {
-    // Handle command block updates
-  });
-
-  // --- Available Commands ---
-  mc.on("available_commands", (packet) => {
-    // Store commands
-  });
-
-  // --- Update Soft Enum ---
-  mc.on("update_soft_enum", (packet) => {
-    // Handle soft enum updates
-  });
-
-  // --- Network Stack Latency ---
   mc.on("network_stack_latency", (packet) => {
-    // Respond to latency
     mc.queue("network_stack_latency", {
       timestamp: packet.timestamp,
       needs_response: false
     });
   });
 
-  // --- Script Custom Event ---
-  mc.on("script_custom_event", (packet) => {
-    // Handle script events
-  });
-
-  // --- Spawn Particle Effect ---
-  mc.on("spawn_particle_effect", (packet) => {
-    // Handle particle effects
-  });
-
-  // --- Available Entity Identifiers ---
-  mc.on("available_entity_identifiers", (packet) => {
-    // Store entity identifiers
-  });
-
-  // --- Level Sound Event V2 ---
-  mc.on("level_sound_event_v2", (packet) => {
-    // Handle sound events v2
-  });
-
-  // --- Network Chunk Publisher Update ---
-  mc.on("network_chunk_publisher_update", (packet) => {
-    // Handle chunk publisher updates
-  });
-
-  // --- Biome Definition List ---
-  mc.on("biome_definition_list", (packet) => {
-    // Store biome definitions
-  });
-
-  // --- Level Event Generic ---
-  mc.on("level_event_generic", (packet) => {
-    // Handle generic level events
-  });
-
-  // --- Lectern Update ---
-  mc.on("lectern_update", (packet) => {
-    // Handle lectern updates
-  });
-
-  // --- Video Stream Connect ---
-  mc.on("video_stream_connect", (packet) => {
-    // Handle video stream
-  });
-
-  // --- On Screen Texture Animation ---
-  mc.on("on_screen_texture_animation", (packet) => {
-    // Handle texture animations
-  });
-
-  // --- Map Create Locked Copy ---
-  mc.on("map_create_locked_copy", (packet) => {
-    // Handle map locked copies
-  });
-
-  // --- Structure Template Data Export Response ---
-  mc.on("structure_template_data_export_response", (packet) => {
-    // Handle structure exports
-  });
-
-  // --- Update Block Properties ---
-  mc.on("update_block_properties", (packet) => {
-    // Handle block property updates
-  });
-
-  // --- Client Cache Miss Response ---
-  mc.on("client_cache_miss_response", (packet) => {
-    // Handle cache misses
-  });
-
-  // --- Education Settings ---
-  mc.on("education_settings", (packet) => {
-    // Handle education settings
-  });
-
-  // --- Multiplayer Settings ---
-  mc.on("multiplayer_settings", (packet) => {
-    // Handle multiplayer settings
-  });
-
-  // --- Settings Command ---
-  mc.on("settings_command", (packet) => {
-    // Handle settings commands
-  });
-
-  // --- Anvil Damage ---
-  mc.on("anvil_damage", (packet) => {
-    // Handle anvil damage
-  });
-
-  // --- Completed Using Item ---
-  mc.on("completed_using_item", (packet) => {
-    // Handle item completion
-  });
-
-  // --- Filter Text Packet ---
-  mc.on("filter_text_packet", (packet) => {
-    // Handle filter text
-  });
-
-  // --- Debug Renderer ---
-  mc.on("debug_renderer", (packet) => {
-    // Handle debug renderer
-  });
-
-  // --- Sync Entity Property ---
-  mc.on("sync_entity_property", (packet) => {
-    // Handle entity property sync
-  });
-
-  // --- Add Volume Entity ---
-  mc.on("add_volume_entity", (packet) => {
-    // Handle volume entity addition
-  });
-
-  // --- Remove Volume Entity ---
-  mc.on("remove_volume_entity", (packet) => {
-    // Handle volume entity removal
-  });
-
-  // --- Position Tracking DB Broadcast ---
-  mc.on("position_tracking_db_broadcast", (packet) => {
-    // Handle position tracking
-  });
-
-  // --- Debug Info ---
-  mc.on("debug_info", (packet) => {
-    // Handle debug info
-  });
-
-  // --- Packet Violation Warning ---
   mc.on("packet_violation_warning", (packet) => {
     console.warn(`[${uid}] Packet violation: ${packet.violation_type}`);
-  });
-
-  // --- Item Component ---
-  mc.on("item_component", (packet) => {
-    // Handle item components
-  });
-
-  // --- Emote ---
-  mc.on("emote", (packet) => {
-    // Handle emotes from other players
   });
 }
 
@@ -1307,7 +1011,6 @@ function startAfkSystems(uid) {
   const s = sessions.get(uid);
   if (!s) return;
 
-  // Initialize chunk system
   if (advancedFeaturesEnabled && PrismarineChunk && PrismarineRegistry) {
     try {
       s.registry = PrismarineRegistry('bedrock_1.21.0');
@@ -1317,7 +1020,6 @@ function startAfkSystems(uid) {
     }
   }
 
-  // Start all AFK loops
   startMovementLoop(uid);
   startAnimationLoop(uid);
   startActionLoop(uid);
@@ -1329,8 +1031,7 @@ function startAfkSystems(uid) {
 }
 
 /**
- * Movement Loop - Sends player_auth_input packets for realistic movement
- * This is the primary movement packet for server-authoritative movement
+ * Movement Loop - Sends player_auth_input packets
  */
 function startMovementLoop(uid) {
   const s = sessions.get(uid);
@@ -1339,10 +1040,8 @@ function startMovementLoop(uid) {
   s.movementLoop = setInterval(() => {
     if (!s.connected || !s.position || !s.initialized) return;
 
-    // Increment tick
     s.tick++;
 
-    // Calculate input data flags
     let inputData = 0n;
     
     if (s.isJumping) inputData |= InputFlags.JUMPING;
@@ -1350,7 +1049,6 @@ function startMovementLoop(uid) {
     if (s.isSprinting) inputData |= InputFlags.SPRINTING;
     if (s.onGround) inputData |= InputFlags.VERTICAL_COLLISION;
     
-    // Movement direction
     if (s.moveVector.x !== 0 || s.moveVector.z !== 0) {
       if (s.moveVector.z < 0) inputData |= InputFlags.UP;
       if (s.moveVector.z > 0) inputData |= InputFlags.DOWN;
@@ -1358,14 +1056,12 @@ function startMovementLoop(uid) {
       if (s.moveVector.x > 0) inputData |= InputFlags.RIGHT;
     }
 
-    // Calculate delta
     const delta = s.velocity ? {
       x: s.velocity.x,
       y: s.velocity.y,
       z: s.velocity.z
     } : { x: 0, y: 0, z: 0 };
 
-    // Send player_auth_input packet
     try {
       s.client.queue("player_auth_input", {
         pitch: s.pitch,
@@ -1378,26 +1074,20 @@ function startMovementLoop(uid) {
         move_vector: s.moveVector,
         head_yaw: s.headYaw,
         input_data: inputData,
-        input_mode: 1, // mouse
-        play_mode: 0, // normal
-        interaction_model: 1, // crosshair
+        input_mode: 1,
+        play_mode: 0,
+        interaction_model: 1,
         tick: BigInt(s.tick),
         delta: delta,
         analog_move_vector: s.analogMoveVector
       });
-    } catch (e) {
-      // Ignore errors
-    }
+    } catch (e) {}
 
-    // Apply physics
     applyPhysics(uid);
 
-  }, 50); // 20 ticks per second
+  }, 50);
 }
 
-/**
- * Apply simple physics
- */
 function applyPhysics(uid) {
   const s = sessions.get(uid);
   if (!s || !s.velocity || !s.position) return;
@@ -1405,7 +1095,6 @@ function applyPhysics(uid) {
   const gravity = 0.08;
   const friction = 0.91;
 
-  // Apply gravity
   if (!s.onGround) {
     s.velocity.y -= gravity;
     if (s.velocity.y < -3.92) s.velocity.y = -3.92;
@@ -1413,8 +1102,7 @@ function applyPhysics(uid) {
     s.velocity.y = 0;
   }
 
-  // Apply movement
-  if (s.isWalking && s.moveVector.x !== 0 || s.moveVector.z !== 0) {
+  if (s.isWalking && (s.moveVector.x !== 0 || s.moveVector.z !== 0)) {
     const speed = s.isSprinting ? 0.28 : 0.22;
     s.velocity.x = s.moveVector.x * speed;
     s.velocity.z = s.moveVector.z * speed;
@@ -1423,19 +1111,14 @@ function applyPhysics(uid) {
     s.velocity.z *= friction;
   }
 
-  // Update position
   s.position.add(s.velocity);
 
-  // Void check
   if (s.position.y < -64) {
     s.position.y = 320;
     s.velocity.y = 0;
   }
 }
 
-/**
- * Animation Loop - Sends animate packets for arm swinging
- */
 function startAnimationLoop(uid) {
   const s = sessions.get(uid);
   if (!s) return;
@@ -1445,7 +1128,6 @@ function startAnimationLoop(uid) {
 
     const now = Date.now();
     
-    // Swing arm randomly (every 3-8 seconds)
     if (now - s.lastSwingTime > 3000 + Math.random() * 5000) {
       swingArm(uid);
       s.lastSwingTime = now;
@@ -1454,9 +1136,6 @@ function startAnimationLoop(uid) {
   }, 1000);
 }
 
-/**
- * Action Loop - Sends player_action packets for various actions
- */
 function startActionLoop(uid) {
   const s = sessions.get(uid);
   if (!s) return;
@@ -1467,7 +1146,6 @@ function startActionLoop(uid) {
     const now = Date.now();
     const actions = [];
 
-    // Random jump (every 5-15 seconds)
     if (now - s.lastJumpTime > 5000 + Math.random() * 10000) {
       actions.push(ActionTypes.JUMP);
       s.lastJumpTime = now;
@@ -1476,7 +1154,6 @@ function startActionLoop(uid) {
       setTimeout(() => { s.isJumping = false; }, 500);
     }
 
-    // Random sneak toggle (every 10-30 seconds)
     if (now - s.lastSneakTime > 10000 + Math.random() * 20000) {
       if (s.isSneaking) {
         actions.push(ActionTypes.STOP_SNEAK);
@@ -1488,7 +1165,6 @@ function startActionLoop(uid) {
       s.lastSneakTime = now;
     }
 
-    // Random sprint toggle (every 15-45 seconds)
     if (now - s.lastSprintTime > 15000 + Math.random() * 30000) {
       if (s.isSprinting) {
         actions.push(ActionTypes.STOP_SPRINT);
@@ -1500,7 +1176,6 @@ function startActionLoop(uid) {
       s.lastSprintTime = now;
     }
 
-    // Send actions
     actions.forEach(action => {
       sendPlayerAction(uid, action);
     });
@@ -1508,9 +1183,6 @@ function startActionLoop(uid) {
   }, 1000);
 }
 
-/**
- * Tick Sync Loop - Keeps connection alive
- */
 function startTickSyncLoop(uid) {
   const s = sessions.get(uid);
   if (!s) return;
@@ -1528,9 +1200,6 @@ function startTickSyncLoop(uid) {
   }, 1000);
 }
 
-/**
- * Chunk GC Loop - Cleans up old chunks
- */
 function startChunkGCLoop(uid) {
   const s = sessions.get(uid);
   if (!s) return;
@@ -1542,9 +1211,6 @@ function startChunkGCLoop(uid) {
   }, 30000);
 }
 
-/**
- * Anti-AFK Loop - Main AFK behavior controller
- */
 function startAntiAfkLoop(uid) {
   const s = sessions.get(uid);
   if (!s) return;
@@ -1557,25 +1223,20 @@ function startAntiAfkLoop(uid) {
       return;
     }
 
-    // Scan for bed and try to sleep
     scanForBedAndSleep(uid);
 
-    // Random rotation
     if (Math.random() > 0.3) {
       session.yaw += (Math.random() - 0.5) * 30;
       session.pitch += (Math.random() - 0.5) * 15;
-      // Clamp pitch
       session.pitch = Math.max(-90, Math.min(90, session.pitch));
     }
 
-    // Random movement
     if (Math.random() > 0.5) {
       session.isWalking = true;
       const angle = Math.random() * Math.PI * 2;
       session.moveVector.x = Math.sin(angle);
       session.moveVector.z = Math.cos(angle);
       
-      // Stop after random time
       setTimeout(() => {
         if (sessions.has(uid)) {
           const s2 = sessions.get(uid);
@@ -1586,18 +1247,15 @@ function startAntiAfkLoop(uid) {
       }, 500 + Math.random() * 1500);
     }
 
-    // Random emote
     if (Math.random() > 0.95) {
       sendEmote(uid);
     }
 
-    // Random chat message
     if (Math.random() > 0.98) {
       const messages = ["brb", "afk", "back soon", "...", "lol"];
       sendChatMessage(uid, messages[Math.floor(Math.random() * messages.length)]);
     }
 
-    // Schedule next action
     const nextDelay = 2000 + Math.random() * 6000;
     session.afkTimeout = setTimeout(performAntiAfk, nextDelay);
   };
@@ -1609,9 +1267,6 @@ function startAntiAfkLoop(uid) {
 // PACKET SENDER FUNCTIONS
 // ============================================================================
 
-/**
- * Send player_action packet
- */
 function sendPlayerAction(uid, action, position = { x: 0, y: 0, z: 0 }, face = 0) {
   const s = sessions.get(uid);
   if (!s || !s.connected || !s.runtimeEntityId) return;
@@ -1627,62 +1282,24 @@ function sendPlayerAction(uid, action, position = { x: 0, y: 0, z: 0 }, face = 0
   } catch (e) {}
 }
 
-/**
- * Send animate packet (arm swing)
- */
 function swingArm(uid) {
   const s = sessions.get(uid);
   if (!s || !s.connected || !s.runtimeEntityId) return;
 
   try {
     s.client.queue("animate", {
-      action_id: 1, // swing arm
+      action_id: 1,
       runtime_entity_id: s.runtimeEntityId
     });
   } catch (e) {}
 }
 
-/**
- * Send entity_event packet
- */
-function sendEntityEvent(uid, eventType) {
-  const s = sessions.get(uid);
-  if (!s || !s.connected || !s.runtimeEntityId) return;
-
-  try {
-    s.client.queue("entity_event", {
-      runtime_entity_id: s.runtimeEntityId,
-      event_id: eventType,
-      data: 0
-    });
-  } catch (e) {}
-}
-
-/**
- * Send interact packet
- */
-function sendInteract(uid, actionId, targetEntityId = 0n, position = { x: 0, y: 0, z: 0 }) {
-  const s = sessions.get(uid);
-  if (!s || !s.connected) return;
-
-  try {
-    s.client.queue("interact", {
-      action_id: actionId,
-      target_entity_id: targetEntityId,
-      position: position
-    });
-  } catch (e) {}
-}
-
-/**
- * Send text/chat packet
- */
 function sendChatMessage(uid, message) {
   const s = sessions.get(uid);
   if (!s || !s.connected) return;
 
   const now = Date.now();
-  if (now - s.lastChatTime < 5000) return; // Rate limit
+  if (now - s.lastChatTime < 5000) return;
   s.lastChatTime = now;
 
   try {
@@ -1698,15 +1315,12 @@ function sendChatMessage(uid, message) {
   } catch (e) {}
 }
 
-/**
- * Send emote packet
- */
 function sendEmote(uid) {
   const s = sessions.get(uid);
   if (!s || !s.connected) return;
 
   const now = Date.now();
-  if (now - s.lastEmoteTime < 10000) return; // Rate limit
+  if (now - s.lastEmoteTime < 10000) return;
   s.lastEmoteTime = now;
 
   const emotes = [
@@ -1720,27 +1334,6 @@ function sendEmote(uid) {
       runtime_entity_id: s.runtimeEntityId,
       emote_id: emotes[Math.floor(Math.random() * emotes.length)],
       flags: 0
-    });
-  } catch (e) {}
-}
-
-/**
- * Send command request
- */
-function sendCommand(uid, command) {
-  const s = sessions.get(uid);
-  if (!s || !s.connected) return;
-
-  try {
-    s.client.queue("command_request", {
-      command: command,
-      origin: {
-        type: 0, // player
-        uuid: "",
-        request_id: "",
-        player_entity_id: s.runtimeEntityId || 0
-      },
-      internal: false
     });
   } catch (e) {}
 }
@@ -1772,11 +1365,9 @@ function scanForBedAndSleep(uid) {
               s.bedPosition = checkPos;
               s.isTryingToSleep = true;
 
-              // Move to bed
               s.targetPosition = new Vec3(checkPos.x + 0.5, checkPos.y, checkPos.z + 0.5);
               s.isWalking = true;
 
-              // Try to sleep after reaching bed
               setTimeout(() => {
                 if (sessions.has(uid)) {
                   const s2 = sessions.get(uid);
@@ -1784,11 +1375,9 @@ function scanForBedAndSleep(uid) {
                   s2.moveVector.x = 0;
                   s2.moveVector.z = 0;
 
-                  // Send start sleeping action
                   sendPlayerAction(uid, ActionTypes.START_SLEEPING, checkPos);
                   s2.isSleeping = true;
 
-                  // Wake up after random time
                   setTimeout(() => {
                     if (sessions.has(uid)) {
                       const s3 = sessions.get(uid);
