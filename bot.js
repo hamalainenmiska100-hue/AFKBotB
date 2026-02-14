@@ -14,6 +14,7 @@
  * - Chunk management and bed detection
  * - Physics simulation
  * - INSTANT RESPAWN on death
+ * - ORE SCANNER (5-15 chunks radius)
  * ============================================================================
  */
 
@@ -29,7 +30,8 @@ const {
   TextInputBuilder,
   TextInputStyle,
   StringSelectMenuBuilder,
-  EmbedBuilder
+  EmbedBuilder,
+  Partials
 } = require("discord.js");
 
 const bedrock = require("bedrock-protocol");
@@ -224,13 +226,16 @@ const lastMsa = new Map();
 let lastAdminMessage = null;
 
 // ----------------- Discord client -----------------
+// 🔥 KORJAUS: Lisätty GuildMembers intent ja Partials jotta botti näkyy member listassa!
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMembers,  // ⬅️ TÄMÄ LISÄTTY! Näkyy member listassa ja saa welcome-viestin
     GatewayIntentBits.DirectMessages,
     GatewayIntentBits.GuildMessages,
     GatewayIntentBits.MessageContent
-  ]
+  ],
+  partials: [Partials.Channel, Partials.Message] // Lisätty varmuuden vuoksi DM-tukea varten
 });
 
 // ==========================================================
@@ -272,6 +277,10 @@ function panelRow(isJava = false) {
         new ButtonBuilder().setCustomId(startCustomId).setLabel("▶ Start").setStyle(ButtonStyle.Success),
         new ButtonBuilder().setCustomId("stop").setLabel("⏹ Stop").setStyle(ButtonStyle.Danger),
         new ButtonBuilder().setCustomId("settings").setLabel("⚙ Settings").setStyle(ButtonStyle.Secondary)
+      ),
+      new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId("scan_ores").setLabel("⛏️ Scan Ores").setStyle(ButtonStyle.Primary),
+        new ButtonBuilder().setCustomId("scan_beds").setLabel("🛏️ Find Bed").setStyle(ButtonStyle.Secondary)
       )
     ]
   };
@@ -355,6 +364,14 @@ client.once("ready", async () => {
     }
   } else {
     console.log("⚪ No previous sessions found.");
+  }
+});
+
+// 🔥 KORJAUS: Welcome-viesti kun botti liittyy uudelle palvelimelle (jos tarvitset)
+client.on(Events.GuildMemberAdd, async (member) => {
+  if (member.user.id === client.user.id) {
+    console.log(`✅ Bot joined server: ${member.guild.name}`);
+    // Bot näkyy nyt member listassa tämän eventin myötä!
   }
 });
 
@@ -458,6 +475,113 @@ async function safeReply(interaction, content) {
   } catch (e) {
     console.error(`[SafeReply] Failed to send message:`, e.message);
   }
+}
+
+async function safeFollowUp(interaction, content) {
+  if (!interaction) return;
+  try {
+    if (interaction.replied || interaction.deferred) {
+      await interaction.followUp(content);
+    } else {
+      await interaction.reply(content);
+    }
+  } catch (e) {
+    console.error(`[SafeFollowUp] Failed:`, e.message);
+  }
+}
+
+// ============================================================================
+// ORE SCANNER SYSTEM
+// ============================================================================
+
+const ORE_BLOCKS = [
+  'diamond_ore', 'deepslate_diamond_ore',
+  'iron_ore', 'deepslate_iron_ore',
+  'gold_ore', 'deepslate_gold_ore',
+  'emerald_ore', 'deepslate_emerald_ore',
+  'redstone_ore', 'deepslate_redstone_ore',
+  'lapis_ore', 'deepslate_lapis_ore',
+  'coal_ore', 'deepslate_coal_ore',
+  'copper_ore', 'deepslate_copper_ore',
+  'ancient_debris',
+  'nether_quartz_ore', 'nether_gold_ore'
+];
+
+async function scanForOres(uid, radius = 8) {
+  const s = sessions.get(uid);
+  if (!s) return { error: "No active session" };
+  if (!s.connected) return { error: "Bot not connected" };
+  if (!advancedFeaturesEnabled || !s.chunks) return { error: "Advanced features not available" };
+  
+  const foundOres = [];
+  const playerPos = s.position ? s.position.floored() : { x: 0, y: 64, z: 0 };
+  const searchRadius = Math.min(Math.max(radius, 1), 15);
+  
+  console.log(`[${uid}] Scanning ${searchRadius} chunks radius for ores...`);
+  
+  const playerChunkX = Math.floor(playerPos.x / 16);
+  const playerChunkZ = Math.floor(playerPos.z / 16);
+  
+  let chunksScanned = 0;
+  let blocksChecked = 0;
+  
+  for (let cx = -searchRadius; cx <= searchRadius; cx++) {
+    for (let cz = -searchRadius; cz <= searchRadius; cz++) {
+      const chunkKey = `${playerChunkX + cx},${playerChunkZ + cz}`;
+      const chunk = s.chunks.get(chunkKey);
+      
+      if (chunk) {
+        chunksScanned++;
+        for (let x = 0; x < 16; x++) {
+          for (let z = 0; z < 16; z++) {
+            for (let y = -64; y < 320; y++) {
+              blocksChecked++;
+              try {
+                const block = chunk.getBlock({ x, y, z });
+                if (block && block.name && ORE_BLOCKS.includes(block.name)) {
+                  const worldX = (playerChunkX + cx) * 16 + x;
+                  const worldZ = (playerChunkZ + cz) * 16 + z;
+                  
+                  foundOres.push({
+                    type: block.name,
+                    x: worldX,
+                    y: y,
+                    z: worldZ,
+                    distance: Math.sqrt(
+                      Math.pow(worldX - playerPos.x, 2) + 
+                      Math.pow(y - playerPos.y, 2) + 
+                      Math.pow(worldZ - playerPos.z, 2)
+                    )
+                  });
+                }
+              } catch (e) {}
+            }
+          }
+        }
+      }
+    }
+  }
+  
+  foundOres.sort((a, b) => a.distance - b.distance);
+  
+  const uniqueOres = [];
+  const seen = new Set();
+  for (const ore of foundOres) {
+    const key = `${ore.x},${ore.y},${ore.z}`;
+    if (!seen.has(key)) {
+      seen.add(key);
+      uniqueOres.push(ore);
+    }
+  }
+  
+  console.log(`[${uid}] Scanned ${chunksScanned} chunks, checked ${blocksChecked} blocks, found ${uniqueOres.length} ores`);
+  
+  return {
+    ores: uniqueOres.slice(0, 20),
+    totalFound: uniqueOres.length,
+    chunksScanned: chunksScanned,
+    playerPos: playerPos
+  };
 }
 
 // ============================================================================
@@ -593,8 +717,8 @@ async function startSession(uid, interaction, isReconnect = false) {
     return;
   }
 
-  // Store interaction reference for later updates
-  let statusMessage = null;
+  let statusInteraction = interaction;
+  let initialMessageSent = false;
   
   const connectionEmbed = new EmbedBuilder()
     .setColor("#5865F2")
@@ -605,14 +729,14 @@ async function startSession(uid, interaction, isReconnect = false) {
     if (!isReconnect && interaction) {
       connectionEmbed.setDescription(`🔍 **Pinging server...**\n🌐 **Target:** \`${ip}:${port}\``);
       await safeReply(interaction, { embeds: [connectionEmbed], content: null, components: [] });
+      initialMessageSent = true;
     }
 
     await bedrock.ping({ host: ip, port: parseInt(port) || 19132, timeout: 5000 });
 
     if (!isReconnect && interaction) {
-      connectionEmbed.setDescription(`✅ **Server found! Joining...**\n🌐 **Target:** \`${ip}:${port}\``);
+      connectionEmbed.setDescription(`✅ **Server found! Connecting...**\n🌐 **Target:** \`${ip}:${port}\``);
       await safeReply(interaction, { embeds: [connectionEmbed] });
-      statusMessage = interaction; // Store for later update
     }
   } catch (err) {
     console.error(`[StartSession] Server ${ip}:${port} unreachable for ${uid}`);
@@ -637,7 +761,7 @@ async function startSession(uid, interaction, isReconnect = false) {
     port: parseInt(port),
     connectTimeout: 60000,
     keepAlive: true,
-    viewDistance: 4,
+    viewDistance: 10,
     profilesFolder: authDir,
     username: uid,
     offline: false,
@@ -706,7 +830,10 @@ async function startSession(uid, interaction, isReconnect = false) {
     difficulty: 0,
     levelChunkCount: 0,
     initialized: false,
-    statusInteraction: statusMessage, // Store for Discord updates
+    statusInteraction: statusInteraction,
+    isReconnect: isReconnect,
+    serverIp: ip,
+    serverPort: port
   };
   sessions.set(uid, currentSession);
 
@@ -737,7 +864,7 @@ async function startSession(uid, interaction, isReconnect = false) {
       mc.queue("serverbound_loading_screen", { type: 2 });
       
       mc.queue("interact", {
-        action_id: 4, // MOUSE_OVER_ENTITY
+        action_id: 4,
         target_entity_id: 0n,
         position: { x: 0, y: 0, z: 0 }
       });
@@ -771,7 +898,7 @@ async function startSession(uid, interaction, isReconnect = false) {
       currentSession.targetPosition = currentSession.position.clone();
     }
     
-    mc.queue("request_chunk_radius", { chunk_radius: 4 });
+    mc.queue("request_chunk_radius", { chunk_radius: 10 });
     mc.queue("client_cache_status", { enabled: false });
     mc.queue("tick_sync", { request_time: BigInt(Date.now()), response_time: 0n });
   });
@@ -782,26 +909,45 @@ async function startSession(uid, interaction, isReconnect = false) {
     currentSession.connected = true;
     currentSession.isReconnecting = false;
     
-    // Update Discord status immediately
-    if (!isReconnect && currentSession.statusInteraction) {
-      const onlineEmbed = new EmbedBuilder()
-        .setColor("#00FF00")
-        .setTitle("🟢 Bot Online")
-        .setDescription(`Successfully connected to \`${ip}:${port}\``)
-        .setTimestamp();
-      
+    const onlineEmbed = new EmbedBuilder()
+      .setColor("#00FF00")
+      .setTitle("🟢 Bot Online")
+      .setDescription(`Successfully connected and spawned in the server!`)
+      .addFields(
+        { name: "Server", value: `\`${currentSession.serverIp}:${currentSession.serverPort}\``, inline: true },
+        { name: "Mode", value: currentSession.isReconnect ? "🔄 Auto-Reconnect" : "🚀 Fresh Start", inline: true },
+        { name: "Position", value: currentSession.position ? 
+          `X: ${Math.floor(currentSession.position.x)}, Y: ${Math.floor(currentSession.position.y)}, Z: ${Math.floor(currentSession.position.z)}` : 
+          "Loading...", inline: false }
+      )
+      .setTimestamp();
+    
+    if (currentSession.statusInteraction) {
       safeReply(currentSession.statusInteraction, { 
         content: null, 
         embeds: [onlineEmbed], 
         components: [] 
+      }).then(() => {
+        console.log(`[${uid}] Discord status updated to ONLINE`);
       }).catch(err => {
-        console.error(`[${uid}] Failed to update Discord status:`, err.message);
+        console.error(`[${uid}] Failed to edit original message:`, err.message);
+        safeFollowUp(currentSession.statusInteraction, {
+          embeds: [onlineEmbed],
+          ephemeral: true
+        });
       });
+    }
+    
+    if (currentSession.isReconnect) {
+      client.users.fetch(uid).then(user => {
+        user.send({ 
+          embeds: [onlineEmbed.setDescription("Your AFK bot has automatically reconnected to the server!")] 
+        }).catch(() => {});
+      }).catch(() => {});
     }
     
     logToDiscord(`✅ Bot of <@${uid}> spawned on **${ip}:${port}**` + (isReconnect ? " (Auto-Rejoined)" : ""));
     
-    // Start all AFK systems
     startAfkSystems(uid);
   });
 
@@ -836,12 +982,10 @@ async function startSession(uid, interaction, isReconnect = false) {
   mc.on("set_health", (packet) => {
     console.log(`[${uid}] Health set to ${packet.health}`);
     
-    // INSTANT RESPAWN when health reaches 0 or below
     if (packet.health <= 0) {
       console.log(`[${uid}] Bot died! Respawning immediately...`);
       logToDiscord(`💀 Bot of <@${uid}> died - respawning instantly`);
       
-      // Send respawn action immediately
       if (currentSession.runtimeEntityId) {
         try {
           mc.queue("player_action", {
@@ -859,7 +1003,7 @@ async function startSession(uid, interaction, isReconnect = false) {
     }
   });
 
-  // --- Respawn Handler (Server confirms respawn) ---
+  // --- Respawn Handler ---
   mc.on("respawn", (packet) => {
     console.log(`[${uid}] Server confirmed respawn`);
     
@@ -871,7 +1015,6 @@ async function startSession(uid, interaction, isReconnect = false) {
       currentSession.isTryingToSleep = false;
     }
     
-    // Reset physics state
     currentSession.isJumping = false;
     currentSession.isSneaking = false;
     currentSession.isSprinting = false;
@@ -920,7 +1063,6 @@ async function startSession(uid, interaction, isReconnect = false) {
     console.log(`[${uid}] Dimension change to ${packet.dimension}`);
     currentSession.dimension = packet.dimension;
     
-    // Send dimension change acknowledgment
     if (currentSession.runtimeEntityId) {
       try {
         mc.queue("player_action", {
@@ -1004,7 +1146,7 @@ async function startSession(uid, interaction, isReconnect = false) {
 }
 
 // ============================================================================
-// AFK SYSTEMS - ALL BEDROCK-PROTOCOL FEATURES
+// AFK SYSTEMS
 // ============================================================================
 
 function startAfkSystems(uid) {
@@ -1030,9 +1172,6 @@ function startAfkSystems(uid) {
   console.log(`[${uid}] All AFK systems started`);
 }
 
-/**
- * Movement Loop - Sends player_auth_input packets
- */
 function startMovementLoop(uid) {
   const s = sessions.get(uid);
   if (!s) return;
@@ -1205,8 +1344,19 @@ function startChunkGCLoop(uid) {
   if (!s) return;
 
   s.chunkGCLoop = setInterval(() => {
-    if (s.chunks.size > 50) {
-      s.chunks.clear();
+    if (s.chunks.size > 100) {
+      if (s.position) {
+        const pcx = Math.floor(s.position.x / 16);
+        const pcz = Math.floor(s.position.z / 16);
+        for (const [key, chunk] of s.chunks) {
+          const [cx, cz] = key.split(',').map(Number);
+          if (Math.abs(cx - pcx) > 12 || Math.abs(cz - pcz) > 12) {
+            s.chunks.delete(key);
+          }
+        }
+      } else {
+        s.chunks.clear();
+      }
     }
   }, 30000);
 }
@@ -1487,6 +1637,114 @@ client.on(Events.InteractionCreate, async (i) => {
           new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("port").setLabel("Port").setStyle(TextInputStyle.Short).setRequired(true).setValue(String(u.server?.port || 19132)))
         );
         return i.showModal(modal);
+      }
+
+      // ORE SCANNER BUTTON
+      if (i.customId === "scan_ores") {
+        await i.deferReply({ ephemeral: true });
+        
+        const result = await scanForOres(uid, 8);
+        
+        if (result.error) {
+          return i.editReply({ content: `❌ ${result.error}` });
+        }
+        
+        if (result.ores.length === 0) {
+          return i.editReply({ 
+            content: `⛏️ Scanned ${result.chunksScanned} chunks. No ores found nearby.\nTip: Wait a bit for chunks to load, or move to a different area.` 
+          });
+        }
+        
+        const byType = {};
+        result.ores.forEach(ore => {
+          if (!byType[ore.type]) byType[ore.type] = [];
+          byType[ore.type].push(ore);
+        });
+        
+        let description = `Found **${result.totalFound}** ores in ${result.chunksScanned} chunks!\nShowing closest 20:\n\n`;
+        
+        Object.keys(byType).forEach(type => {
+          const ores = byType[type];
+          const emoji = type.includes('diamond') ? '💎' : 
+                       type.includes('emerald') ? '✳️' :
+                       type.includes('gold') ? '🥇' :
+                       type.includes('iron') ? '⛓️' :
+                       type.includes('redstone') ? '🔴' :
+                       type.includes('lapis') ? '🔵' :
+                       type.includes('coal') ? '⚫' :
+                       type.includes('copper') ? '🟫' :
+                       type.includes('ancient') ? '🏺' : '⛏️';
+          
+          description += `${emoji} **${type.replace(/_/g, ' ')}** (${ores.length} found):\n`;
+          ores.slice(0, 5).forEach(ore => {
+            description += `   \`${ore.x}, ${ore.y}, ${ore.z}\` (${Math.round(ore.distance)}m)\n`;
+          });
+          if (ores.length > 5) description += `   ... and ${ores.length - 5} more\n`;
+          description += '\n';
+        });
+        
+        const embed = new EmbedBuilder()
+          .setTitle("⛏️ Ore Scanner Results")
+          .setDescription(description)
+          .setColor("#FFD700")
+          .setFooter({ text: `Player pos: ${Math.round(result.playerPos.x)}, ${Math.round(result.playerPos.y)}, ${Math.round(result.playerPos.z)}` })
+          .setTimestamp();
+        
+        return i.editReply({ embeds: [embed] });
+      }
+
+      // BED FINDER BUTTON
+      if (i.customId === "scan_beds") {
+        await i.deferReply({ ephemeral: true });
+        const s = sessions.get(uid);
+        
+        if (!s || !s.connected) {
+          return i.editReply({ content: "❌ Bot not connected" });
+        }
+        
+        if (!advancedFeaturesEnabled || !s.chunks) {
+          return i.editReply({ content: "❌ Advanced features not available" });
+        }
+        
+        const beds = [];
+        const playerPos = s.position ? s.position.floored() : { x: 0, y: 64, z: 0 };
+        
+        for (const [key, chunk] of s.chunks) {
+          for (let x = 0; x < 16; x++) {
+            for (let z = 0; z < 16; z++) {
+              for (let y = -64; y < 320; y++) {
+                try {
+                  const block = chunk.getBlock({ x, y, z });
+                  if (block && block.name && block.name.includes('bed')) {
+                    const [cx, cz] = key.split(',').map(Number);
+                    const wx = cx * 16 + x;
+                    const wz = cz * 16 + z;
+                    const dist = Math.sqrt(Math.pow(wx - playerPos.x, 2) + Math.pow(wz - playerPos.z, 2));
+                    beds.push({ x: wx, y, z: wz, distance: dist });
+                  }
+                } catch (e) {}
+              }
+            }
+          }
+        }
+        
+        beds.sort((a, b) => a.distance - b.distance);
+        
+        if (beds.length === 0) {
+          return i.editReply({ content: "🛏️ No beds found in loaded chunks." });
+        }
+        
+        let desc = `Found **${beds.length}** beds:\n\n`;
+        beds.slice(0, 10).forEach(bed => {
+          desc += `🛏️ \`${bed.x}, ${bed.y}, ${bed.z}\` (${Math.round(bed.distance)}m away)\n`;
+        });
+        
+        const embed = new EmbedBuilder()
+          .setTitle("🛏️ Nearby Beds")
+          .setDescription(desc)
+          .setColor("#FF69B4");
+        
+        return i.editReply({ embeds: [embed] });
       }
     }
 
