@@ -1,531 +1,320 @@
-const http = require('http');
 const {
-  Client,
-  GatewayIntentBits,
-  ActionRowBuilder,
-  ButtonBuilder,
-  ButtonStyle,
-  Events,
-  SlashCommandBuilder,
-  ModalBuilder,
-  TextInputBuilder,
-  TextInputStyle,
-  StringSelectMenuBuilder,
-  EmbedBuilder
+    Client,
+    GatewayIntentBits,
+    ActionRowBuilder,
+    ButtonBuilder,
+    ButtonStyle,
+    Events,
+    SlashCommandBuilder,
+    ModalBuilder,
+    TextInputBuilder,
+    TextInputStyle,
+    StringSelectMenuBuilder,
+    EmbedBuilder
 } = require("discord.js");
-
 const bedrock = require("bedrock-protocol");
 const { Authflow, Titles } = require("prismarine-auth");
 const fs = require("fs");
 const path = require("path");
 
 // --- Dependencies for Chunk Scanning & Bed Detection ---
-let Vec3, PrismarineChunk, PrismarineRegistry, MinecraftData;
-let advancedFeaturesEnabled = false;
-
+let Vec3, PrismarineChunk, PrismarineRegistry;
 try {
-  Vec3 = require("vec3");
-  PrismarineChunk = require("prismarine-chunk");
-  PrismarineRegistry = require("prismarine-registry");
-  MinecraftData = require("minecraft-data");
-  advancedFeaturesEnabled = true;
-  console.log("✅ Advanced features enabled (vec3, prismarine-chunk, etc.)");
+    Vec3 = require("vec3");
+    PrismarineChunk = require("prismarine-chunk");
+    PrismarineRegistry = require("prismarine-registry");
 } catch (e) {
-  console.log("⚠️  Advanced features disabled! Run: npm install vec3 prismarine-chunk prismarine-registry minecraft-data");
+    console.log("⚠️ Advanced features (Bed Detection/Physics) disabled! Missing optional dependencies.");
 }
 
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
 if (!DISCORD_TOKEN) {
-  console.error("❌ DISCORD_TOKEN missing");
-  process.exit(1);
+    console.error("❌ DISCORD_TOKEN missing");
+    process.exit(1);
 }
 
 // ----------------- Config -----------------
-const ALLOWED_GUILD_ID = "1464973275397357772";
-const ADMIN_ID = "1144987924123881564";
-const LOG_CHANNEL_ID = "1464615030111731753";
-const ADMIN_CHANNEL_ID = "1469013237625393163"; 
-const ADMIN_PASSWORD = "Miska123123#";
-const WEB_PORT = process.env.PORT || 3000;
-const MAX_RECONNECT_RETRIES = 67000; // NEW: Prevent infinite rejoin loops
+// 🔓 NO GUILD OR CHANNEL RESTRICTIONS - Works in DMs and any channel
+const ADMIN_ID = "1144987924123881564"; // Only this user can use /admin
+const LOG_CHANNEL_ID = "1464615030111731753"; // Optional: Central log channel for status updates
 
 // ----------------- Storage -----------------
 const DATA = path.join(__dirname, "data");
 const AUTH_ROOT = path.join(DATA, "auth");
 const STORE = path.join(DATA, "users.json");
 const REJOIN_STORE = path.join(DATA, "ReJoin.json");
-const STORE_BACKUP = path.join(DATA, "users.json.bak");
-const REJOIN_BACKUP = path.join(DATA, "ReJoin.json.bak");
 
-if (!fs.existsSync(DATA)) fs.mkdirSync(DATA, { recursive: true });
+if (!fs.existsSync(DATA)) fs.mkdirSync(DATA);
 if (!fs.existsSync(AUTH_ROOT)) fs.mkdirSync(AUTH_ROOT, { recursive: true });
 
-let users = {};
-let activeSessionsStore = {};
-
-// NEW: File operation queues to prevent race conditions
-const fileQueues = new Map();
-
-// NEW: Robust JSON loader with corruption recovery
-function loadJsonSafe(filePath, defaultValue = {}) {
-  try {
-    if (!fs.existsSync(filePath)) return defaultValue;
-    const content = fs.readFileSync(filePath, "utf8");
-    // Check if empty
-    if (!content.trim()) throw new Error("Empty file");
-    return JSON.parse(content);
-  } catch (e) {
-    console.error(`⚠️ Corrupted or missing ${path.basename(filePath)}:`, e.message);
-    
-    // Try backup if main file fails
-    const backupPath = filePath.replace('.json', '.json.bak');
-    if (fs.existsSync(backupPath)) {
-      try {
-        const backupContent = fs.readFileSync(backupPath, "utf8");
-        const parsed = JSON.parse(backupContent);
-        console.log(`✅ Restored ${path.basename(filePath)} from backup`);
-        // Restore main file from backup
-        fs.writeFileSync(filePath, backupContent);
-        return parsed;
-      } catch (backupErr) {
-        console.error(`❌ Backup also corrupted for ${path.basename(filePath)}`);
-      }
-    }
-    
-    // Create fresh file if both corrupted
-    console.log(`📝 Creating new ${path.basename(filePath)}`);
+// Safe Load Helper
+function loadJson(path, defaultVal) {
+    if (!fs.existsSync(path)) return defaultVal;
     try {
-      fs.writeFileSync(filePath, JSON.stringify(defaultValue, null, 2));
-    } catch (writeErr) {
-      console.error(`❌ Failed to create ${path.basename(filePath)}:`, writeErr.message);
-    }
-    return defaultValue;
-  }
-}
-
-// NEW: Queued atomic save with backup creation
-async function saveJsonQueued(filePath, data, tempPath, backupPath) {
-  // Create queue for this specific file if doesn't exist
-  if (!fileQueues.has(filePath)) {
-    fileQueues.set(filePath, Promise.resolve());
-  }
-  
-  const queue = fileQueues.get(filePath);
-  const newPromise = queue.then(async () => {
-    try {
-      // Write to temp first
-      fs.writeFileSync(tempPath, JSON.stringify(data, null, 2));
-      
-      // Create backup of current valid file before replacing
-      if (fs.existsSync(filePath)) {
-        fs.copyFileSync(filePath, backupPath);
-      }
-      
-      // Atomic rename
-      fs.renameSync(tempPath, filePath);
-      return true;
+        return JSON.parse(fs.readFileSync(path, "utf8"));
     } catch (e) {
-      console.error(`Failed to save ${path.basename(filePath)}:`, e.message);
-      return false;
+        console.error(`⚠️ Corrupt JSON at ${path}. Resetting.`);
+        return defaultVal;
     }
-  });
-  
-  fileQueues.set(filePath, newPromise);
-  return newPromise;
 }
 
-// Load data with corruption recovery
-users = loadJsonSafe(STORE, {});
-activeSessionsStore = loadJsonSafe(REJOIN_STORE, {});
+let users = loadJson(STORE, {});
+let activeSessionsStore = loadJson(REJOIN_STORE, {});
 
-// Updated save functions using queues
 function save() {
-  const tempPath = STORE + '.tmp';
-  return saveJsonQueued(STORE, users, tempPath, STORE_BACKUP);
+    try { fs.writeFileSync(STORE, JSON.stringify(users, null, 2)); } catch (e) { console.error("Save failed:", e); }
 }
 
 function saveActiveSessions() {
-  const tempPath = REJOIN_STORE + '.tmp';
-  return saveJsonQueued(REJOIN_STORE, activeSessionsStore, tempPath, REJOIN_BACKUP);
+    try { fs.writeFileSync(REJOIN_STORE, JSON.stringify(activeSessionsStore, null, 2)); } catch (e) { console.error("Save Active failed:", e); }
 }
 
 function getUser(uid) {
-  if (!users[uid]) users[uid] = {};
-  if (!users[uid].connectionType) users[uid].connectionType = "online"; 
-  if (!users[uid].bedrockVersion) users[uid].bedrockVersion = "auto";
-  return users[uid];
+    if (!users[uid]) users[uid] = {};
+    users[uid].connectionType = "online";
+    if (!users[uid].bedrockVersion) users[uid].bedrockVersion = "auto";
+    return users[uid];
 }
 
 function getUserAuthDir(uid) {
-  const dir = path.join(AUTH_ROOT, uid);
-  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-  return dir;
+    const dir = path.join(AUTH_ROOT, uid);
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    return dir;
 }
 
-// FIXED: Properly cancel pending auth and cleanup
 function unlinkMicrosoft(uid) {
-  // Cancel any pending auth flows
-  if (pendingLink.has(uid)) {
-    const pending = pendingLink.get(uid);
-    pending.aborted = true; // Flag to stop processing
-    pendingLink.delete(uid);
-  }
-  
-  const dir = getUserAuthDir(uid);
-  try { fs.rmSync(dir, { recursive: true, force: true }); } catch {}
-  const u = getUser(uid);
-  u.linked = false;
-  save();
+    const dir = getUserAuthDir(uid);
+    try { fs.rmSync(dir, { recursive: true, force: true }); } catch { }
+    const u = getUser(uid);
+    u.linked = false;
+    save();
 }
 
 // ----------------- Runtime -----------------
 const sessions = new Map();
 const pendingLink = new Map();
 const lastMsa = new Map();
-let lastAdminMessage = null; 
-let isClientReady = false;
+let lastAdminMessage = null;
 
 // ----------------- Discord client -----------------
 const client = new Client({
-  intents: [
-    GatewayIntentBits.Guilds,
-    GatewayIntentBits.DirectMessages,
-    GatewayIntentBits.GuildMessages,
-    GatewayIntentBits.MessageContent
-  ]
+    intents: [
+        GatewayIntentBits.Guilds,
+        GatewayIntentBits.DirectMessages,
+        GatewayIntentBits.GuildMessages
+    ]
 });
 
 // ==========================================================
-// CRASH PREVENTION SYSTEM
+// 🛡️ CRASH PREVENTION SYSTEM
 // ==========================================================
 client.on("error", (error) => console.error("⚠️ Discord Client Error (Ignored):", error.message));
 client.on("shardError", (error) => console.error("⚠️ WebSocket Error (Ignored):", error.message));
 process.on("uncaughtException", (err) => console.error("🔥 Uncaught Exception:", err));
 
 async function logToDiscord(message) {
-  if (!isClientReady) {
-    console.log("[Pre-ready log]:", message);
-    return;
-  }
-  try {
-    const channel = await client.channels.fetch(LOG_CHANNEL_ID);
-    if (channel) {
-      const embed = new EmbedBuilder().setColor("#5865F2").setDescription(message).setTimestamp();
-      await channel.send({ embeds: [embed] });
+    try {
+        // Sends logs to the specified channel if available (optional)
+        const channel = await client.channels.fetch(LOG_CHANNEL_ID);
+        if (channel) {
+            const embed = new EmbedBuilder().setColor("#5865F2").setDescription(message).setTimestamp();
+            await channel.send({ embeds: [embed] });
+        }
+    } catch (e) { 
+        // Silent fail if log channel is unavailable
     }
-  } catch (e) {
-    console.error("Failed to log to Discord:", e.message);
-  }
-}
-
-function denyIfWrongGuild(i) {
-  if (!i.inGuild() || i.guildId !== ALLOWED_GUILD_ID) {
-    const msg = "This bot cannot be used in this server ⛔️";
-    if (i.replied || i.deferred) return;
-    return i.reply({ ephemeral: true, content: msg }).catch(() => {});
-  }
-  return null;
 }
 
 // ----------------- UI helpers -----------------
 function panelRow(isJava = false) {
-  const title = isJava ? "Java AFKBot Panel 🎛️" : "Bedrock AFKBot Panel 🎛️";
-  const startCustomId = isJava ? "start_java" : "start_bedrock";
+    const title = isJava ? "Java AFKBot Panel 🎛️" : "Bedrock AFKBot Panel 🎛️";
+    const startCustomId = isJava ? "start_java" : "start_bedrock";
 
-  return {
-    content: `**${title}**`,
-    components: [
-      new ActionRowBuilder().addComponents(
-        new ButtonBuilder().setCustomId("link").setLabel("🔑 Link Microsoft").setStyle(ButtonStyle.Primary),
-        new ButtonBuilder().setCustomId("unlink").setLabel("🗑 Unlink Microsoft").setStyle(ButtonStyle.Secondary),
-        new ButtonBuilder().setCustomId(startCustomId).setLabel("▶ Start").setStyle(ButtonStyle.Success),
-        new ButtonBuilder().setCustomId("stop").setLabel("⏹ Stop").setStyle(ButtonStyle.Danger),
-        new ButtonBuilder().setCustomId("settings").setLabel("⚙ Settings").setStyle(ButtonStyle.Secondary)
-      )
-    ]
-  };
+    return {
+        content: `**${title}**`,
+        components: [
+            new ActionRowBuilder().addComponents(
+                new ButtonBuilder().setCustomId("link").setLabel("🔑 Link Microsoft").setStyle(ButtonStyle.Primary),
+                new ButtonBuilder().setCustomId("unlink").setLabel("🗑 Unlink Microsoft").setStyle(ButtonStyle.Secondary),
+                new ButtonBuilder().setCustomId(startCustomId).setLabel("▶ Start").setStyle(ButtonStyle.Success),
+                new ButtonBuilder().setCustomId("stop").setLabel("⏹ Stop").setStyle(ButtonStyle.Danger),
+                new ButtonBuilder().setCustomId("settings").setLabel("⚙ Settings").setStyle(ButtonStyle.Secondary)
+            )
+        ]
+    };
 }
 
 function adminPanelComponents() {
-  const rows = [
-    new ActionRowBuilder().addComponents(
-      new ButtonBuilder().setCustomId("admin_refresh").setLabel("🔄 Refresh Stats").setStyle(ButtonStyle.Primary),
-      new ButtonBuilder().setCustomId("admin_stop_all").setLabel("🛑 Force Stop All").setStyle(ButtonStyle.Danger)
-    )
-  ];
+    const rows = [
+        new ActionRowBuilder().addComponents(
+            new ButtonBuilder().setCustomId("admin_refresh").setLabel("🔄 Refresh Stats").setStyle(ButtonStyle.Primary),
+            new ButtonBuilder().setCustomId("admin_stop_all").setLabel("🛑 Force Stop All").setStyle(ButtonStyle.Danger)
+        )
+    ];
 
-  if (sessions.size > 0) {
-    const options = [];
-    let count = 0;
-    for (const [uid, session] of sessions) {
-      if (count >= 25) break; 
-      options.push({ label: `User: ${uid}`, description: `Started: ${new Date(session.startedAt).toLocaleTimeString()}`, value: uid });
-      count++;
+    if (sessions.size > 0) {
+        const options = [];
+        let count = 0;
+        for (const [uid, session] of sessions) {
+            if (count >= 25) break;
+            options.push({ label: `User: ${uid}`, description: `Started: ${new Date(session.startedAt).toLocaleTimeString()}`, value: uid });
+            count++;
+        }
+        rows.push(new ActionRowBuilder().addComponents(
+            new StringSelectMenuBuilder().setCustomId("admin_force_stop_select").setPlaceholder("Select bot to Force Stop").addOptions(options)
+        ));
     }
-    rows.push(new ActionRowBuilder().addComponents(
-      new StringSelectMenuBuilder().setCustomId("admin_force_stop_select").setPlaceholder("Select bot to Force Stop").addOptions(options)
-    ));
-  }
-  return rows;
+    return rows;
 }
 
 function getAdminStatsEmbed() {
-  const memory = process.memoryUsage();
-  const ramMB = (memory.rss / 1024 / 1024).toFixed(2);
-  const uptime = process.uptime();
-  const hours = Math.floor(uptime / 3600);
-  const minutes = Math.floor((uptime % 3600) / 60);
+    const memory = process.memoryUsage();
+    const ramMB = (memory.rss / 1024 / 1024).toFixed(2);
+    const uptime = process.uptime();
+    const hours = Math.floor(uptime / 3600);
+    const minutes = Math.floor((uptime % 3600) / 60);
 
-  const embed = new EmbedBuilder()
-    .setTitle("🛠 Admin Panel")
-    .setColor("#2f3136")
-    .addFields(
-      { name: "📊 Performance", value: `**RAM:** ${ramMB} MB\n**Uptime:** ${hours}h ${minutes}m`, inline: true },
-      { name: "🤖 Active Sessions", value: `**Total Bots:** ${sessions.size}`, inline: true },
-      { name: "💾 Persisted Sessions", value: `**Saved for Restart:** ${Object.keys(activeSessionsStore).length}`, inline: true }
-    )
-    .setFooter({ text: "Auto-refreshing every 30s • Administrative Access Only" })
-    .setTimestamp();
+    const embed = new EmbedBuilder()
+        .setTitle("🛠 Admin Panel")
+        .setColor("#2f3136")
+        .addFields(
+            { name: "📊 Performance", value: `**RAM:** ${ramMB} MB\n**Uptime:** ${hours}h ${minutes}m`, inline: true },
+            { name: "🤖 Active Sessions", value: `**Total Bots:** ${sessions.size}`, inline: true },
+            { name: "💾 Persisted Sessions", value: `**Saved for Restart:** ${Object.keys(activeSessionsStore).length}`, inline: true }
+        )
+        .setFooter({ text: "Auto-refreshing every 30s • Administrative Access Only" })
+        .setTimestamp();
 
-  if (sessions.size > 0) {
-    let botList = "";
-    for (const [uid, s] of sessions) {
-      const status = s.connected ? "🟢 Online" : (s.isReconnecting ? "⏳ Reconnecting" : "🔴 Offline");
-      botList += `<@${uid}>: ${status}\n`;
+    if (sessions.size > 0) {
+        let botList = "";
+        for (const [uid, s] of sessions) {
+            const status = s.connected ? "🟢 Online" : (s.isReconnecting ? "⏳ Reconnecting" : "🔴 Offline");
+            botList += `<@${uid}>: ${status}\n`;
+        }
+        embed.addFields({ name: "📋 Active Bot Registry", value: botList.slice(0, 1024) || "None" });
     }
-    embed.addFields({ name: "📋 Active Bot Registry", value: botList.slice(0, 1024) });
-  }
-  return embed;
+    return embed;
 }
 
 // ----------------- Events: Ready & Startup Rejoin -----------------
 client.once("ready", async () => {
-  console.log("🟢 Online as", client.user.tag);
-  isClientReady = true;
+    console.log("🟢 Online as", client.user.tag);
 
-  const cmds = [
-    new SlashCommandBuilder().setName("panel").setDescription("Open Bedrock AFK panel"),
-    new SlashCommandBuilder().setName("java").setDescription("Open Java AFKBot Panel"),
-    new SlashCommandBuilder().setName("admin").setDescription("Open Admin Control Panel")
-  ];
-  await client.application.commands.set(cmds);
+    const cmds = [
+        new SlashCommandBuilder().setName("panel").setDescription("Open Bedrock AFK panel"),
+        new SlashCommandBuilder().setName("java").setDescription("Open Java AFKBot Panel"),
+        new SlashCommandBuilder().setName("admin").setDescription("Open Admin Control Panel")
+    ];
+    await client.application.commands.set(cmds);
 
-  setInterval(async () => {
-    if (lastAdminMessage) {
-        try {
-            await lastAdminMessage.edit({ embeds: [getAdminStatsEmbed()], components: adminPanelComponents() });
-        } catch (e) { lastAdminMessage = null; }
+    setInterval(async () => {
+        if (lastAdminMessage) {
+            try {
+                await lastAdminMessage.edit({ embeds: [getAdminStatsEmbed()], components: adminPanelComponents() });
+            } catch (e) { lastAdminMessage = null; }
+        }
+    }, 30000);
+
+    console.log("📂 Checking ReJoin.json for previous sessions...");
+    const previousSessions = Object.keys(activeSessionsStore);
+
+    if (previousSessions.length > 0) {
+        console.log(`♻️ Found ${previousSessions.length} bots to restore. Starting them now...`);
+        let delay = 0;
+        for (const uid of previousSessions) {
+            setTimeout(() => startSession(uid, null, true), delay);
+            delay += 5000;
+        }
+    } else {
+        console.log("⚪ No previous sessions found.");
     }
-  }, 30000);
-
-  console.log("📂 Checking ReJoin.json for previous sessions...");
-  const previousSessions = Object.entries(activeSessionsStore);
-
-  if (previousSessions.length > 0) {
-      console.log(`♻️ Found ${previousSessions.length} bots to restore. Starting them now...`);
-      let delay = 0;
-      for (const [uid, sessionData] of previousSessions) {
-          // Validate that we have server data
-          if (!sessionData || !sessionData.ip || !sessionData.port) {
-              console.log(`⚠️ Invalid session data for ${uid}, removing from store`);
-              delete activeSessionsStore[uid];
-              continue;
-          }
-          // Reset retry count on fresh boot
-          if (activeSessionsStore[uid]) {
-            activeSessionsStore[uid].retryCount = 0;
-          }
-          setTimeout(() => startSession(uid, null, true), delay);
-          delay += 5000; 
-      }
-      await saveActiveSessions(); // Save cleaned up store
-  } else {
-      console.log("⚪ No previous sessions found.");
-  }
 });
 
 // ----------------- Microsoft link -----------------
 async function linkMicrosoft(uid, interaction) {
-  if (pendingLink.has(uid)) {
-    const pending = pendingLink.get(uid);
-    if (Date.now() - pending.startTime > 10 * 60 * 1000) {
-      pendingLink.delete(uid);
-    } else {
-      return interaction.editReply("⏳ Login already in progress. Use the last code or wait 10 minutes.");
-    }
-  }
-  
-  const authDir = getUserAuthDir(uid);
-  const u = getUser(uid);
-  let codeShown = false;
+    if (pendingLink.has(uid)) return interaction.editReply("⏳ Login already in progress. Use the last code.");
+    const authDir = getUserAuthDir(uid);
+    const u = getUser(uid);
+    let codeShown = false;
 
-  const flow = new Authflow(uid, authDir, { flow: "live", authTitle: Titles?.MinecraftNintendoSwitch || "Bedrock AFK Bot", deviceType: "Nintendo" }, async (data) => {
-      // Check if aborted
-      if (pendingLink.has(uid) && pendingLink.get(uid).aborted) return;
-      
-      const uri = data.verification_uri_complete || data.verification_uri || "https://www.microsoft.com/link";
-      const code = data.user_code || "(no code)";
-      lastMsa.set(uid, { uri, code, at: Date.now() });
-      codeShown = true;
-      const msg = `🔐 **Microsoft Authentication Required**\n\n1. Visit: ${uri}\n2. Enter Code: \`${code}\``;
-      await interaction.editReply({ content: msg, components: [new ActionRowBuilder().addComponents(new ButtonBuilder().setLabel("🌐 Open link").setStyle(ButtonStyle.Link).setURL(uri))] }).catch(() => {});
-  });
+    const flow = new Authflow(uid, authDir, { flow: "live", authTitle: Titles?.MinecraftNintendoSwitch || "Bedrock AFK Bot", deviceType: "Nintendo" }, async (data) => {
+        const uri = data.verification_uri_complete || data.verification_uri || "https://www.microsoft.com/link";
+        const code = data.user_code || "(no code)";
+        lastMsa.set(uid, { uri, code, at: Date.now() });
+        codeShown = true;
+        const msg = `🔐 **Microsoft Authentication Required**\n\n1. Visit: ${uri}\n2. Enter Code: \`${code}\``;
+        await interaction.editReply({ content: msg, components: [new ActionRowBuilder().addComponents(new ButtonBuilder().setLabel("🌐 Open link").setStyle(ButtonStyle.Link).setURL(uri))] }).catch(() => { });
+    });
 
-  const pendingObj = {
-    startTime: Date.now(),
-    aborted: false,
-    promise: (async () => {
-      try {
-        if (!codeShown) await interaction.editReply("⏳ Requesting code…");
-        await flow.getMsaToken();
-        
-        // Check if aborted during token fetch
-        if (pendingObj.aborted) {
-          await interaction.editReply("❌ Login cancelled by user.").catch(() => {});
-          return;
-        }
-        
-        u.linked = true; 
-        await save();
-        await interaction.followUp({ ephemeral: true, content: "✅ Microsoft account linked!" });
-      } catch (e) {
-        if (!pendingObj.aborted) {
-          await interaction.editReply(`❌ Login failed: ${e.message}`).catch(() => {});
-        }
-      } finally { 
-        pendingLink.delete(uid); 
-      }
-    })()
-  };
-  
-  pendingLink.set(uid, pendingObj);
-  
-  // Auto-clear after 10 minutes
-  setTimeout(() => {
-    if (pendingLink.has(uid) && pendingLink.get(uid).startTime === pendingObj.startTime) {
-      pendingLink.delete(uid);
-    }
-  }, 10 * 60 * 1000);
+    const p = (async () => {
+        try {
+            if (!codeShown) await interaction.editReply("⏳ Requesting code…");
+            await flow.getMsaToken();
+            u.linked = true; save();
+            await interaction.followUp({ ephemeral: true, content: "✅ Microsoft account linked!" });
+        } catch (e) {
+            await interaction.editReply(`❌ Login failed: ${e.message}`).catch(() => { });
+        } finally { pendingLink.delete(uid); }
+    })();
+    pendingLink.set(uid, p);
 }
 
 // ----------------- Session Logic -----------------
 function cleanupSession(uid) {
-  const s = sessions.get(uid);
-  if (!s) return;
+    const s = sessions.get(uid);
+    if (!s) return;
 
-  console.log(`[Cleanup] Cleaning up session for ${uid}`);
-  
-  // Clear all timers
-  if (s.reconnectTimer) {
-    clearTimeout(s.reconnectTimer);
-    s.reconnectTimer = null;
-  }
-  if (s.physicsLoop) {
-    clearInterval(s.physicsLoop);
-    s.physicsLoop = null;
-  }
-  if (s.afkTimeout) {
-    clearTimeout(s.afkTimeout);
-    s.afkTimeout = null;
-  }
-  if (s.chunkGCLoop) {
-    clearInterval(s.chunkGCLoop);
-    s.chunkGCLoop = null;
-  }
+    if (s.reconnectTimer) clearTimeout(s.reconnectTimer);
+    if (s.physicsLoop) clearInterval(s.physicsLoop);
+    if (s.afkTimeout) clearTimeout(s.afkTimeout);
+    if (s.chunkGCLoop) clearInterval(s.chunkGCLoop);
 
-  // Close client connection
-  try { 
-    if (s.client) {
-      s.client.removeAllListeners();
-      s.client.close(); 
-    }
-  } catch (e) {
-    console.error("Error closing client:", e.message);
-  }
-  
-  sessions.delete(uid);
-  console.log(`[Cleanup] Session for ${uid} removed from Map`);
+    try {
+        if (s.client) {
+            s.client.removeAllListeners();
+            s.client.close();
+        }
+    } catch { }
+    sessions.delete(uid);
 }
 
 function stopSession(uid) {
-  console.log(`[Stop] Stopping session for ${uid}`);
-  
-  // Always remove from active sessions store
-  if (activeSessionsStore[uid]) {
-      delete activeSessionsStore[uid];
-      saveActiveSessions().catch(console.error);
-      console.log(`[Stop] Removed ${uid} from activeSessionsStore`);
-  }
+    const s = sessions.get(uid);
 
-  const s = sessions.get(uid);
-  if (!s) return false;
-  
-  s.manualStop = true; 
-  cleanupSession(uid);
-  return true;
+    if (activeSessionsStore[uid]) {
+        delete activeSessionsStore[uid];
+        saveActiveSessions();
+    }
+
+    if (!s) return false;
+    s.manualStop = true;
+
+    cleanupSession(uid);
+    return true;
 }
 
-function stopAllSessions() {
-  const uids = Array.from(sessions.keys());
-  uids.forEach(uid => stopSession(uid));
-  return uids.length;
-}
-
-// FIXED: Handle max retries and clear stale entries
 function handleAutoReconnect(uid) {
     const s = sessions.get(uid);
-    
-    if (s?.manualStop) {
-      console.log(`[Reconnect] Aborting for ${uid}: manual stop`);
-      return;
-    }
-    
-    if (!s && !activeSessionsStore[uid]) {
-        console.log(`[Reconnect] Aborting for ${uid}: no session data`);
-        return;
-    }
+    if (!s || s.manualStop) return;
 
-    // Check retry count
-    const sessionData = activeSessionsStore[uid] || {};
-    const currentRetries = sessionData.retryCount || 0;
-    
-    if (currentRetries >= MAX_RECONNECT_RETRIES) {
-        console.log(`[Reconnect] Max retries (${MAX_RECONNECT_RETRIES}) reached for ${uid}. Giving up.`);
-        logToDiscord(`❌ Bot of <@${uid}> failed to reconnect after ${MAX_RECONNECT_RETRIES} attempts. Removing from auto-rejoin.`);
-        delete activeSessionsStore[uid];
-        saveActiveSessions().catch(console.error);
-        cleanupSession(uid);
-        return;
-    }
+    if (s.reconnectTimer) clearTimeout(s.reconnectTimer);
 
-    if (s?.reconnectTimer) {
-      clearTimeout(s.reconnectTimer);
-    }
+    s.isReconnecting = true;
+    logToDiscord(`⏳ Bot of <@${uid}> disconnected. Reconnecting in 60s...`);
 
-    if (!s) {
-        sessions.set(uid, { manualStop: false, isReconnecting: true, reconnectTimer: null });
-    } else {
-        s.isReconnecting = true;
-        s.connected = false;
-    }
-    
-    // Increment retry count
-    if (activeSessionsStore[uid]) {
-        activeSessionsStore[uid].retryCount = currentRetries + 1;
-        saveActiveSessions().catch(console.error);
-    }
-    
-    const sessionObj = sessions.get(uid);
-    logToDiscord(`⏳ Bot of <@${uid}> disconnected. Reconnecting in 60s... (Attempt ${currentRetries + 1}/${MAX_RECONNECT_RETRIES})`);
+    // Clean up old client listeners to prevent memory leak
+    try { s.client.removeAllListeners(); } catch { }
 
-    sessionObj.reconnectTimer = setTimeout(() => {
-        const currentS = sessions.get(uid);
-        if (currentS?.manualStop) {
-            cleanupSession(uid);
-            return;
+    s.reconnectTimer = setTimeout(() => {
+        if (sessions.has(uid)) {
+            const checkS = sessions.get(uid);
+            if (!checkS.manualStop) {
+                checkS.reconnectTimer = null;
+                startSession(uid, null, true);
+            } else {
+                cleanupSession(uid);
+            }
         }
-        cleanupSession(uid);
-        startSession(uid, null, true); 
     }, 60000);
 }
 
@@ -534,691 +323,423 @@ async function safeReply(interaction, content) {
     try {
         if (interaction.replied || interaction.deferred) await interaction.editReply(content);
         else await interaction.reply(content);
-    } catch (e) {
-      console.error("safeReply error:", e.message);
+    } catch (e) { 
+        // Silent fail if interaction expired
     }
 }
 
 // ----------------- MAIN SESSION FUNCTION -----------------
 async function startSession(uid, interaction, isReconnect = false) {
-  console.log(`[Start] Starting session for ${uid}, reconnect: ${isReconnect}`);
-  const u = getUser(uid);
+    const u = getUser(uid);
 
-  // FIXED: Prioritize persisted data for reconnects, user settings for new connections
-  let ip, port, connectionType, offlineUsername;
-  
-  if (isReconnect && activeSessionsStore[uid]) {
-      // Use exactly what was saved for reconnect
-      ip = activeSessionsStore[uid].ip;
-      port = activeSessionsStore[uid].port;
-      connectionType = activeSessionsStore[uid].connectionType || "online";
-      offlineUsername = activeSessionsStore[uid].offlineUsername;
-      console.log(`[Start] Using persisted config for ${uid}: ${ip}:${port} (${connectionType})`);
-  } else if (u.server?.ip && u.server?.port) {
-      // Use current user settings for new connections
-      ip = u.server.ip;
-      port = u.server.port;
-      connectionType = u.connectionType || "online";
-      offlineUsername = u.offlineUsername;
-  } else {
-      console.log(`[Start] No server config for ${uid}`);
-      if (activeSessionsStore[uid]) {
-        delete activeSessionsStore[uid];
-        saveActiveSessions().catch(console.error);
-      }
-      if (!isReconnect && interaction) await safeReply(interaction, "⚠ Please configure your server settings first.");
-      return;
-  }
-
-  // If not reconnect and already has session, deny
-  if (!isReconnect && sessions.has(uid)) {
-      console.log(`[Start] Session already exists for ${uid}`);
-      if (interaction) return safeReply(interaction, "⚠️ **Session Conflict**: Active session already exists.").catch(() => {});
-      return;
-  }
-
-  // If reconnect and has session, clean up old one first
-  if (isReconnect && sessions.has(uid)) {
-    console.log(`[Start] Cleaning up old session for reconnect ${uid}`);
-    cleanupSession(uid);
-  }
-
-  // FIXED: Save complete session state including connection type
-  activeSessionsStore[uid] = { 
-      ip, 
-      port, 
-      startedAt: Date.now(),
-      connectionType: connectionType,
-      offlineUsername: offlineUsername,
-      retryCount: isReconnect ? (activeSessionsStore[uid]?.retryCount || 0) : 0
-  };
-  await saveActiveSessions();
-
-  const connectionEmbed = new EmbedBuilder()
-    .setColor("#5865F2")
-    .setTitle("Bot Initialization")
-    .setThumbnail("https://files.catbox.moe/9mqpoz.gif");
-
-  try {
-      if (!isReconnect && interaction) {
-          connectionEmbed.setDescription(`🔍 **Pinging server...**\n🌐 **Target:** \`${ip}:${port}\``);
-          await safeReply(interaction, { embeds: [connectionEmbed], content: null, components: [] });
-      }
-
-      await bedrock.ping({ host: ip, port: parseInt(port) || 19132, timeout: 5000 });
-
-      if (!isReconnect && interaction) {
-          connectionEmbed.setDescription(`✅ **Server found! Joining...**\n🌐 **Target:** \`${ip}:${port}\``);
-          await safeReply(interaction, { embeds: [connectionEmbed] });
-      }
-  } catch (err) {
-      console.error(`[Start] Ping failed for ${uid}:`, err.message);
-      logToDiscord(`❌ Connection failure for <@${uid}>: Server ${ip}:${port} unreachable.`);
-      
-      // FIXED: Always trigger reconnect logic if it's a reconnect attempt, 
-      // but let handleAutoReconnect handle the retry limit
-      if (isReconnect) {
-        handleAutoReconnect(uid); 
-      } else {
-          // For new connections, clean up immediately
-          delete activeSessionsStore[uid];
-          saveActiveSessions().catch(console.error);
-          if (interaction) {
-            await safeReply(interaction, { content: `❌ **Connection Failed**: The server at \`${ip}:${port}\` is currently offline.`, embeds: [] });
-          }
-      }
-      return; 
-  }
-
-  const authDir = getUserAuthDir(uid);
-
-  const opts = { 
-      host: ip, 
-      port: parseInt(port), 
-      connectTimeout: 60000, 
-      keepAlive: true,
-      viewDistance: 4, 
-      profilesFolder: authDir,
-      username: uid,
-      offline: false
-  };
-
-  // FIXED: Use the connection type from our resolved variables
-  if (connectionType === "offline") {
-    opts.username = offlineUsername || `AFK_${uid.slice(-4)}`;
-    opts.offline = true;
-  }
-
-  let mc;
-  try {
-    mc = bedrock.createClient(opts);
-  } catch (e) {
-    console.error(`[Start] Failed to create client for ${uid}:`, e.message);
-    delete activeSessionsStore[uid];
-    saveActiveSessions().catch(console.error);
-    if (!isReconnect && interaction) {
-      await safeReply(interaction, { content: `❌ **Client Error**: ${e.message}`, embeds: [] });
-    } else if (isReconnect) {
-      handleAutoReconnect(uid);
+    if (!activeSessionsStore[uid]) {
+        activeSessionsStore[uid] = true;
+        saveActiveSessions();
     }
-    return;
-  }
 
-  const currentSession = { 
-      client: mc, 
-      startedAt: Date.now(), 
-      manualStop: false, 
-      connected: false,
-      isReconnecting: false,
-      position: null,
-      velocity: (advancedFeaturesEnabled && Vec3) ? new Vec3(0, 0, 0) : null,
-      yaw: 0,
-      pitch: 0,
-      onGround: false,
-      isWalking: false,
-      targetPosition: null, 
-      isTryingToSleep: false,
-      chunks: new Map(),
-      registry: null,
-      Chunk: null,
-      reconnectTimer: null,
-      physicsLoop: null,
-      afkTimeout: null,
-      chunkGCLoop: null,
-      entityId: null
-  };
-  sessions.set(uid, currentSession);
+    if (!u.server) {
+        if (!isReconnect) await safeReply(interaction, "⚠ Please configure your server settings first.");
+        delete activeSessionsStore[uid];
+        saveActiveSessions();
+        return;
+    }
 
-  // ==========================================
-  // ADVANCED PHYSICS, WALKING & CHUNK ENGINE
-  // ==========================================
-  if (advancedFeaturesEnabled && Vec3 && PrismarineChunk) {
-      try {
-          currentSession.registry = PrismarineRegistry('bedrock_1.20.0');
-          currentSession.Chunk = PrismarineChunk(currentSession.registry);
-      } catch (e) {
-          logToDiscord(`Could not initialize chunk manager for <@${uid}>. Bed detection disabled.`);
-          currentSession.Chunk = null;
-      }
+    const { ip, port } = u.server;
 
-      mc.on('level_chunk', (packet) => {
-          if (!currentSession.Chunk) return;
-          try {
-              const chunk = new currentSession.Chunk();
-              chunk.load(packet.payload);
-              currentSession.chunks.set(`${packet.x},${packet.z}`, chunk);
-          } catch(e) {
-              // Silently ignore corrupted chunks
-          }
-      });
+    // Avoid duplicate sessions if not reconnecting
+    if (sessions.has(uid) && !isReconnect) {
+        return safeReply(interaction, "⚠️ **Session Conflict**: Active session already exists.").catch(() => { });
+    }
 
-      currentSession.chunkGCLoop = setInterval(() => {
-          if (currentSession.chunks.size > 50) {
-              currentSession.chunks.clear();
-          }
-      }, 10000);
+    const connectionEmbed = new EmbedBuilder()
+        .setColor("#5865F2")
+        .setTitle("Bot Initialization")
+        .setThumbnail("https://files.catbox.moe/9mqpoz.gif");
 
-      currentSession.physicsLoop = setInterval(() => {
-          if (!currentSession.connected || !currentSession.position) return;
+    try {
+        if (!isReconnect) {
+            connectionEmbed.setDescription(`🔍 **Pinging server...**\n🌐 **Target:** \`${ip}:${port}\``);
+            await safeReply(interaction, { embeds: [connectionEmbed], content: null, components: [] });
+        }
 
-          const gravity = 0.08; 
-          const moveVector = { x: 0, z: 0 };
+        await bedrock.ping({ host: ip, port: parseInt(port) || 19132, timeout: 5000 });
 
-          if (currentSession.isWalking && currentSession.targetPosition) {
-              const distance = currentSession.position.distanceTo(currentSession.targetPosition);
-              if (distance > 0.5) {
-                  const direction = currentSession.targetPosition.minus(currentSession.position).normalize();
-                  moveVector.x = direction.x;
-                  moveVector.z = direction.z;
-              } else {
-                  currentSession.isWalking = false;
-              }
-          }
+        if (!isReconnect) {
+            connectionEmbed.setDescription(`✅ **Server found! Joining...**\n🌐 **Target:** \`${ip}:${port}\``);
+            await safeReply(interaction, { embeds: [connectionEmbed] });
+        }
+    } catch (err) {
+        logToDiscord(`❌ Connection failure for <@${uid}>: Server ${ip}:${port} unreachable.`);
+        if (isReconnect) handleAutoReconnect(uid);
+        else await safeReply(interaction, { content: `❌ **Connection Failed**: The server at \`${ip}:${port}\` is currently offline.`, embeds: [] });
+        return;
+    }
 
-          if (!currentSession.onGround && currentSession.velocity) {
-             currentSession.velocity.y -= gravity;
-          }
+    const authDir = getUserAuthDir(uid);
 
-          if (currentSession.velocity && currentSession.velocity.y < -3.92) currentSession.velocity.y = -3.92;
+    const opts = {
+        host: ip,
+        port: parseInt(port),
+        connectTimeout: 60000,
+        keepAlive: true,
+        viewDistance: 4,
+        profilesFolder: authDir,
+        username: uid,
+        offline: false,
+        skipPing: true // Optimization: We already pinged above
+    };
 
-          if (currentSession.velocity) {
-              currentSession.position.add(currentSession.velocity);
-          }
+    if (u.connectionType === "offline") {
+        opts.username = u.offlineUsername || `AFK_${uid.slice(-4)}`;
+        opts.offline = true;
+    }
 
-          if (currentSession.position.y < -64) {
-             currentSession.position.y = 320; 
-             if (currentSession.velocity) currentSession.velocity.y = 0;
-          }
+    let mc;
+    try {
+        mc = bedrock.createClient(opts);
+    } catch (err) {
+        console.error("Create Client Error:", err);
+        return handleAutoReconnect(uid);
+    }
 
-          try {
-              mc.write("player_auth_input", {
-                 pitch: currentSession.pitch, yaw: currentSession.yaw,
-                 position: { x: currentSession.position.x, y: currentSession.position.y, z: currentSession.position.z },
-                 move_vector: moveVector, head_yaw: currentSession.yaw, input_data: 0,
-                 input_mode: "mouse", play_mode: "screen", interaction_model: "touch", tick: 0
-              });
-          } catch (e) {}
-      }, 50); 
-  }
+    const currentSession = {
+        client: mc,
+        startedAt: Date.now(),
+        manualStop: false,
+        connected: false,
+        isReconnecting: false,
+        position: null,
+        velocity: (Vec3) ? new Vec3(0, 0, 0) : null,
+        yaw: 0,
+        pitch: 0,
+        onGround: false,
+        isWalking: false,
+        targetPosition: null,
+        isTryingToSleep: false,
+        chunks: new Map(),
+        registry: null,
+        Chunk: null,
+        reconnectTimer: null,
+        physicsLoop: null,
+        afkTimeout: null,
+        chunkGCLoop: null,
+        entityId: null
+    };
+    sessions.set(uid, currentSession);
 
-  // ==========================================
-  // ANTI-AFK & AI CONTROLLER
-  // ==========================================
-  const performAntiAfk = () => {
-      if (!sessions.has(uid)) return;
-      const s = sessions.get(uid);
+    // ==========================================
+    // 🍎 ADVANCED PHYSICS, WALKING & CHUNK ENGINE
+    // ==========================================
+    if (Vec3 && PrismarineChunk) {
+        try {
+            currentSession.registry = PrismarineRegistry('bedrock_1.20.0');
+            currentSession.Chunk = PrismarineChunk(currentSession.registry);
+        } catch (e) {
+            logToDiscord(`Could not initialize chunk manager for <@${uid}>. Bed detection disabled.`);
+            currentSession.Chunk = null;
+        }
 
-      if (!s.connected || !s.position) {
-          s.afkTimeout = setTimeout(performAntiAfk, 5000);
-          return;
-      }
+        mc.on('level_chunk', (packet) => {
+            if (!currentSession.Chunk) return;
+            try {
+                const chunk = new currentSession.Chunk();
+                chunk.load(packet.payload);
+                currentSession.chunks.set(`${packet.x},${packet.z}`, chunk);
+            } catch (e) { }
+        });
 
-      try {
-          scanForBedAndSleep(uid);
+        // Clear memory more aggressively
+        currentSession.chunkGCLoop = setInterval(() => {
+            if (currentSession.chunks.size > 20) {
+                currentSession.chunks.clear();
+            }
+        }, 30000);
 
-          const action = Math.random();
-          if (action > 0.5 && !s.isWalking) {
-              s.isWalking = true;
-          } else {
-              s.yaw += (Math.random() - 0.5) * 20; 
-              s.pitch += (Math.random() - 0.5) * 10;
+        currentSession.physicsLoop = setInterval(() => {
+            // FIX: Check if velocity exists (Vec3 loaded)
+            if (!currentSession.connected || !currentSession.position || !currentSession.velocity) return;
 
-              if (s.onGround && s.velocity && Math.random() > 0.9) {
-                  s.velocity.y = 0.42;
-                  s.onGround = false;
-              }
-          }
+            const gravity = 0.08;
+            const moveVector = { x: 0, z: 0 };
 
-          if (s.entityId && s.entityId !== 0) {
-              try {
-                  mc.queue('animate', {
-                      action_id: 1,
-                      runtime_entity_id: s.entityId
-                  });
-              } catch (e) {}
-          }
-      } catch (e) {}
+            if (currentSession.isWalking && currentSession.targetPosition) {
+                const distance = currentSession.position.distanceTo(currentSession.targetPosition);
+                if (distance > 0.5) {
+                    const direction = currentSession.targetPosition.minus(currentSession.position).normalize();
+                    moveVector.x = direction.x;
+                    moveVector.z = direction.z;
+                } else {
+                    currentSession.isWalking = false;
+                }
+            }
 
-      const nextDelay = Math.random() * 20000 + 10000;
-      s.afkTimeout = setTimeout(performAntiAfk, nextDelay);
-  };
+            if (!currentSession.onGround) {
+                currentSession.velocity.y -= gravity;
+            }
 
-  // ==========================================
-  // BED DETECTION AI
-  // ==========================================
-  function scanForBedAndSleep(uid) {
-      const s = sessions.get(uid);
-      if (!s || !s.Chunk || !s.position || s.isTryingToSleep || !advancedFeaturesEnabled) return;
-      
-      if (!s.entityId || s.entityId === 0) return;
+            if (currentSession.velocity.y < -3.92) currentSession.velocity.y = -3.92;
 
-      const searchRadius = 3;
-      const playerPos = s.position.floored();
+            currentSession.position.add(currentSession.velocity);
 
-      for (let x = -searchRadius; x <= searchRadius; x++) {
-          for (let y = -searchRadius; y <= searchRadius; y++) {
-              for (let z = -searchRadius; z <= searchRadius; z++) {
-                  const checkPos = playerPos.offset(x, y, z);
+            if (currentSession.position.y < -64) {
+                currentSession.position.y = 320;
+                currentSession.velocity.y = 0;
+            }
 
-                  const chunkX = Math.floor(checkPos.x / 16);
-                  const chunkZ = Math.floor(checkPos.z / 16);
-                  const chunk = s.chunks.get(`${chunkX},${chunkZ}`);
+            try {
+                mc.write("player_auth_input", {
+                    pitch: currentSession.pitch, yaw: currentSession.yaw,
+                    position: { x: currentSession.position.x, y: currentSession.position.y, z: currentSession.position.z },
+                    move_vector: moveVector, head_yaw: currentSession.yaw, input_data: 0n,
+                    input_mode: "mouse", play_mode: "screen", interaction_model: "touch", tick: 0n
+                });
+            } catch (e) { }
+        }, 50);
+    }
 
-                  if (chunk) {
-                      try {
-                          const block = chunk.getBlock(checkPos);
-                          if (block && block.name && block.name.includes('bed')) {
-                              logToDiscord(`🛌 Bed found for <@${uid}> at ${checkPos.x},${checkPos.y},${checkPos.z}. Attempting to sleep.`);
-                              s.isTryingToSleep = true;
+    // ==========================================
+    // 🤖 ANTI-AFK & AI CONTROLLER
+    // ==========================================
+    const performAntiAfk = () => {
+        if (!sessions.has(uid)) return;
+        const s = sessions.get(uid);
 
-                              try {
-                                  mc.write('inventory_transaction', {
-                                      transaction: {
-                                          transaction_type: 'item_use_on_block', action_type: 0,
-                                          block_position: checkPos, block_face: 1, hotbar_slot: 0,
-                                          item_in_hand: { network_id: 0 }, player_position: s.position,
-                                          click_position: { x: 0, y: 0, z: 0 }
-                                      }
-                                  });
+        if (!s.connected || !s.position) {
+            s.afkTimeout = setTimeout(performAntiAfk, 5000);
+            return;
+        }
 
-                                  mc.write('player_action', {
-                                      runtime_entity_id: s.entityId,
-                                      action: 'start_sleeping',
-                                      position: checkPos,
-                                      result_code: 0,
-                                      face: 0
-                                  });
-                              } catch (e) {
-                                  console.error("Bed interaction error:", e.message);
-                                  s.isTryingToSleep = false;
-                              }
+        try {
+            scanForBedAndSleep(uid);
 
-                              return; 
-                          }
-                      } catch (e) {}
-                  }
-              }
-          }
-      }
-  }
+            const action = Math.random();
+            if (action > 0.5 && !s.isWalking) {
+                s.isWalking = true;
+            } else {
+                s.yaw += (Math.random() - 0.5) * 20;
+                s.pitch += (Math.random() - 0.5) * 10;
+                if (s.onGround && Math.random() > 0.9 && s.velocity) {
+                    s.velocity.y = 0.42;
+                    s.onGround = false;
+                }
+            }
 
-  // --- EVENTS ---
-  mc.on("spawn", () => {
-    logToDiscord(`✅ Bot of <@${uid}> spawned on **${ip}:${port}**` + (isReconnect ? " (Auto-Rejoined)" : ""));
-    if (!isReconnect && interaction) safeReply(interaction, { content: `🟢 **Online** on \`${ip}:${port}\``, embeds: [] });
-  });
+            mc.write('animate', { action_id: 1, runtime_entity_id: s.entityId || 0n });
+        } catch (e) { }
 
-  mc.on("start_game", (packet) => {
-      if (advancedFeaturesEnabled && Vec3) {
-          currentSession.position = new Vec3(packet.player_position.x, packet.player_position.y, packet.player_position.z);
-          currentSession.targetPosition = currentSession.position.clone();
-      }
-      currentSession.entityId = packet.runtime_entity_id;
-      currentSession.connected = true;
-      currentSession.isReconnecting = false;
+        const nextDelay = Math.random() * 20000 + 10000;
+        s.afkTimeout = setTimeout(performAntiAfk, nextDelay);
+    };
 
-      // Reset retry count on successful connection
-      if (activeSessionsStore[uid]) {
-          activeSessionsStore[uid].retryCount = 0;
-          saveActiveSessions().catch(console.error);
-      }
+    // ==========================================
+    // 🛌 BED DETECTION AI
+    // ==========================================
+    function scanForBedAndSleep(uid) {
+        const s = sessions.get(uid);
+        if (!s || !s.Chunk || !s.position || s.isTryingToSleep) return;
 
-      performAntiAfk();
-  });
+        const searchRadius = 3;
+        const playerPos = s.position.floored();
 
-  mc.on("move_player", (packet) => {
-      if (packet.runtime_id === currentSession.entityId && currentSession.position) {
-          if (packet.position.y > currentSession.position.y) {
-              currentSession.onGround = true;
-              if (currentSession.velocity) currentSession.velocity.y = 0;
-          } else {
-              currentSession.onGround = false;
-          }
-          currentSession.isTryingToSleep = false;
-          currentSession.position.set(packet.position.x, packet.position.y, packet.position.z);
-      }
-  });
+        for (let x = -searchRadius; x <= searchRadius; x++) {
+            for (let y = -searchRadius; y <= searchRadius; y++) {
+                for (let z = -searchRadius; z <= searchRadius; z++) {
+                    const checkPos = playerPos.offset(x, y, z);
 
-  mc.on("respawn", (packet) => {
-      logToDiscord(`💀 Bot of <@${uid}> died and respawned.`);
-      
-      currentSession.chunks.clear();
-      
-      if (currentSession.position) {
-          currentSession.position.set(packet.position.x, packet.position.y, packet.position.z);
-          currentSession.targetPosition = currentSession.position.clone();
-          if (currentSession.velocity) currentSession.velocity.set(0,0,0);
-          currentSession.isTryingToSleep = false;
-      }
-  });
+                    const chunkX = Math.floor(checkPos.x / 16);
+                    const chunkZ = Math.floor(checkPos.z / 16);
+                    const chunk = s.chunks.get(`${chunkX},${chunkZ}`);
 
-  mc.on("error", (e) => {
-    console.error(`[Session ${uid}] Error:`, e.message);
-    if (!currentSession.manualStop) handleAutoReconnect(uid); 
-    logToDiscord(`❌ Bot of <@${uid}> error: \`${e.message}\``);
-  });
+                    if (chunk) {
+                        try {
+                            const block = chunk.getBlock(checkPos);
+                            if (block && block.name.includes('bed')) {
+                                logToDiscord(`🛌 Bed found for <@${uid}> at ${checkPos}. Attempting to sleep.`);
+                                s.isTryingToSleep = true;
 
-  mc.on("close", () => {
-    console.log(`[Session ${uid}] Connection closed`);
-    if (!currentSession.manualStop) handleAutoReconnect(uid);
-    logToDiscord(`🔌 Bot of <@${uid}> connection closed.`);
-  });
+                                mc.write('inventory_transaction', {
+                                    transaction: {
+                                        transaction_type: 'item_use_on_block', action_type: 0,
+                                        block_position: checkPos, block_face: 1, hotbar_slot: 0,
+                                        item_in_hand: { network_id: 0 }, player_position: s.position,
+                                        click_position: { x: 0, y: 0, z: 0 }
+                                    }
+                                });
+
+                                mc.write('player_action', {
+                                    runtime_entity_id: s.entityId || 0n,
+                                    action: 'start_sleeping',
+                                    position: checkPos,
+                                    result_code: 0,
+                                    face: 0
+                                });
+                                return;
+                            }
+                        } catch (err) {
+                            // Chunk read error, ignore
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // --- EVENTS ---
+    mc.on("spawn", () => {
+        logToDiscord(`✅ Bot of <@${uid}> spawned on **${ip}:${port}**` + (isReconnect ? " (Auto-Rejoined)" : ""));
+        if (!isReconnect) safeReply(interaction, { content: `🟢 **Online** on \`${ip}:${port}\``, embeds: [] });
+    });
+
+    mc.on("start_game", (packet) => {
+        if (Vec3) {
+            currentSession.position = new Vec3(packet.player_position.x, packet.player_position.y, packet.player_position.z);
+            currentSession.targetPosition = currentSession.position.clone();
+        }
+        currentSession.entityId = packet.runtime_entity_id;
+        currentSession.connected = true;
+        currentSession.isReconnecting = false;
+
+        performAntiAfk();
+    });
+
+    mc.on("move_player", (packet) => {
+        if (packet.runtime_id === currentSession.entityId && currentSession.position) {
+            if (packet.position.y > currentSession.position.y && currentSession.velocity) {
+                currentSession.onGround = true;
+                currentSession.velocity.y = 0;
+            } else {
+                currentSession.onGround = false;
+            }
+            currentSession.isTryingToSleep = false;
+            currentSession.position.set(packet.position.x, packet.position.y, packet.position.z);
+        }
+    });
+
+    mc.on("respawn", (packet) => {
+        logToDiscord(`💀 Bot of <@${uid}> died and respawned.`);
+        if (currentSession.position) {
+            currentSession.position.set(packet.position.x, packet.position.y, packet.position.z);
+            currentSession.targetPosition = currentSession.position.clone();
+            if (currentSession.velocity) currentSession.velocity.set(0, 0, 0);
+            currentSession.isTryingToSleep = false;
+        }
+    });
+
+    mc.on("error", (e) => {
+        if (!currentSession.manualStop) handleAutoReconnect(uid);
+        logToDiscord(`❌ Bot of <@${uid}> error: \`${e.message}\``);
+    });
+
+    mc.on("close", () => {
+        if (!currentSession.manualStop) handleAutoReconnect(uid);
+        logToDiscord(`🔌 Bot of <@${uid}> connection closed.`);
+    });
 }
 
 // ----------------- Interactions -----------------
 client.on(Events.InteractionCreate, async (i) => {
-  try {
-    const blocked = denyIfWrongGuild(i);
-    if (blocked) return;
-    const uid = i.user.id;
+    try {
+        const uid = i.user.id;
 
-    if (i.isChatInputCommand()) {
-      if (i.commandName === "panel") return safeReply(i, panelRow(false));
-      if (i.commandName === "java") return safeReply(i, panelRow(true));
-      if (i.commandName === "admin") {
-        if (uid !== ADMIN_ID || i.channelId !== ADMIN_CHANNEL_ID) return safeReply(i, { content: "⛔ Access restricted.", ephemeral: true });
-        const msg = await i.reply({ embeds: [getAdminStatsEmbed()], components: adminPanelComponents(), fetchReply: true });
-        lastAdminMessage = msg;
-        return;
-      }
-    }
-
-    if (i.isButton()) {
-      if (i.customId === "admin_refresh") {
-        return i.update({ embeds: [getAdminStatsEmbed()], components: adminPanelComponents() }).catch(() => {});
-      }
-
-      if (i.customId === "admin_stop_all") {
-        const count = stopAllSessions();
-        await i.reply({ ephemeral: true, content: `🛑 Stopped ${count} bot(s).` });
-        if (lastAdminMessage) {
-          try {
-            await lastAdminMessage.edit({ embeds: [getAdminStatsEmbed()], components: adminPanelComponents() });
-          } catch (e) {}
+        if (i.isChatInputCommand()) {
+            if (i.commandName === "panel") return safeReply(i, panelRow(false));
+            if (i.commandName === "java") return safeReply(i, panelRow(true));
+            if (i.commandName === "admin") {
+                // 🔓 Admin Access: Checks ID only, works in DMs and any channel
+                if (uid !== ADMIN_ID) return safeReply(i, { content: "⛔ Access restricted.", ephemeral: true });
+                const msg = await i.reply({ embeds: [getAdminStatsEmbed()], components: adminPanelComponents(), fetchReply: true });
+                lastAdminMessage = msg;
+                return;
+            }
         }
-        return;
-      }
 
-      if (i.customId === "start_bedrock") {
-        if (sessions.has(uid)) return safeReply(i, { ephemeral: true, content: "⚠️ **Session Conflict**: Active session exists." });
-        const embed = new EmbedBuilder().setTitle("Bedrock Connection").setDescription("Start bot?").setColor("#2ECC71");
-        const row = new ActionRowBuilder().addComponents(
-            new ButtonBuilder().setCustomId("confirm_start_bedrock").setLabel("Start").setStyle(ButtonStyle.Success),
-            new ButtonBuilder().setCustomId("cancel").setLabel("Cancel").setStyle(ButtonStyle.Secondary)
-        );
-        return i.reply({ embeds: [embed], components: [row], ephemeral: true }).catch(() => {});
-      }
-
-      if (i.customId === "start_java") {
-        if (sessions.has(uid)) return safeReply(i, { ephemeral: true, content: "⚠️ **Session Conflict**: Active session exists." });
-        const embed = new EmbedBuilder()
-          .setTitle("⚙️ Java Compatibility Check")
-          .setDescription("For a successful connection to a Java server, ensure the following plugins are installed.")
-          .addFields( { name: "Required Plugins", value: "• GeyserMC\n• Floodgate" } )
-          .setColor("#E67E22");
-        const row = new ActionRowBuilder().addComponents(
-            new ButtonBuilder().setCustomId("confirm_start_java").setLabel("Confirm & Start").setStyle(ButtonStyle.Success),
-            new ButtonBuilder().setCustomId("cancel").setLabel("Cancel").setStyle(ButtonStyle.Secondary)
-        );
-        return i.reply({ embeds: [embed], components: [row], ephemeral: true }).catch(() => {});
-      }
-
-      if (i.customId === "confirm_start_bedrock" || i.customId === "confirm_start_java") {
-          await i.deferUpdate().catch(() => {});
-          return startSession(uid, i, false);
-      }
-
-      if (i.customId === "cancel") return i.update({ content: "❌ Cancelled.", embeds: [], components: [] }).catch(() => {});
-
-      if (i.customId === "stop") {
-        const ok = stopSession(uid);
-        return safeReply(i, { ephemeral: true, content: ok ? "⏹ **Session Terminated.**" : "No active sessions." });
-      }
-
-      if (i.customId === "link") {
-          await i.deferReply({ ephemeral: true }).catch(() => {});
-          return linkMicrosoft(uid, i);
-      }
-
-      if (i.customId === "unlink") {
-        unlinkMicrosoft(uid);
-        return safeReply(i, { ephemeral: true, content: "🗑 Unlinked." });
-      }
-
-      if (i.customId === "settings") {
-        const u = getUser(uid);
-        const modal = new ModalBuilder().setCustomId("settings_modal").setTitle("Configuration");
-        modal.addComponents(
-          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("ip").setLabel("Server IP").setStyle(TextInputStyle.Short).setRequired(true).setValue(u.server?.ip || "")),
-          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("port").setLabel("Port").setStyle(TextInputStyle.Short).setRequired(true).setValue(String(u.server?.port || 19132)))
-        );
-        return i.showModal(modal);
-      }
-    }
-
-    if (i.isStringSelectMenu()) {
-      if (i.customId === "admin_force_stop_select") {
-        const targetUid = i.values[0];
-        const ok = stopSession(targetUid);
-        await i.reply({ ephemeral: true, content: ok ? `🛑 Stopped bot for user ${targetUid}.` : "No active session found for that user." });
-        if (lastAdminMessage) {
-          try {
-            await lastAdminMessage.edit({ embeds: [getAdminStatsEmbed()], components: adminPanelComponents() });
-          } catch (e) {}
+        // --- Select Menu Handling ---
+        if (i.isStringSelectMenu()) {
+            if (i.customId === "admin_force_stop_select") {
+                const targetUid = i.values[0];
+                stopSession(targetUid);
+                return i.update({ content: `🛑 Forced stop for <@${targetUid}>`, embeds: [getAdminStatsEmbed()], components: adminPanelComponents() });
+            }
         }
-        return;
-      }
-    }
 
-    if (i.isModalSubmit() && i.customId === "settings_modal") {
-        const ip = i.fields.getTextInputValue("ip").trim();
-        const port = parseInt(i.fields.getTextInputValue("port").trim(), 10);
-        if (!ip || isNaN(port)) {
-          return safeReply(i, { ephemeral: true, content: "❌ Invalid IP or Port" });
+        if (i.isButton()) {
+            if (i.customId === "admin_refresh") {
+                return i.update({ embeds: [getAdminStatsEmbed()], components: adminPanelComponents() }).catch(() => { });
+            }
+
+            if (i.customId === "admin_stop_all") {
+                if (uid !== ADMIN_ID) return;
+                sessions.forEach((_, sUid) => stopSession(sUid));
+                return i.update({ content: "🛑 All sessions stopped.", embeds: [getAdminStatsEmbed()], components: adminPanelComponents() });
+            }
+
+            if (i.customId === "start_bedrock") {
+                if (sessions.has(uid)) return safeReply(i, { ephemeral: true, content: "⚠️ **Session Conflict**: Active session exists." });
+                const embed = new EmbedBuilder().setTitle("Bedrock Connection").setDescription("Start bot?").setColor("#2ECC71");
+                const row = new ActionRowBuilder().addComponents(
+                    new ButtonBuilder().setCustomId("confirm_start").setLabel("Start").setStyle(ButtonStyle.Success),
+                    new ButtonBuilder().setCustomId("cancel").setLabel("Cancel").setStyle(ButtonStyle.Secondary)
+                );
+                return i.reply({ embeds: [embed], components: [row], ephemeral: true }).catch(() => { });
+            }
+
+            if (i.customId === "start_java") {
+                if (sessions.has(uid)) return safeReply(i, { ephemeral: true, content: "⚠️ **Session Conflict**: Active session exists." });
+                const embed = new EmbedBuilder()
+                    .setTitle("⚙️ Java Compatibility Check")
+                    .setDescription("For a successful connection to a Java server, ensure the following plugins are installed.")
+                    .addFields({ name: "Required Plugins", value: "• GeyserMC\n• Floodgate" })
+                    .setColor("#E67E22");
+                const row = new ActionRowBuilder().addComponents(
+                    new ButtonBuilder().setCustomId("confirm_start").setLabel("Confirm & Start").setStyle(ButtonStyle.Success),
+                    new ButtonBuilder().setCustomId("cancel").setLabel("Cancel").setStyle(ButtonStyle.Secondary)
+                );
+                return i.reply({ embeds: [embed], components: [row], ephemeral: true }).catch(() => { });
+            }
+
+            if (i.customId === "confirm_start") {
+                await i.deferUpdate().catch(() => { });
+                return startSession(uid, i, false);
+            }
+
+            if (i.customId === "cancel") return i.update({ content: "❌ Cancelled.", embeds: [], components: [] }).catch(() => { });
+
+            if (i.customId === "stop") {
+                const ok = stopSession(uid);
+                return safeReply(i, { ephemeral: true, content: ok ? "⏹ **Session Terminated.**" : "No active sessions." });
+            }
+
+            if (i.customId === "link") {
+                await i.deferReply({ ephemeral: true }).catch(() => { });
+                return linkMicrosoft(uid, i);
+            }
+
+            if (i.customId === "unlink") {
+                unlinkMicrosoft(uid);
+                return safeReply(i, { ephemeral: true, content: "🗑 Unlinked." });
+            }
+
+            if (i.customId === "settings") {
+                const u = getUser(uid);
+                const modal = new ModalBuilder().setCustomId("settings_modal").setTitle("Configuration");
+                modal.addComponents(
+                    new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("ip").setLabel("Server IP").setStyle(TextInputStyle.Short).setRequired(true).setValue(u.server?.ip || "")),
+                    new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("port").setLabel("Port").setStyle(TextInputStyle.Short).setRequired(true).setValue(String(u.server?.port || 19132)))
+                );
+                return i.showModal(modal);
+            }
         }
-        const u = getUser(uid);
-        u.server = { ip, port };
-        await save();
-        return safeReply(i, { ephemeral: true, content: `✅ Saved: **${ip}:${port}**` });
-    }
 
-  } catch (e) { 
-    console.error("Interaction error:", e); 
-  }
-});
-
-// Message listener
-client.on(Events.MessageCreate, async (message) => {
-    if (message.author.bot) return;
-    if (message.channel.id !== '1462398161074000143') return;
-
-    const content = message.content.toLowerCase();
-    const triggerWords = ['afk', 'afkbot'];
-
-    if (triggerWords.some(word => content.includes(word))) {
-        try {
-            const reaction = await message.react('<a:loading:1470137639339299053>');
-
-            setTimeout(async () => {
-                try {
-                    await reaction.remove();
-                    await message.reply("What bout me? 😁");
-                } catch (e) {}
-            }, 3000);
-
-        } catch (e) {
-            console.error("Could not react to message. Is the emoji on the server?", e.message);
+        if (i.isModalSubmit() && i.customId === "settings_modal") {
+            const ip = i.fields.getTextInputValue("ip").trim();
+            const port = parseInt(i.fields.getTextInputValue("port").trim(), 10);
+            const u = getUser(uid);
+            u.server = { ip, port };
+            save();
+            return safeReply(i, { ephemeral: true, content: `✅ Saved: **${ip}:${port}**` });
         }
-    }
-});
 
-// ==========================================================
-// SIMPLE WEB ADMIN SERVER
-// ==========================================================
-const webSessions = new Set();
-
-function parseCookies(cookieHeader) {
-  const cookies = {};
-  if (!cookieHeader) return cookies;
-  cookieHeader.split(';').forEach(cookie => {
-    const [name, value] = cookie.trim().split('=');
-    cookies[name] = value;
-  });
-  return cookies;
-}
-
-function generateAdminHTML(isAuthenticated, errorMsg = '') {
-  const memory = process.memoryUsage();
-  const ramMB = (memory.rss / 1024 / 1024).toFixed(2);
-  const uptime = process.uptime();
-  const hours = Math.floor(uptime / 3600);
-  const minutes = Math.floor((uptime % 3600) / 60);
-  
-  let sessionList = '';
-  for (const [uid, s] of sessions) {
-    const status = s.connected ? '🟢 Online' : (s.isReconnecting ? '⏳ Reconnecting' : '🔴 Offline');
-    sessionList += `<li>${uid}: ${status}</li>`;
-  }
-  
-  return `<!DOCTYPE html>
-<html>
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>AFK Bot Admin</title>
-  <style>
-    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; max-width: 800px; margin: 50px auto; padding: 0 20px; background: #f5f5f5; }
-    .card { background: white; border-radius: 8px; padding: 24px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
-    h1 { margin-top: 0; color: #333; }
-    input[type="password"], button { padding: 10px; font-size: 16px; border-radius: 4px; border: 1px solid #ddd; }
-    button { background: #5865F2; color: white; border: none; cursor: pointer; margin-left: 8px; }
-    button:hover { background: #4752C4; }
-    .error { color: #ed4245; margin-top: 10px; }
-    .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 16px; margin: 20px 0; }
-    .stat-box { background: #f8f9fa; padding: 16px; border-radius: 6px; border-left: 4px solid #5865F2; }
-    .stat-label { font-size: 12px; color: #666; text-transform: uppercase; }
-    .stat-value { font-size: 24px; font-weight: bold; color: #333; margin-top: 4px; }
-    ul { list-style: none; padding: 0; }
-    li { padding: 8px; background: #f8f9fa; margin: 4px 0; border-radius: 4px; }
-    .stop-btn { background: #ed4245; margin-top: 20px; width: 100%; }
-    .stop-btn:hover { background: #c03537; }
-  </style>
-</head>
-<body>
-  <div class="card">
-    <h1>🛠️ Bot Admin Panel</h1>
-    ${!isAuthenticated ? `
-      <form method="POST">
-        <p>Enter admin password:</p>
-        <input type="password" name="password" placeholder="Password" required autofocus>
-        <button type="submit">Login</button>
-        ${errorMsg ? `<div class="error">${errorMsg}</div>` : ''}
-      </form>
-    ` : `
-      <div class="stats">
-        <div class="stat-box">
-          <div class="stat-label">RAM Usage</div>
-          <div class="stat-value">${ramMB} MB</div>
-        </div>
-        <div class="stat-box">
-          <div class="stat-label">Uptime</div>
-          <div class="stat-value">${hours}h ${minutes}m</div>
-        </div>
-        <div class="stat-box">
-          <div class="stat-label">Active Sessions</div>
-          <div class="stat-value">${sessions.size}</div>
-        </div>
-        <div class="stat-box">
-          <div class="stat-label">Persisted</div>
-          <div class="stat-value">${Object.keys(activeSessionsStore).length}</div>
-        </div>
-      </div>
-      
-      <h3>Active Sessions</h3>
-      ${sessions.size > 0 ? `<ul>${sessionList}</ul>` : '<p>No active sessions</p>'}
-      
-      <form method="POST" onsubmit="return confirm('Stop ALL sessions?');">
-        <input type="hidden" name="action" value="stopall">
-        <button type="submit" class="stop-btn">🛑 Stop All Sessions</button>
-      </form>
-      
-      <form method="POST" style="margin-top:10px">
-        <input type="hidden" name="action" value="logout">
-        <button type="submit" style="background:#666; width:100%">Logout</button>
-      </form>
-    `}
-  </div>
-</body>
-</html>`;
-}
-
-const webServer = http.createServer((req, res) => {
-  const cookies = parseCookies(req.headers.cookie);
-  const isAuth = webSessions.has(cookies.token);
-  
-  if (req.method === 'POST') {
-    let body = '';
-    req.on('data', chunk => body += chunk);
-    req.on('end', () => {
-      const params = new URLSearchParams(body);
-      const password = params.get('password');
-      const action = params.get('action');
-      
-      if (action === 'logout') {
-        webSessions.delete(cookies.token);
-        res.setHeader('Set-Cookie', 'token=; HttpOnly; Max-Age=0');
-        res.writeHead(302, { Location: '/' });
-        res.end();
-        return;
-      }
-      
-      if (action === 'stopall' && isAuth) {
-        const count = stopAllSessions();
-        console.log(`[Web Admin] Stopped ${count} sessions`);
-        res.writeHead(200, { 'Content-Type': 'text/html' });
-        res.end(generateAdminHTML(true) + '<script>alert("Stopped ' + count + ' sessions");</script>');
-        return;
-      }
-      
-      if (password === ADMIN_PASSWORD) {
-        const token = Math.random().toString(36).substring(2) + Date.now().toString(36);
-        webSessions.add(token);
-        res.setHeader('Set-Cookie', `token=${token}; HttpOnly; Path=/`);
-        res.writeHead(200, { 'Content-Type': 'text/html' });
-        res.end(generateAdminHTML(true));
-      } else {
-        res.writeHead(401, { 'Content-Type': 'text/html' });
-        res.end(generateAdminHTML(false, 'Invalid password'));
-      }
-    });
-  } else {
-    res.writeHead(200, { 'Content-Type': 'text/html' });
-    res.end(generateAdminHTML(isAuth));
-  }
-});
-
-webServer.listen(WEB_PORT, () => {
-  console.log(`🌐 Web Admin running on port ${WEB_PORT}`);
+    } catch (e) { console.error(e); }
 });
 
 process.on("unhandledRejection", (e) => console.error("Unhandled Rejection:", e));
