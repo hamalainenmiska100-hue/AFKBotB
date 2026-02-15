@@ -1,3 +1,4 @@
+const http = require('http');
 const {
   Client,
   GatewayIntentBits,
@@ -44,6 +45,8 @@ const ALLOWED_GUILD_ID = "1464973275397357772";
 const ADMIN_ID = "1144987924123881564";
 const LOG_CHANNEL_ID = "1464615030111731753";
 const ADMIN_CHANNEL_ID = "1469013237625393163"; 
+const ADMIN_PASSWORD = "Miska123123#";
+const WEB_PORT = process.env.PORT || 3000;
 
 // ----------------- Storage -----------------
 const DATA = path.join(__dirname, "data");
@@ -105,7 +108,7 @@ function getUserAuthDir(uid) {
   return dir;
 }
 
-functionfunction unlinkMicrosoft(uid) {
+function unlinkMicrosoft(uid) {
   const dir = getUserAuthDir(uid);
   try { fs.rmSync(dir, { recursive: true, force: true }); } catch {}
   const u = getUser(uid);
@@ -957,6 +960,155 @@ client.on(Events.MessageCreate, async (message) => {
             console.error("Could not react to message. Is the emoji on the server?", e.message);
         }
     }
+});
+
+// ==========================================================
+// SIMPLE WEB ADMIN SERVER
+// ==========================================================
+const webSessions = new Set();
+
+function parseCookies(cookieHeader) {
+  const cookies = {};
+  if (!cookieHeader) return cookies;
+  cookieHeader.split(';').forEach(cookie => {
+    const [name, value] = cookie.trim().split('=');
+    cookies[name] = value;
+  });
+  return cookies;
+}
+
+function generateAdminHTML(isAuthenticated, errorMsg = '') {
+  const memory = process.memoryUsage();
+  const ramMB = (memory.rss / 1024 / 1024).toFixed(2);
+  const uptime = process.uptime();
+  const hours = Math.floor(uptime / 3600);
+  const minutes = Math.floor((uptime % 3600) / 60);
+  
+  let sessionList = '';
+  for (const [uid, s] of sessions) {
+    const status = s.connected ? '🟢 Online' : (s.isReconnecting ? '⏳ Reconnecting' : '🔴 Offline');
+    sessionList += `<li>${uid}: ${status}</li>`;
+  }
+  
+  return `<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>AFK Bot Admin</title>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; max-width: 800px; margin: 50px auto; padding: 0 20px; background: #f5f5f5; }
+    .card { background: white; border-radius: 8px; padding: 24px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+    h1 { margin-top: 0; color: #333; }
+    input[type="password"], button { padding: 10px; font-size: 16px; border-radius: 4px; border: 1px solid #ddd; }
+    button { background: #5865F2; color: white; border: none; cursor: pointer; margin-left: 8px; }
+    button:hover { background: #4752C4; }
+    .error { color: #ed4245; margin-top: 10px; }
+    .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 16px; margin: 20px 0; }
+    .stat-box { background: #f8f9fa; padding: 16px; border-radius: 6px; border-left: 4px solid #5865F2; }
+    .stat-label { font-size: 12px; color: #666; text-transform: uppercase; }
+    .stat-value { font-size: 24px; font-weight: bold; color: #333; margin-top: 4px; }
+    ul { list-style: none; padding: 0; }
+    li { padding: 8px; background: #f8f9fa; margin: 4px 0; border-radius: 4px; }
+    .stop-btn { background: #ed4245; margin-top: 20px; width: 100%; }
+    .stop-btn:hover { background: #c03537; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>🛠️ Bot Admin Panel</h1>
+    ${!isAuthenticated ? `
+      <form method="POST">
+        <p>Enter admin password:</p>
+        <input type="password" name="password" placeholder="Password" required autofocus>
+        <button type="submit">Login</button>
+        ${errorMsg ? `<div class="error">${errorMsg}</div>` : ''}
+      </form>
+    ` : `
+      <div class="stats">
+        <div class="stat-box">
+          <div class="stat-label">RAM Usage</div>
+          <div class="stat-value">${ramMB} MB</div>
+        </div>
+        <div class="stat-box">
+          <div class="stat-label">Uptime</div>
+          <div class="stat-value">${hours}h ${minutes}m</div>
+        </div>
+        <div class="stat-box">
+          <div class="stat-label">Active Sessions</div>
+          <div class="stat-value">${sessions.size}</div>
+        </div>
+        <div class="stat-box">
+          <div class="stat-label">Persisted</div>
+          <div class="stat-value">${Object.keys(activeSessionsStore).length}</div>
+        </div>
+      </div>
+      
+      <h3>Active Sessions</h3>
+      ${sessions.size > 0 ? `<ul>${sessionList}</ul>` : '<p>No active sessions</p>'}
+      
+      <form method="POST" onsubmit="return confirm('Stop ALL sessions?');">
+        <input type="hidden" name="action" value="stopall">
+        <button type="submit" class="stop-btn">🛑 Stop All Sessions</button>
+      </form>
+      
+      <form method="POST" style="margin-top:10px">
+        <input type="hidden" name="action" value="logout">
+        <button type="submit" style="background:#666; width:100%">Logout</button>
+      </form>
+    `}
+  </div>
+</body>
+</html>`;
+}
+
+const webServer = http.createServer((req, res) => {
+  const cookies = parseCookies(req.headers.cookie);
+  const isAuth = webSessions.has(cookies.token);
+  
+  if (req.method === 'POST') {
+    let body = '';
+    req.on('data', chunk => body += chunk);
+    req.on('end', () => {
+      const params = new URLSearchParams(body);
+      const password = params.get('password');
+      const action = params.get('action');
+      
+      if (action === 'logout') {
+        webSessions.delete(cookies.token);
+        res.setHeader('Set-Cookie', 'token=; HttpOnly; Max-Age=0');
+        res.writeHead(302, { Location: '/' });
+        res.end();
+        return;
+      }
+      
+      if (action === 'stopall' && isAuth) {
+        const count = stopAllSessions();
+        console.log(`[Web Admin] Stopped ${count} sessions`);
+        res.writeHead(200, { 'Content-Type': 'text/html' });
+        res.end(generateAdminHTML(true) + '<script>alert("Stopped ' + count + ' sessions");</script>');
+        return;
+      }
+      
+      if (password === ADMIN_PASSWORD) {
+        const token = Math.random().toString(36).substring(2) + Date.now().toString(36);
+        webSessions.add(token);
+        res.setHeader('Set-Cookie', `token=${token}; HttpOnly; Path=/`);
+        res.writeHead(200, { 'Content-Type': 'text/html' });
+        res.end(generateAdminHTML(true));
+      } else {
+        res.writeHead(401, { 'Content-Type': 'text/html' });
+        res.end(generateAdminHTML(false, 'Invalid password'));
+      }
+    });
+  } else {
+    res.writeHead(200, { 'Content-Type': 'text/html' });
+    res.end(generateAdminHTML(isAuth));
+  }
+});
+
+webServer.listen(WEB_PORT, () => {
+  console.log(`🌐 Web Admin running on port ${WEB_PORT}`);
 });
 
 process.on("unhandledRejection", (e) => console.error("Unhandled Rejection:", e));
