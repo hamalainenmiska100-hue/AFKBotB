@@ -105,7 +105,7 @@ function getUserAuthDir(uid) {
   return dir;
 }
 
-function unlinkMicrosoft(uid) {
+functionfunction unlinkMicrosoft(uid) {
   const dir = getUserAuthDir(uid);
   try { fs.rmSync(dir, { recursive: true, force: true }); } catch {}
   const u = getUser(uid);
@@ -392,37 +392,44 @@ function stopAllSessions() {
 
 function handleAutoReconnect(uid) {
     const s = sessions.get(uid);
-    if (!s || s.manualStop) {
-      console.log(`[Reconnect] Aborting for ${uid}: manual stop or no session`);
+    
+    // If manually stopped explicitly, abort
+    if (s?.manualStop) {
+      console.log(`[Reconnect] Aborting for ${uid}: manual stop`);
       return;
     }
-
-    // Prevent multiple reconnect timers
-    if (s.reconnectTimer) {
-      clearTimeout(s.reconnectTimer);
-      s.reconnectTimer = null;
+    
+    // If no session in memory AND no persisted data, abort
+    if (!s && !activeSessionsStore[uid]) {
+        console.log(`[Reconnect] Aborting for ${uid}: no session data`);
+        return;
     }
 
-    s.isReconnecting = true;
-    s.connected = false;
+    // Prevent multiple timers
+    if (s?.reconnectTimer) {
+      clearTimeout(s.reconnectTimer);
+    }
+
+    // Create minimal session tracker if none exists (for reconnect logic)
+    if (!s) {
+        sessions.set(uid, { manualStop: false, isReconnecting: true, reconnectTimer: null });
+    } else {
+        s.isReconnecting = true;
+        s.connected = false;
+    }
+    
+    const sessionObj = sessions.get(uid);
     logToDiscord(`⏳ Bot of <@${uid}> disconnected. Reconnecting in 60s...`);
 
-    s.reconnectTimer = setTimeout(() => {
-        console.log(`[Reconnect] Attempting reconnect for ${uid}`);
-        if (!sessions.has(uid)) {
-          console.log(`[Reconnect] Session ${uid} no longer exists, aborting`);
-          return;
-        }
-        
-        const checkS = sessions.get(uid);
-        if (!checkS.manualStop) {
-            // Clean up old session before starting new one
+    sessionObj.reconnectTimer = setTimeout(() => {
+        // Check if stopped during wait
+        const currentS = sessions.get(uid);
+        if (currentS?.manualStop) {
             cleanupSession(uid);
-            startSession(uid, null, true); 
-        } else {
-            console.log(`[Reconnect] Session ${uid} was manually stopped, cleaning up`);
-            cleanupSession(uid);
+            return;
         }
+        cleanupSession(uid);
+        startSession(uid, null, true); 
     }, 60000);
 }
 
@@ -441,8 +448,16 @@ async function startSession(uid, interaction, isReconnect = false) {
   console.log(`[Start] Starting session for ${uid}, reconnect: ${isReconnect}`);
   const u = getUser(uid);
 
-  // Validate server configuration
-  if (!u.server || !u.server.ip || !u.server.port) {
+  // Validate server configuration - check user settings first, then persisted data
+  let ip, port;
+  if (u.server?.ip && u.server?.port) {
+      ip = u.server.ip;
+      port = u.server.port;
+  } else if (activeSessionsStore[uid]?.ip && activeSessionsStore[uid]?.port) {
+      ip = activeSessionsStore[uid].ip;
+      port = activeSessionsStore[uid].port;
+      console.log(`[Start] Using persisted server config for ${uid}: ${ip}:${port}`);
+  } else {
       console.log(`[Start] No server config for ${uid}`);
       if (activeSessionsStore[uid]) {
         delete activeSessionsStore[uid];
@@ -451,8 +466,6 @@ async function startSession(uid, interaction, isReconnect = false) {
       if (!isReconnect && interaction) await safeReply(interaction, "⚠ Please configure your server settings first.");
       return;
   }
-
-  const { ip, port } = u.server;
 
   // If not reconnect and already has session, deny
   if (!isReconnect && sessions.has(uid)) {
@@ -492,9 +505,11 @@ async function startSession(uid, interaction, isReconnect = false) {
       console.error(`[Start] Ping failed for ${uid}:`, err.message);
       logToDiscord(`❌ Connection failure for <@${uid}>: Server ${ip}:${port} unreachable.`);
       
-      // Remove from active sessions since connection failed
-      delete activeSessionsStore[uid];
-      saveActiveSessions();
+      // Only remove persisted data on new connections, not reconnects
+      if (!isReconnect) {
+          delete activeSessionsStore[uid];
+          saveActiveSessions();
+      }
       
       if (isReconnect) {
         handleAutoReconnect(uid); 
