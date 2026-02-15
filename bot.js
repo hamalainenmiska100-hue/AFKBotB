@@ -47,7 +47,7 @@ const LOG_CHANNEL_ID = "1464615030111731753";
 const ADMIN_CHANNEL_ID = "1469013237625393163"; 
 const ADMIN_PASSWORD = "Miska123123#";
 const WEB_PORT = process.env.PORT || 3000;
-const MAX_RECONNECT_RETRIES = 5; // NEW: Prevent infinite rejoin loops
+const MAX_RECONNECT_RETRIES = 67000; // NEW: Prevent infinite rejoin loops
 
 // ----------------- Storage -----------------
 const DATA = path.join(__dirname, "data");
