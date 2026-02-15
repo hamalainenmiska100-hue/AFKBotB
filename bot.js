@@ -47,14 +47,15 @@ const LOG_CHANNEL_ID = "1464615030111731753";
 const ADMIN_CHANNEL_ID = "1469013237625393163"; 
 const ADMIN_PASSWORD = "Miska123123#";
 const WEB_PORT = process.env.PORT || 3000;
+const MAX_RECONNECT_RETRIES = 5; // NEW: Prevent infinite rejoin loops
 
 // ----------------- Storage -----------------
 const DATA = path.join(__dirname, "data");
 const AUTH_ROOT = path.join(DATA, "auth");
 const STORE = path.join(DATA, "users.json");
 const REJOIN_STORE = path.join(DATA, "ReJoin.json");
-const STORE_TEMP = path.join(DATA, "users.json.tmp");
-const REJOIN_TEMP = path.join(DATA, "ReJoin.json.tmp");
+const STORE_BACKUP = path.join(DATA, "users.json.bak");
+const REJOIN_BACKUP = path.join(DATA, "ReJoin.json.bak");
 
 if (!fs.existsSync(DATA)) fs.mkdirSync(DATA, { recursive: true });
 if (!fs.existsSync(AUTH_ROOT)) fs.mkdirSync(AUTH_ROOT, { recursive: true });
@@ -62,37 +63,90 @@ if (!fs.existsSync(AUTH_ROOT)) fs.mkdirSync(AUTH_ROOT, { recursive: true });
 let users = {};
 let activeSessionsStore = {};
 
-try {
-  if (fs.existsSync(STORE)) users = JSON.parse(fs.readFileSync(STORE, "utf8"));
-} catch (e) {
-  console.error("Failed to load users.json:", e.message);
-  users = {};
-}
+// NEW: File operation queues to prevent race conditions
+const fileQueues = new Map();
 
-try {
-  if (fs.existsSync(REJOIN_STORE)) activeSessionsStore = JSON.parse(fs.readFileSync(REJOIN_STORE, "utf8"));
-} catch (e) {
-  console.error("Failed to load ReJoin.json:", e.message);
-  activeSessionsStore = {};
-}
-
-// Atomic save functions to prevent corruption
-function save() {
+// NEW: Robust JSON loader with corruption recovery
+function loadJsonSafe(filePath, defaultValue = {}) {
   try {
-    fs.writeFileSync(STORE_TEMP, JSON.stringify(users, null, 2));
-    fs.renameSync(STORE_TEMP, STORE);
+    if (!fs.existsSync(filePath)) return defaultValue;
+    const content = fs.readFileSync(filePath, "utf8");
+    // Check if empty
+    if (!content.trim()) throw new Error("Empty file");
+    return JSON.parse(content);
   } catch (e) {
-    console.error("Failed to save users.json:", e.message);
+    console.error(`⚠️ Corrupted or missing ${path.basename(filePath)}:`, e.message);
+    
+    // Try backup if main file fails
+    const backupPath = filePath.replace('.json', '.json.bak');
+    if (fs.existsSync(backupPath)) {
+      try {
+        const backupContent = fs.readFileSync(backupPath, "utf8");
+        const parsed = JSON.parse(backupContent);
+        console.log(`✅ Restored ${path.basename(filePath)} from backup`);
+        // Restore main file from backup
+        fs.writeFileSync(filePath, backupContent);
+        return parsed;
+      } catch (backupErr) {
+        console.error(`❌ Backup also corrupted for ${path.basename(filePath)}`);
+      }
+    }
+    
+    // Create fresh file if both corrupted
+    console.log(`📝 Creating new ${path.basename(filePath)}`);
+    try {
+      fs.writeFileSync(filePath, JSON.stringify(defaultValue, null, 2));
+    } catch (writeErr) {
+      console.error(`❌ Failed to create ${path.basename(filePath)}:`, writeErr.message);
+    }
+    return defaultValue;
   }
+}
+
+// NEW: Queued atomic save with backup creation
+async function saveJsonQueued(filePath, data, tempPath, backupPath) {
+  // Create queue for this specific file if doesn't exist
+  if (!fileQueues.has(filePath)) {
+    fileQueues.set(filePath, Promise.resolve());
+  }
+  
+  const queue = fileQueues.get(filePath);
+  const newPromise = queue.then(async () => {
+    try {
+      // Write to temp first
+      fs.writeFileSync(tempPath, JSON.stringify(data, null, 2));
+      
+      // Create backup of current valid file before replacing
+      if (fs.existsSync(filePath)) {
+        fs.copyFileSync(filePath, backupPath);
+      }
+      
+      // Atomic rename
+      fs.renameSync(tempPath, filePath);
+      return true;
+    } catch (e) {
+      console.error(`Failed to save ${path.basename(filePath)}:`, e.message);
+      return false;
+    }
+  });
+  
+  fileQueues.set(filePath, newPromise);
+  return newPromise;
+}
+
+// Load data with corruption recovery
+users = loadJsonSafe(STORE, {});
+activeSessionsStore = loadJsonSafe(REJOIN_STORE, {});
+
+// Updated save functions using queues
+function save() {
+  const tempPath = STORE + '.tmp';
+  return saveJsonQueued(STORE, users, tempPath, STORE_BACKUP);
 }
 
 function saveActiveSessions() {
-  try {
-    fs.writeFileSync(REJOIN_TEMP, JSON.stringify(activeSessionsStore, null, 2));
-    fs.renameSync(REJOIN_TEMP, REJOIN_STORE);
-  } catch (e) {
-    console.error("Failed to save ReJoin.json:", e.message);
-  }
+  const tempPath = REJOIN_STORE + '.tmp';
+  return saveJsonQueued(REJOIN_STORE, activeSessionsStore, tempPath, REJOIN_BACKUP);
 }
 
 function getUser(uid) {
@@ -108,7 +162,15 @@ function getUserAuthDir(uid) {
   return dir;
 }
 
+// FIXED: Properly cancel pending auth and cleanup
 function unlinkMicrosoft(uid) {
+  // Cancel any pending auth flows
+  if (pendingLink.has(uid)) {
+    const pending = pendingLink.get(uid);
+    pending.aborted = true; // Flag to stop processing
+    pendingLink.delete(uid);
+  }
+  
   const dir = getUserAuthDir(uid);
   try { fs.rmSync(dir, { recursive: true, force: true }); } catch {}
   const u = getUser(uid);
@@ -269,10 +331,14 @@ client.once("ready", async () => {
               delete activeSessionsStore[uid];
               continue;
           }
+          // Reset retry count on fresh boot
+          if (activeSessionsStore[uid]) {
+            activeSessionsStore[uid].retryCount = 0;
+          }
           setTimeout(() => startSession(uid, null, true), delay);
           delay += 5000; 
       }
-      saveActiveSessions(); // Save cleaned up store
+      await saveActiveSessions(); // Save cleaned up store
   } else {
       console.log("⚪ No previous sessions found.");
   }
@@ -281,7 +347,6 @@ client.once("ready", async () => {
 // ----------------- Microsoft link -----------------
 async function linkMicrosoft(uid, interaction) {
   if (pendingLink.has(uid)) {
-    // Check if pending link is older than 10 minutes
     const pending = pendingLink.get(uid);
     if (Date.now() - pending.startTime > 10 * 60 * 1000) {
       pendingLink.delete(uid);
@@ -295,6 +360,9 @@ async function linkMicrosoft(uid, interaction) {
   let codeShown = false;
 
   const flow = new Authflow(uid, authDir, { flow: "live", authTitle: Titles?.MinecraftNintendoSwitch || "Bedrock AFK Bot", deviceType: "Nintendo" }, async (data) => {
+      // Check if aborted
+      if (pendingLink.has(uid) && pendingLink.get(uid).aborted) return;
+      
       const uri = data.verification_uri_complete || data.verification_uri || "https://www.microsoft.com/link";
       const code = data.user_code || "(no code)";
       lastMsa.set(uid, { uri, code, at: Date.now() });
@@ -305,15 +373,25 @@ async function linkMicrosoft(uid, interaction) {
 
   const pendingObj = {
     startTime: Date.now(),
+    aborted: false,
     promise: (async () => {
       try {
         if (!codeShown) await interaction.editReply("⏳ Requesting code…");
         await flow.getMsaToken();
+        
+        // Check if aborted during token fetch
+        if (pendingObj.aborted) {
+          await interaction.editReply("❌ Login cancelled by user.").catch(() => {});
+          return;
+        }
+        
         u.linked = true; 
-        save();
+        await save();
         await interaction.followUp({ ephemeral: true, content: "✅ Microsoft account linked!" });
       } catch (e) {
-        await interaction.editReply(`❌ Login failed: ${e.message}`).catch(() => {});
+        if (!pendingObj.aborted) {
+          await interaction.editReply(`❌ Login failed: ${e.message}`).catch(() => {});
+        }
       } finally { 
         pendingLink.delete(uid); 
       }
@@ -375,7 +453,7 @@ function stopSession(uid) {
   // Always remove from active sessions store
   if (activeSessionsStore[uid]) {
       delete activeSessionsStore[uid];
-      saveActiveSessions();
+      saveActiveSessions().catch(console.error);
       console.log(`[Stop] Removed ${uid} from activeSessionsStore`);
   }
 
@@ -393,27 +471,37 @@ function stopAllSessions() {
   return uids.length;
 }
 
+// FIXED: Handle max retries and clear stale entries
 function handleAutoReconnect(uid) {
     const s = sessions.get(uid);
     
-    // If manually stopped explicitly, abort
     if (s?.manualStop) {
       console.log(`[Reconnect] Aborting for ${uid}: manual stop`);
       return;
     }
     
-    // If no session in memory AND no persisted data, abort
     if (!s && !activeSessionsStore[uid]) {
         console.log(`[Reconnect] Aborting for ${uid}: no session data`);
         return;
     }
 
-    // Prevent multiple timers
+    // Check retry count
+    const sessionData = activeSessionsStore[uid] || {};
+    const currentRetries = sessionData.retryCount || 0;
+    
+    if (currentRetries >= MAX_RECONNECT_RETRIES) {
+        console.log(`[Reconnect] Max retries (${MAX_RECONNECT_RETRIES}) reached for ${uid}. Giving up.`);
+        logToDiscord(`❌ Bot of <@${uid}> failed to reconnect after ${MAX_RECONNECT_RETRIES} attempts. Removing from auto-rejoin.`);
+        delete activeSessionsStore[uid];
+        saveActiveSessions().catch(console.error);
+        cleanupSession(uid);
+        return;
+    }
+
     if (s?.reconnectTimer) {
       clearTimeout(s.reconnectTimer);
     }
 
-    // Create minimal session tracker if none exists (for reconnect logic)
     if (!s) {
         sessions.set(uid, { manualStop: false, isReconnecting: true, reconnectTimer: null });
     } else {
@@ -421,11 +509,16 @@ function handleAutoReconnect(uid) {
         s.connected = false;
     }
     
+    // Increment retry count
+    if (activeSessionsStore[uid]) {
+        activeSessionsStore[uid].retryCount = currentRetries + 1;
+        saveActiveSessions().catch(console.error);
+    }
+    
     const sessionObj = sessions.get(uid);
-    logToDiscord(`⏳ Bot of <@${uid}> disconnected. Reconnecting in 60s...`);
+    logToDiscord(`⏳ Bot of <@${uid}> disconnected. Reconnecting in 60s... (Attempt ${currentRetries + 1}/${MAX_RECONNECT_RETRIES})`);
 
     sessionObj.reconnectTimer = setTimeout(() => {
-        // Check if stopped during wait
         const currentS = sessions.get(uid);
         if (currentS?.manualStop) {
             cleanupSession(uid);
@@ -451,20 +544,27 @@ async function startSession(uid, interaction, isReconnect = false) {
   console.log(`[Start] Starting session for ${uid}, reconnect: ${isReconnect}`);
   const u = getUser(uid);
 
-  // Validate server configuration - check user settings first, then persisted data
-  let ip, port;
-  if (u.server?.ip && u.server?.port) {
-      ip = u.server.ip;
-      port = u.server.port;
-  } else if (activeSessionsStore[uid]?.ip && activeSessionsStore[uid]?.port) {
+  // FIXED: Prioritize persisted data for reconnects, user settings for new connections
+  let ip, port, connectionType, offlineUsername;
+  
+  if (isReconnect && activeSessionsStore[uid]) {
+      // Use exactly what was saved for reconnect
       ip = activeSessionsStore[uid].ip;
       port = activeSessionsStore[uid].port;
-      console.log(`[Start] Using persisted server config for ${uid}: ${ip}:${port}`);
+      connectionType = activeSessionsStore[uid].connectionType || "online";
+      offlineUsername = activeSessionsStore[uid].offlineUsername;
+      console.log(`[Start] Using persisted config for ${uid}: ${ip}:${port} (${connectionType})`);
+  } else if (u.server?.ip && u.server?.port) {
+      // Use current user settings for new connections
+      ip = u.server.ip;
+      port = u.server.port;
+      connectionType = u.connectionType || "online";
+      offlineUsername = u.offlineUsername;
   } else {
       console.log(`[Start] No server config for ${uid}`);
       if (activeSessionsStore[uid]) {
         delete activeSessionsStore[uid];
-        saveActiveSessions();
+        saveActiveSessions().catch(console.error);
       }
       if (!isReconnect && interaction) await safeReply(interaction, "⚠ Please configure your server settings first.");
       return;
@@ -483,9 +583,16 @@ async function startSession(uid, interaction, isReconnect = false) {
     cleanupSession(uid);
   }
 
-  // Add to active sessions store with server info (FIXED: storing server data)
-  activeSessionsStore[uid] = { ip, port, startedAt: Date.now() };
-  saveActiveSessions();
+  // FIXED: Save complete session state including connection type
+  activeSessionsStore[uid] = { 
+      ip, 
+      port, 
+      startedAt: Date.now(),
+      connectionType: connectionType,
+      offlineUsername: offlineUsername,
+      retryCount: isReconnect ? (activeSessionsStore[uid]?.retryCount || 0) : 0
+  };
+  await saveActiveSessions();
 
   const connectionEmbed = new EmbedBuilder()
     .setColor("#5865F2")
@@ -508,16 +615,17 @@ async function startSession(uid, interaction, isReconnect = false) {
       console.error(`[Start] Ping failed for ${uid}:`, err.message);
       logToDiscord(`❌ Connection failure for <@${uid}>: Server ${ip}:${port} unreachable.`);
       
-      // Only remove persisted data on new connections, not reconnects
-      if (!isReconnect) {
-          delete activeSessionsStore[uid];
-          saveActiveSessions();
-      }
-      
+      // FIXED: Always trigger reconnect logic if it's a reconnect attempt, 
+      // but let handleAutoReconnect handle the retry limit
       if (isReconnect) {
         handleAutoReconnect(uid); 
-      } else if (interaction) {
-        await safeReply(interaction, { content: `❌ **Connection Failed**: The server at \`${ip}:${port}\` is currently offline.`, embeds: [] });
+      } else {
+          // For new connections, clean up immediately
+          delete activeSessionsStore[uid];
+          saveActiveSessions().catch(console.error);
+          if (interaction) {
+            await safeReply(interaction, { content: `❌ **Connection Failed**: The server at \`${ip}:${port}\` is currently offline.`, embeds: [] });
+          }
       }
       return; 
   }
@@ -535,8 +643,9 @@ async function startSession(uid, interaction, isReconnect = false) {
       offline: false
   };
 
-  if (u.connectionType === "offline") {
-    opts.username = u.offlineUsername || `AFK_${uid.slice(-4)}`;
+  // FIXED: Use the connection type from our resolved variables
+  if (connectionType === "offline") {
+    opts.username = offlineUsername || `AFK_${uid.slice(-4)}`;
     opts.offline = true;
   }
 
@@ -546,9 +655,11 @@ async function startSession(uid, interaction, isReconnect = false) {
   } catch (e) {
     console.error(`[Start] Failed to create client for ${uid}:`, e.message);
     delete activeSessionsStore[uid];
-    saveActiveSessions();
+    saveActiveSessions().catch(console.error);
     if (!isReconnect && interaction) {
       await safeReply(interaction, { content: `❌ **Client Error**: ${e.message}`, embeds: [] });
+    } else if (isReconnect) {
+      handleAutoReconnect(uid);
     }
     return;
   }
@@ -678,16 +789,13 @@ async function startSession(uid, interaction, isReconnect = false) {
               }
           }
 
-          // FIXED: Proper hand swing implementation for Bedrock Edition
           if (s.entityId && s.entityId !== 0) {
               try {
                   mc.queue('animate', {
                       action_id: 1,
                       runtime_entity_id: s.entityId
                   });
-              } catch (e) {
-                  // Ignore packet errors
-              }
+              } catch (e) {}
           }
       } catch (e) {}
 
@@ -702,7 +810,6 @@ async function startSession(uid, interaction, isReconnect = false) {
       const s = sessions.get(uid);
       if (!s || !s.Chunk || !s.position || s.isTryingToSleep || !advancedFeaturesEnabled) return;
       
-      // Validate entityId
       if (!s.entityId || s.entityId === 0) return;
 
       const searchRadius = 3;
@@ -748,9 +855,7 @@ async function startSession(uid, interaction, isReconnect = false) {
 
                               return; 
                           }
-                      } catch (e) {
-                          // Ignore block read errors
-                      }
+                      } catch (e) {}
                   }
               }
           }
@@ -772,6 +877,12 @@ async function startSession(uid, interaction, isReconnect = false) {
       currentSession.connected = true;
       currentSession.isReconnecting = false;
 
+      // Reset retry count on successful connection
+      if (activeSessionsStore[uid]) {
+          activeSessionsStore[uid].retryCount = 0;
+          saveActiveSessions().catch(console.error);
+      }
+
       performAntiAfk();
   });
 
@@ -791,7 +902,6 @@ async function startSession(uid, interaction, isReconnect = false) {
   mc.on("respawn", (packet) => {
       logToDiscord(`💀 Bot of <@${uid}> died and respawned.`);
       
-      // Clear chunks on respawn (fix for stale chunk data)
       currentSession.chunks.clear();
       
       if (currentSession.position) {
@@ -928,7 +1038,7 @@ client.on(Events.InteractionCreate, async (i) => {
         }
         const u = getUser(uid);
         u.server = { ip, port };
-        save();
+        await save();
         return safeReply(i, { ephemeral: true, content: `✅ Saved: **${ip}:${port}**` });
     }
 
