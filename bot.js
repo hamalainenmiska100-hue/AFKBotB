@@ -20,12 +20,11 @@ const { Authflow, Titles } = require("prismarine-auth");
 const fs = require("fs");
 const path = require("path");
 
-// Optional: Vec3 for physics (graceful degradation if missing)
 let Vec3;
 try {
     Vec3 = require("vec3");
 } catch (e) {
-    console.warn("[INIT] Vec3 not available - physics disabled");
+    console.warn("[INIT] Vec3 not available");
 }
 
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
@@ -34,12 +33,11 @@ if (!DISCORD_TOKEN) {
     process.exit(1);
 }
 
-// ==================== CONFIGURATION ====================
 const CONFIG = {
     ADMIN_ID: "1144987924123881564",
     LOG_CHANNEL_ID: "1464615030111731753",
     SAVE_DEBOUNCE_MS: 1000,
-    MAX_RECONNECT_ATTEMPTS: 50, // Reduced for production stability
+    MAX_RECONNECT_ATTEMPTS: 50,
     RECONNECT_BASE_DELAY_MS: 5000,
     RECONNECT_MAX_DELAY_MS: 300000,
     CONNECTION_TIMEOUT_MS: 30000,
@@ -52,7 +50,6 @@ const CONFIG = {
     GRACEFUL_SHUTDOWN_TIMEOUT_MS: 20000,
 };
 
-// ==================== STORAGE SYSTEM ====================
 const DATA = path.join(__dirname, "data");
 const AUTH_ROOT = path.join(DATA, "auth");
 const STORE = path.join(DATA, "users.json");
@@ -75,7 +72,6 @@ if (!ensureDir(DATA) || !ensureDir(AUTH_ROOT)) {
     process.exit(1);
 }
 
-// ==================== PERSISTENT STORE (Simplified for stability) ====================
 class PersistentStore {
     constructor(filePath) {
         this.filePath = filePath;
@@ -156,7 +152,6 @@ const sessionStore = new PersistentStore(REJOIN_STORE);
 let users = userStore.load({});
 let activeSessionsStore = sessionStore.load({});
 
-// ==================== RUNTIME STATE ====================
 const sessions = new Map();
 const pendingLink = new Map();
 let lastAdminMessage = null;
@@ -169,7 +164,6 @@ let metrics = {
     startTime: Date.now()
 };
 
-// ==================== DISCORD CLIENT ====================
 const client = new Client({
     intents: [
         GatewayIntentBits.Guilds,
@@ -188,7 +182,6 @@ const client = new Client({
     }
 });
 
-// ==================== ERROR HANDLING ====================
 process.on("uncaughtException", (err) => {
     console.error("[CRASH] Uncaught Exception:", err);
     metrics.crashes++;
@@ -196,7 +189,6 @@ process.on("uncaughtException", (err) => {
         fs.appendFileSync(CRASH_LOG, `[${new Date().toISOString()}] UNCAUGHT: ${err.stack}\n`);
     } catch (e) {}
     
-    // Don't exit on non-fatal errors
     if (err.code === 'EADDRINUSE' || err.code === 'EACCES') {
         gracefulShutdown('FATAL_ERROR');
     }
@@ -210,10 +202,6 @@ process.on("unhandledRejection", (reason) => {
     } catch (e) {}
 });
 
-// ==================== SESSION MANAGEMENT ====================
-/**
- * Complete cleanup of session resources to prevent memory leaks
- */
 async function cleanupSession(uid) {
     if (!uid) return;
     const session = sessions.get(uid);
@@ -222,7 +210,6 @@ async function cleanupSession(uid) {
     console.log(`[SESSION] Cleaning up ${uid}`);
 
     try {
-        // Clear all timers
         const timerKeys = [
             'reconnectTimer', 'physicsLoop', 'afkTimeout', 
             'keepaliveTimer', 'staleCheckTimer', 'swingTimer'
@@ -236,27 +223,18 @@ async function cleanupSession(uid) {
             }
         }
 
-        // Remove Discord interaction references to prevent memory leaks
         session.interaction = null;
-        session.startInteraction = null;
 
-        // Clean up bedrock client
         if (session.client) {
-            // Remove all listeners first to prevent callbacks during close
             session.client.removeAllListeners();
-            
             try {
                 if (typeof session.client.close === 'function' && !session.client.destroyed) {
                     session.client.close();
                 }
-            } catch (e) {
-                // Ignore close errors
-            }
-            
+            } catch (e) {}
             session.client = null;
         }
 
-        // Clear position references
         session.position = null;
         session.targetPosition = null;
         session.velocity = null;
@@ -267,7 +245,6 @@ async function cleanupSession(uid) {
     
     sessions.delete(uid);
     
-    // Force garbage collection hint (if available)
     if (global.gc && sessions.size === 0) {
         try {
             global.gc();
@@ -284,7 +261,7 @@ async function cleanupAllSessions() {
     await Promise.all(promises);
 }
 
-async function stopSession(uid) {
+async function stopSession(uid, interaction = null) {
     if (!uid) return false;
     
     const session = sessions.get(uid);
@@ -298,10 +275,18 @@ async function stopSession(uid) {
     }
 
     await cleanupSession(uid);
+    
+    if (interaction) {
+        await interaction.update({
+            content: "⏹ **Stopped**",
+            embeds: [],
+            components: []
+        }).catch(() => {});
+    }
+    
     return true;
 }
 
-// ==================== RECONNECTION SYSTEM ====================
 function scheduleReconnect(uid, attempt = 1) {
     if (!uid || isShuttingDown) return;
     
@@ -344,12 +329,10 @@ function scheduleReconnect(uid, attempt = 1) {
     }, delay);
 }
 
-// ==================== HEALTH MONITORING ====================
 function startHealthMonitoring(uid) {
     const session = sessions.get(uid);
     if (!session) return;
 
-    // Keepalive
     session.keepaliveTimer = setInterval(() => {
         if (!session.connected || !session.client || session.client.destroyed) {
             return;
@@ -364,7 +347,6 @@ function startHealthMonitoring(uid) {
         }
     }, CONFIG.KEEPALIVE_INTERVAL_MS);
 
-    // Stale connection detection
     session.staleCheckTimer = setInterval(() => {
         if (!session.connected) return;
         
@@ -385,7 +367,6 @@ function startHealthMonitoring(uid) {
     }, CONFIG.STALE_CONNECTION_TIMEOUT_MS);
 }
 
-// ==================== UTILITY FUNCTIONS ====================
 function getUser(uid) {
     if (!uid || typeof uid !== 'string' || !/^\d+$/.test(uid)) {
         console.warn(`[AUTH] Invalid UID access: ${uid}`);
@@ -448,7 +429,6 @@ function isValidPort(port) {
     return !isNaN(num) && num > 0 && num <= 65535;
 }
 
-// ==================== DISCORD HELPERS ====================
 async function logToDiscord(message) {
     if (!message || isShuttingDown || !discordReady) return;
     try {
@@ -474,12 +454,9 @@ async function safeReply(interaction, content) {
         } else {
             await interaction.reply(payload).catch(() => {});
         }
-    } catch (e) {
-        // Silent fail to prevent crashes
-    }
+    } catch (e) {}
 }
 
-// ==================== UI COMPONENTS ====================
 function panelRow(isJava = false) {
     const title = isJava ? "Java AFKBot Panel 🎛️" : "Bedrock AFKBot Panel 🎛️";
     const startCustomId = isJava ? "start_java" : "start_bedrock";
@@ -555,22 +532,23 @@ function adminPanelComponents() {
     return rows;
 }
 
-// ==================== MICROSOFT AUTH ====================
 async function linkMicrosoft(uid, interaction) {
     if (!uid || !interaction) return;
     
     if (pendingLink.has(uid)) {
-        return safeReply(interaction, "⏳ Login already in progress.");
+        return interaction.reply({ content: "⏳ Login already in progress.", ephemeral: true });
     }
     
     const authDir = getUserAuthDir(uid);
     if (!authDir) {
-        return safeReply(interaction, "❌ System error: Cannot create auth directory.");
+        return interaction.reply({ content: "❌ System error.", ephemeral: true });
     }
+
+    await interaction.deferReply({ ephemeral: true });
 
     const timeoutId = setTimeout(() => {
         pendingLink.delete(uid);
-        safeReply(interaction, "⏰ Login timed out.").catch(() => {});
+        interaction.editReply({ content: "⏰ Login timed out.", components: [] }).catch(() => {});
     }, 300000);
 
     try {
@@ -585,7 +563,7 @@ async function linkMicrosoft(uid, interaction) {
             async (data) => {
                 try {
                     const uri = data?.verification_uri_complete || "https://www.microsoft.com/link";
-                                       const code = data?.user_code;
+                    const code = data?.user_code;
                     
                     const row = new ActionRowBuilder().addComponents(
                         new ButtonBuilder()
@@ -596,7 +574,7 @@ async function linkMicrosoft(uid, interaction) {
                     
                     await interaction.editReply({ 
                         content: `🔐 **Code:** \`${code}\`\n🔗 **Link:** ${uri}`, 
-                        components: [row] 
+                        components: [row]
                     }).catch(() => {});
                 } catch (e) {
                     console.error("[AUTH] Callback error:", e);
@@ -608,10 +586,16 @@ async function linkMicrosoft(uid, interaction) {
             clearTimeout(timeoutId);
             getUser(uid).linked = true;
             userStore.save();
-            await interaction.followUp({ ephemeral: true, content: "✅ Account linked!" }).catch(() => {});
+            await interaction.editReply({ 
+                content: "✅ Account linked successfully!", 
+                components: [] 
+            }).catch(() => {});
         }).catch(async (e) => {
             clearTimeout(timeoutId);
-            await interaction.editReply(`❌ Failed: ${e?.message || 'Unknown error'}`).catch(() => {});
+            await interaction.editReply({ 
+                content: `❌ Failed: ${e?.message || 'Unknown error'}`,
+                components: []
+            }).catch(() => {});
         }).finally(() => { 
             pendingLink.delete(uid); 
         });
@@ -622,11 +606,13 @@ async function linkMicrosoft(uid, interaction) {
         clearTimeout(timeoutId);
         pendingLink.delete(uid);
         console.error("[AUTH] Flow creation error:", e);
-        safeReply(interaction, "❌ Authentication system error.");
+        await interaction.editReply({ 
+            content: "❌ Authentication system error.",
+            components: []
+        }).catch(() => {});
     }
 }
 
-// ==================== MAIN SESSION ====================
 async function startSession(uid, interaction, isReconnect = false, reconnectAttempt = 1) {
     if (!uid || isShuttingDown) return;
     
@@ -634,45 +620,77 @@ async function startSession(uid, interaction, isReconnect = false, reconnectAtte
     const u = getUser(uid);
     
     if (!u.server?.ip) {
-        if (!isReconnect) safeReply(interaction, "⚠️ Configure server settings first.");
+        if (!isReconnect && interaction) {
+            await interaction.editReply({ 
+                content: "⚠️ Configure server settings first with **Settings** button.",
+                components: [] 
+            }).catch(() => {});
+        }
         return;
     }
 
     const { ip, port } = u.server;
     
     if (!isValidIP(ip) || !isValidPort(port)) {
-        if (!isReconnect) safeReply(interaction, "❌ Invalid server address.");
+        if (!isReconnect && interaction) {
+            await interaction.editReply({ 
+                content: "❌ Invalid server address.",
+                components: [] 
+            }).catch(() => {});
+        }
         return;
     }
 
-    // Conflict check
     if (sessions.has(uid) && !isReconnect) {
-        return safeReply(interaction, { 
-            ephemeral: true, 
-            content: "⚠️ Active session exists. Use Stop first." 
-        });
+        if (interaction) {
+            await interaction.editReply({ 
+                content: "⚠️ Active session exists. Use **Stop** first.",
+                components: [] 
+            }).catch(() => {});
+        }
+        return;
     }
 
-    // Cleanup old if reconnecting
     if (isReconnect && sessions.has(uid)) {
         await cleanupSession(uid);
     }
 
-    // Ping check
     try {
+        if (!isReconnect && interaction) {
+            await interaction.editReply({ 
+                content: `🔍 **Pinging** \`${ip}:${port}\`...`,
+                components: [] 
+            }).catch(() => {});
+        }
+        
         await bedrock.ping({ host: ip, port: parseInt(port), timeout: 5000 });
+        
+        if (!isReconnect && interaction) {
+            await interaction.editReply({ 
+                content: `🟡 **Joining** \`${ip}:${port}\`...`,
+                components: [] 
+            }).catch(() => {});
+        }
     } catch (err) {
         if (isReconnect) {
             scheduleReconnect(uid, reconnectAttempt);
-        } else {
-            safeReply(interaction, { content: `❌ Server offline: ${ip}:${port}` });
+        } else if (interaction) {
+            await interaction.editReply({ 
+                content: `❌ **Server offline:** \`${ip}:${port}\``,
+                components: [] 
+            }).catch(() => {});
         }
         return;
     }
 
     const authDir = getUserAuthDir(uid);
     if (!authDir) {
-        if (!isReconnect) safeReply(interaction, "❌ Auth error.");
+        if (!isReconnect && interaction) {
+            await interaction.editReply({ 
+                content: "❌ Auth directory error.",
+                components: []
+            }).catch(() => {});
+        }
         return;
     }
 
@@ -698,12 +716,17 @@ async function startSession(uid, interaction, isReconnect = false, reconnectAtte
         mc = bedrock.createClient(opts);
     } catch (err) {
         console.error("[SESSION] Create client error:", err);
-        if (isReconnect) scheduleReconnect(uid, reconnectAttempt);
-        else safeReply(interaction, "❌ Failed to create client.");
+        if (isReconnect) {
+            scheduleReconnect(uid, reconnectAttempt);
+        } else if (interaction) {
+            await interaction.editReply({ 
+                content: "❌ Failed to create client.",
+                components: []
+            }).catch(() => {});
+        }
         return;
     }
 
-    // Initialize session state
     const session = {
         client: mc,
         startedAt: Date.now(),
@@ -719,7 +742,7 @@ async function startSession(uid, interaction, isReconnect = false, reconnectAtte
         onGround: false,
         lastPacketTime: Date.now(),
         lastKeepalive: Date.now(),
-        // Timer references
+        interaction: isReconnect ? null : interaction,
         reconnectTimer: null,
         physicsLoop: null,
         afkTimeout: null,
@@ -730,7 +753,6 @@ async function startSession(uid, interaction, isReconnect = false, reconnectAtte
     
     sessions.set(uid, session);
 
-    // Safe packet writer with state checks
     const safeWrite = (packetName, params) => {
         try {
             if (mc && !mc.destroyed && session.connected && !isShuttingDown) {
@@ -745,19 +767,16 @@ async function startSession(uid, interaction, isReconnect = false, reconnectAtte
         return false;
     };
 
-    // Physics loop (simplified, no chunk dependency)
     if (Vec3) {
         session.physicsLoop = setInterval(() => {
             if (!session.connected || !session.position || mc.destroyed) return;
 
             try {
-                // Simple gravity
                 if (!session.onGround && session.velocity) {
                     session.velocity.y -= 0.08;
                     if (session.velocity.y < -3.92) session.velocity.y = -3.92;
                     session.position.y += session.velocity.y;
                     
-                    // Floor collision (simplified)
                     if (session.position.y < 64) {
                         session.position.y = 64;
                         session.velocity.y = 0;
@@ -779,22 +798,19 @@ async function startSession(uid, interaction, isReconnect = false, reconnectAtte
                     input_mode: "mouse", 
                     play_mode: "screen", 
                     interaction_model: "touch", 
-                    tick: BigInt(Date.now()) // Use timestamp as tick
+                    tick: BigInt(Date.now())
                 });
             } catch (e) {}
         }, CONFIG.PHYSICS_TICK_MS);
     }
 
-    // AFK Logic (anti-kick)
     const performAntiAfk = () => {
         if (!sessions.has(uid) || isShuttingDown || !session.connected) return;
         
         try {
-            // Random rotation
             session.yaw += (Math.random() - 0.5) * 30;
             session.pitch = Math.max(-90, Math.min(90, session.pitch + (Math.random() - 0.5) * 20));
             
-            // Random jump
             if (session.onGround && session.velocity && Math.random() > 0.7) {
                 session.velocity.y = 0.42;
                 session.onGround = false;
@@ -804,23 +820,26 @@ async function startSession(uid, interaction, isReconnect = false, reconnectAtte
         session.afkTimeout = setTimeout(performAntiAfk, 10000 + Math.random() * 10000);
     };
 
-    // Swing logic (hand waving)
     const startSwinging = () => {
         session.swingTimer = setInterval(() => {
             if (!session.connected || !session.entityId) return;
             safeWrite('animate', { 
-                action_id: 1, // Swing arm
+                action_id: 1,
                 runtime_entity_id: session.entityId 
             });
         }, CONFIG.SWING_INTERVAL_MS);
     };
 
-    // Event Handlers
     mc.on("spawn", () => {
-        console.log(`[SESSION] ${uid} spawned on ${ip}:${port}`);
+        console.log(`[SESSION] ${uid} spawned`);
         logToDiscord(`✅ <@${uid}> connected to ${ip}:${port}`);
-        if (!isReconnect && interaction) {
-            safeReply(interaction, { content: `🟢 Online: ${ip}:${port}`, embeds: [] });
+        
+        if (!isReconnect && session.interaction) {
+            session.interaction.editReply({ 
+                content: `🟢 **Online** on \`${ip}:${port}\`\n⏱️ Started <t:${Math.floor(Date.now()/1000)}:R>`,
+                embeds: [],
+                components: [] 
+            }).catch(() => {});
         }
     });
 
@@ -842,7 +861,6 @@ async function startSession(uid, interaction, isReconnect = false, reconnectAtte
             session.reconnectAttempt = 0;
             session.lastPacketTime = Date.now();
 
-            // Persist session
             activeSessionsStore[uid] = { 
                 startedAt: Date.now(), 
                 server: u.server 
@@ -870,7 +888,6 @@ async function startSession(uid, interaction, isReconnect = false, reconnectAtte
                 packet.position.z || session.position.z
             );
             
-            // Simple ground detection
             if (session.velocity) {
                 session.onGround = packet.position.y <= Math.floor(packet.position.y) + 0.1;
                 if (session.onGround) session.velocity.y = 0;
@@ -898,7 +915,13 @@ async function startSession(uid, interaction, isReconnect = false, reconnectAtte
     mc.on("error", (e) => {
         console.error(`[SESSION] ${uid} error:`, e.message);
         if (!session.manualStop) scheduleReconnect(uid, reconnectAttempt);
-        logToDiscord(`❌ <@${uid}> error: ${e?.message || 'Unknown'}`);
+        
+        if (!isReconnect && session.interaction) {
+            session.interaction.editReply({ 
+                content: `❌ **Error:** ${e?.message || 'Connection failed'}\n🔄 Reconnecting automatically...`,
+                components: [] 
+            }).catch(() => {});
+        }
     });
 
     mc.on("close", () => {
@@ -911,7 +934,6 @@ async function startSession(uid, interaction, isReconnect = false, reconnectAtte
     });
 }
 
-// ==================== DISCORD EVENTS ====================
 client.once("ready", async () => {
     console.log(`[DISCORD] Logged in as ${client.user?.tag}`);
     discordReady = true;
@@ -925,7 +947,6 @@ client.once("ready", async () => {
         console.error("[DISCORD] Command registration failed:", e);
     }
 
-    // Admin panel updater
     setInterval(async () => {
         if (lastAdminMessage && !isShuttingDown && discordReady) {
             try {
@@ -939,7 +960,6 @@ client.once("ready", async () => {
         }
     }, 30000);
 
-    // Memory monitor
     setInterval(() => {
         const mem = process.memoryUsage();
         const mb = mem.rss / 1024 / 1024;
@@ -954,7 +974,6 @@ client.once("ready", async () => {
         }
     }, CONFIG.MEMORY_CHECK_INTERVAL_MS);
 
-    // Restore sessions
     console.log("[INIT] Restoring sessions...");
     const toRestore = Object.keys(activeSessionsStore || {});
     
@@ -966,7 +985,7 @@ client.once("ready", async () => {
                 setTimeout(() => {
                     if (!isShuttingDown) startSession(uid, null, true);
                 }, delay);
-                delay += 5000; // 5s stagger to prevent overload
+                delay += 5000;
             }
         }
     }
@@ -977,11 +996,10 @@ client.on(Events.InteractionCreate, async (i) => {
     
     const uid = i.user.id;
     
-    // Rate limit (1s)
     if (i.isButton() || i.isChatInputCommand()) {
         const last = i.user.lastInteraction || 0;
         if (Date.now() - last < 1000) {
-            return safeReply(i, { ephemeral: true, content: "⏳ Please wait..." });
+            return i.reply({ ephemeral: true, content: "⏳ Please wait..." }).catch(() => {});
         }
         i.user.lastInteraction = Date.now();
     }
@@ -989,16 +1007,22 @@ client.on(Events.InteractionCreate, async (i) => {
     try {
         if (i.isChatInputCommand()) {
             if (i.commandName === "panel") {
-                return safeReply(i, panelRow(false));
+                const panel = panelRow(false);
+                return i.reply({ 
+                    content: panel.content, 
+                    components: panel.components,
+                    ephemeral: true 
+                }).catch(() => {});
             }
             if (i.commandName === "admin") {
                 if (uid !== CONFIG.ADMIN_ID) {
-                    return safeReply(i, { content: "⛔ Access denied", ephemeral: true });
+                    return i.reply({ content: "⛔ Access denied", ephemeral: true }).catch(() => {});
                 }
                 const msg = await i.reply({ 
                     embeds: [getAdminStatsEmbed()], 
                     components: adminPanelComponents(), 
-                    fetchReply: true 
+                    fetchReply: true,
+                    ephemeral: true
                 });
                 lastAdminMessage = msg;
                 return;
@@ -1018,7 +1042,6 @@ client.on(Events.InteractionCreate, async (i) => {
         }
 
         if (i.isButton()) {
-            // Admin buttons
             if (i.customId === "admin_refresh") {
                 return i.update({ 
                     embeds: [getAdminStatsEmbed()], 
@@ -1049,47 +1072,71 @@ client.on(Events.InteractionCreate, async (i) => {
                 }).catch(() => {});
             }
 
-            // User buttons
             if (i.customId === "start_bedrock" || i.customId === "start_java") {
                 if (sessions.has(uid)) {
-                    return safeReply(i, { ephemeral: true, content: "⚠️ Already running" });
+                    return i.reply({ ephemeral: true, content: "⚠️ Already running" }).catch(() => {});
                 }
                 
                 const isJava = i.customId === "start_java";
                 const embed = new EmbedBuilder()
                     .setTitle(isJava ? "Java Connection" : "Bedrock Connection")
-                    .setDescription(isJava ? "Requires GeyserMC" : "Start bot?")
+                    .setDescription(isJava ? "Requires GeyserMC + Floodgate" : "Ready to connect?")
                     .setColor(isJava ? "#E67E22" : "#2ECC71");
                     
                 const row = new ActionRowBuilder().addComponents(
-                    new ButtonBuilder().setCustomId("confirm_start").setLabel("Start").setStyle(ButtonStyle.Success),
-                    new ButtonBuilder().setCustomId("cancel").setLabel("Cancel").setStyle(ButtonStyle.Secondary)
+                    new ButtonBuilder()
+                        .setCustomId("confirm_start")
+                        .setLabel("▶ Confirm Start")
+                        .setStyle(ButtonStyle.Success),
+                    new ButtonBuilder()
+                        .setCustomId("cancel")
+                        .setLabel("✖ Cancel")
+                        .setStyle(ButtonStyle.Secondary)
                 );
-                return i.reply({ embeds: [embed], components: [row], ephemeral: true });
+                
+                return i.update({ embeds: [embed], components: [row] }).catch(() => {});
             }
 
             if (i.customId === "confirm_start") {
-                await i.deferUpdate().catch(() => {});
+                await i.update({ 
+                    content: "⏳ **Connecting...**",
+                    embeds: [], 
+                    components: []
+                }).catch(() => {});
+                
                 return startSession(uid, i, false);
             }
 
             if (i.customId === "cancel") {
-                return i.update({ content: "❌ Cancelled", embeds: [], components: [] }).catch(() => {});
+                return i.update({ 
+                    content: "❌ Cancelled", 
+                    embeds: [], 
+                    components: [] 
+                }).catch(() => {});
             }
 
             if (i.customId === "stop") {
-                const ok = await stopSession(uid);
-                return safeReply(i, { ephemeral: true, content: ok ? "⏹ Stopped" : "No session" });
+                const ok = await stopSession(uid, i);
+                if (!ok) {
+                    return i.update({ 
+                        content: "No active session",
+                        embeds: [],
+                        components: []
+                    }).catch(() => {});
+                }
+                return;
             }
 
             if (i.customId === "link") {
-                await i.deferReply({ ephemeral: true });
                 return linkMicrosoft(uid, i);
             }
 
             if (i.customId === "unlink") {
                 await unlinkMicrosoft(uid);
-                return safeReply(i, { ephemeral: true, content: "🗑 Unlinked" });
+                return i.reply({ 
+                    content: "🗑 Unlinked Microsoft account", 
+                    ephemeral: true 
+                }).catch(() => {});
             }
 
             if (i.customId === "settings") {
@@ -1125,12 +1172,18 @@ client.on(Events.InteractionCreate, async (i) => {
             const port = parseInt(i.fields.getTextInputValue("port"));
             
             if (!ip || !port || !isValidPort(port)) {
-                return safeReply(i, { ephemeral: true, content: "❌ Invalid input" });
+                return i.reply({ 
+                    content: "❌ Invalid input", 
+                    ephemeral: true 
+                }).catch(() => {});
             }
             
             getUser(uid).server = { ip, port };
             userStore.save();
-            return safeReply(i, { ephemeral: true, content: `✅ Saved: ${ip}:${port}` });
+            return i.reply({ 
+                content: `✅ Saved: ${ip}:${port}`, 
+                ephemeral: true 
+            }).catch(() => {});
         }
 
     } catch (e) {
@@ -1138,7 +1191,6 @@ client.on(Events.InteractionCreate, async (i) => {
     }
 });
 
-// ==================== SHUTDOWN HANDLING ====================
 function gracefulShutdown(signal) {
     console.log(`[SHUTDOWN] ${signal} received`);
     isShuttingDown = true;
@@ -1167,13 +1219,11 @@ function gracefulShutdown(signal) {
 process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
 process.on('SIGINT', () => gracefulShutdown('SIGINT'));
 
-// ==================== STARTUP ====================
 client.login(DISCORD_TOKEN).catch(e => {
     console.error("[FATAL] Discord login failed:", e);
     process.exit(1);
 });
 
-// Heartbeat log
 setInterval(() => {
     console.log(`[HEARTBEAT] Sessions: ${sessions.size} | Uptime: ${Math.floor(process.uptime()/60)}m`);
 }, 60000);
