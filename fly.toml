@@ -1,28 +1,17 @@
-app = "afkbot" # Change this to your Fly app name
-primary_region = "arn" # Change to your preferred region
+app = "afkbot"
+primary_region = "arn"
 
 [build]
-  # No build args needed for this simple setup
+  builder = "heroku/buildpacks:20"
 
-[env]
-  # Change these to your target server details
-  SERVER_HOST = "misulikisuli.aternos.me"
-  SERVER_PORT = "20465"
-  BOT_USERNAME = "AFK_Guardian"
-  
-  # This tells the JS file to look for tokens in the mounted volume
-  PERSISTENT_DATA_PATH = "/data/auth"
+[processes]
+  app = "node --optimize-for-size --max-old-space-size=512 index.js"
 
-# This mounts the volume you created (bot_data) to /data inside the bot
-[mounts]
-  source = "bot_data"
-  destination = "/data"
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "1024mb"
+  cpus = 1
+  cpu_kind = "shared"
 
-[http_service]
-  internal_port = 8080
-  force_https = true
-  auto_stop_machines = false # CRITICAL: Prevents Fly from turning it off when idle
-  auto_start_machines = true
-  min_machines_running = 1
-  processes = ["app"]
-
+[swap]
+  size_mb = 512
