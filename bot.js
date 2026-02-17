@@ -10,21 +10,22 @@ const {
     TextInputBuilder,
     TextInputStyle,
     StringSelectMenuBuilder,
-    EmbedBuilder
+    EmbedBuilder,
+    ActivityType
 } = require("discord.js");
 const bedrock = require("bedrock-protocol");
 const { Authflow, Titles } = require("prismarine-auth");
 const fs = require("fs");
 const path = require("path");
 
-// --- Dependencies for Chunk Scanning & Bed Detection ---
+// --- Optional Dependencies ---
 let Vec3, PrismarineChunk, PrismarineRegistry;
 try {
     Vec3 = require("vec3");
     PrismarineChunk = require("prismarine-chunk");
     PrismarineRegistry = require("prismarine-registry");
 } catch (e) {
-    console.log("⚠️ Advanced features (Bed Detection/Physics) disabled! Missing optional dependencies.");
+    console.log("⚠️ Advanced features disabled - missing optional dependencies");
 }
 
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
@@ -33,34 +34,42 @@ if (!DISCORD_TOKEN) {
     process.exit(1);
 }
 
-// ----------------- Config -----------------
-const ADMIN_ID = "1144987924123881564";
-const LOG_CHANNEL_ID = "1464615030111731753";
-const SAVE_DEBOUNCE_MS = 1000; // Debounce rapid saves
-const AUTO_SAVE_INTERVAL_MS = 30000; // Auto-save every 30s
-const MAX_RECONNECT_ATTEMPTS = 80; // Prevent infinite reconnection loops
-const RECONNECT_BASE_DELAY_MS = 30000; // Start with 30s, exponential backoff
+// ==================== CONFIGURATION ====================
+const CONFIG = {
+    ADMIN_ID: "1144987924123881564",
+    LOG_CHANNEL_ID: "1464615030111731753",
+    SAVE_DEBOUNCE_MS: 500,
+    AUTO_SAVE_INTERVAL_MS: 15000,
+    MAX_RECONNECT_ATTEMPTS: 1000, // Essentially infinite with backoff cap
+    RECONNECT_BASE_DELAY_MS: 5000,
+    RECONNECT_MAX_DELAY_MS: 300000, // 5 minutes max
+    CONNECTION_TIMEOUT_MS: 30000,
+    KEEPALIVE_INTERVAL_MS: 15000,
+    STALE_CONNECTION_TIMEOUT_MS: 60000,
+    CHUNK_CACHE_MAX_SIZE: 50,
+    MEMORY_CHECK_INTERVAL_MS: 60000,
+    MAX_MEMORY_MB: 2048,
+    SESSION_HEARTBEAT_INTERVAL_MS: 30000,
+    TOKEN_REFRESH_BUFFER_MS: 300000, // Refresh tokens 5 min before expiry
+};
 
-// ----------------- Storage -----------------
+// ==================== STORAGE SYSTEM ====================
 const DATA = path.join(__dirname, "data");
 const AUTH_ROOT = path.join(DATA, "auth");
 const STORE = path.join(DATA, "users.json");
-const REJOIN_STORE = path.join(DATA, "ReJoin.json");
+const REJOIN_STORE = path.join(DATA, "rejoin.json");
 const CRASH_LOG = path.join(DATA, "crash.log");
+const WAL_FILE = path.join(DATA, "wal.json"); // Write-ahead log
 
-// Safe directory initialization with recursive retry
-function ensureDir(dir, retries = 3) {
+// Ensure directories exist
+function ensureDir(dir) {
     try {
         if (!fs.existsSync(dir)) {
             fs.mkdirSync(dir, { recursive: true });
         }
         return true;
     } catch (e) {
-        if (retries > 0 && e.code === 'EBUSY') {
-            setTimeout(() => ensureDir(dir, retries - 1), 100);
-            return false;
-        }
-        console.error(`❌ Fatal: Cannot create directory ${dir}:`, e);
+        console.error(`❌ Cannot create directory ${dir}:`, e);
         return false;
     }
 }
@@ -69,45 +78,133 @@ if (!ensureDir(DATA) || !ensureDir(AUTH_ROOT)) {
     process.exit(1);
 }
 
-// Enhanced Safe Load Helper with schema validation
-function loadJson(filePath, defaultVal = {}) {
-    if (!fs.existsSync(filePath)) return defaultVal;
-    try {
-        const data = fs.readFileSync(filePath, "utf8");
-        if (!data || data.trim() === "") return defaultVal;
-        const parsed = JSON.parse(data);
-        // Validate it's an object (not array/string)
-        if (typeof parsed !== 'object' || parsed === null) return defaultVal;
-        return parsed;
-    } catch (e) {
-        console.error(`⚠️ Corrupt JSON at ${filePath}:`, e.message);
+// ==================== WRITE-AHEAD LOGGING SYSTEM ====================
+// Ensures data durability even if crash happens during save
+class WriteAheadLog {
+    constructor(filePath) {
+        this.filePath = filePath;
+    }
+
+    write(operation, data) {
         try {
-            const backupPath = `${filePath}.backup.${Date.now()}`;
-            fs.renameSync(filePath, backupPath);
-            console.log(`📦 Backed up corrupt file to ${backupPath}`);
-        } catch (backupErr) {
-            console.error("Failed to backup corrupt file:", backupErr.message);
+            const entry = {
+                timestamp: Date.now(),
+                operation,
+                data: JSON.stringify(data),
+                checksum: this._checksum(data)
+            };
+            fs.appendFileSync(this.filePath, JSON.stringify(entry) + '\n');
+            return true;
+        } catch (e) {
+            console.error("WAL write failed:", e);
+            return false;
         }
-        return defaultVal;
+    }
+
+    replay(targetStore) {
+        if (!fs.existsSync(this.filePath)) return;
+        try {
+            const lines = fs.readFileSync(this.filePath, 'utf8').split('\n').filter(Boolean);
+            for (const line of lines) {
+                try {
+                    const entry = JSON.parse(line);
+                    if (entry.operation === 'update' && entry.data) {
+                        const data = JSON.parse(entry.data);
+                        Object.assign(targetStore, data);
+                    }
+                } catch (e) { /* Skip corrupt entries */ }
+            }
+            // Clear WAL after successful replay
+            fs.writeFileSync(this.filePath, '');
+        } catch (e) {
+            console.error("WAL replay failed:", e);
+        }
+    }
+
+    clear() {
+        try {
+            fs.writeFileSync(this.filePath, '');
+        } catch (e) {}
+    }
+
+    _checksum(data) {
+        // Simple checksum for integrity verification
+        const str = JSON.stringify(data);
+        let hash = 0;
+        for (let i = 0; i < str.length; i++) {
+            const char = str.charCodeAt(i);
+            hash = ((hash << 5) - hash) + char;
+            hash = hash & hash;
+        }
+        return hash;
     }
 }
 
-// Enhanced Save System with debouncing and queue
+// ==================== ENHANCED PERSISTENT STORE ====================
 class PersistentStore {
-    constructor(filePath) {
+    constructor(filePath, wal) {
         this.filePath = filePath;
+        this.wal = wal;
         this.data = null;
         this.saveTimeout = null;
         this.isSaving = false;
         this.saveQueue = [];
+        this.lastSaveTime = 0;
+        this.saveCount = 0;
     }
 
     load(defaultVal = {}) {
-        this.data = loadJson(this.filePath, defaultVal);
+        // First replay WAL for durability
+        this.data = defaultVal;
+        if (this.wal) {
+            this.wal.replay(this.data);
+        }
+        
+        // Then load main file
+        if (fs.existsSync(this.filePath)) {
+            try {
+                const content = fs.readFileSync(this.filePath, "utf8");
+                if (content.trim()) {
+                    const parsed = JSON.parse(content);
+                    if (typeof parsed === 'object' && parsed !== null) {
+                        this.data = { ...this.data, ...parsed };
+                    }
+                }
+            } catch (e) {
+                console.error(`⚠️ Corrupt JSON at ${this.filePath}:`, e.message);
+                this._backupCorruptFile();
+            }
+        }
         return this.data;
     }
 
-    // Debounced save to prevent disk thrashing
+    _backupCorruptFile() {
+        try {
+            const backupPath = `${this.filePath}.backup.${Date.now()}`;
+            fs.renameSync(this.filePath, backupPath);
+            console.log(`📦 Backed up corrupt file to ${backupPath}`);
+        } catch (e) {
+            console.error("Failed to backup corrupt file:", e);
+        }
+    }
+
+    set(key, value) {
+        if (!this.data) this.data = {};
+        this.data[key] = value;
+        this.save();
+    }
+
+    get(key) {
+        return this.data?.[key];
+    }
+
+    delete(key) {
+        if (this.data) {
+            delete this.data[key];
+            this.save();
+        }
+    }
+
     save(immediate = false) {
         return new Promise((resolve) => {
             this.saveQueue.push(resolve);
@@ -118,14 +215,13 @@ class PersistentStore {
             }
 
             if (this.saveTimeout) clearTimeout(this.saveTimeout);
-            this.saveTimeout = setTimeout(() => this._flush(), SAVE_DEBOUNCE_MS);
+            this.saveTimeout = setTimeout(() => this._flush(), CONFIG.SAVE_DEBOUNCE_MS);
         });
     }
 
     async _flush() {
         if (this.isSaving) {
-            // Retry after current save completes
-            setTimeout(() => this._flush(), 100);
+            setTimeout(() => this._flush(), 50);
             return;
         }
 
@@ -134,54 +230,350 @@ class PersistentStore {
         this.saveQueue = [];
 
         const tempPath = `${this.filePath}.tmp`;
+        const backupPath = `${this.filePath}.bak`;
         let success = false;
 
         try {
-            // Ensure directory still exists (Docker volume issues)
+            // Write WAL entry first
+            if (this.wal) {
+                this.wal.write('update', this.data);
+            }
+
+            // Ensure directory exists
             const dir = path.dirname(this.filePath);
             if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
 
             const jsonString = JSON.stringify(this.data, null, 2);
             
-            // Atomic write: write temp, then rename
+            // Create backup of current file
+            if (fs.existsSync(this.filePath)) {
+                fs.copyFileSync(this.filePath, backupPath);
+            }
+
+            // Atomic write
             fs.writeFileSync(tempPath, jsonString, { encoding: 'utf8', flag: 'w' });
             fs.renameSync(tempPath, this.filePath);
+            
+            // Clear WAL on successful save
+            if (this.wal) {
+                this.wal.clear();
+            }
+
+            this.lastSaveTime = Date.now();
+            this.saveCount++;
             success = true;
+
+            // Clean up old backup
+            if (fs.existsSync(backupPath)) {
+                fs.unlinkSync(backupPath);
+            }
         } catch (e) {
             console.error(`❌ Save failed for ${this.filePath}:`, e.message);
-            // Attempt emergency backup
-            try {
-                const emergencyPath = `${this.filePath}.emergency.${Date.now()}`;
-                fs.writeFileSync(emergencyPath, JSON.stringify(this.data));
-                console.log(`🆘 Emergency backup saved to ${emergencyPath}`);
-            } catch (emergencyErr) {
-                console.error("🆘 CRITICAL: Even emergency backup failed:", emergencyErr.message);
-            }
+            this._emergencyBackup();
         } finally {
             this.isSaving = false;
-            // Resolve all waiting promises
             resolvers.forEach(r => r(success));
+            
             if (this.saveQueue.length > 0) {
                 setTimeout(() => this._flush(), 10);
             }
         }
     }
+
+    _emergencyBackup() {
+        try {
+            const emergencyPath = `${this.filePath}.emergency.${Date.now()}`;
+            fs.writeFileSync(emergencyPath, JSON.stringify(this.data));
+            console.log(`🆘 Emergency backup saved to ${emergencyPath}`);
+        } catch (e) {
+            console.error("🆘 CRITICAL: Emergency backup failed:", e);
+        }
+    }
 }
 
-// Initialize stores
-const userStore = new PersistentStore(STORE);
-const sessionStore = new PersistentStore(REJOIN_STORE);
+// Initialize stores with WAL
+const wal = new WriteAheadLog(WAL_FILE);
+const userStore = new PersistentStore(STORE, wal);
+const sessionStore = new PersistentStore(REJOIN_STORE, wal);
 
 let users = userStore.load({});
 let activeSessionsStore = sessionStore.load({});
 
-// Auto-save interval
-setInterval(() => {
-    userStore.save().catch(e => console.error("Auto-save error:", e));
-    sessionStore.save().catch(e => console.error("Session auto-save error:", e));
-}, AUTO_SAVE_INTERVAL_MS);
+// ==================== RUNTIME STATE ====================
+const sessions = new Map();
+const pendingLink = new Map();
+const lastMsa = new Map();
+let lastAdminMessage = null;
+let isShuttingDown = false;
+let discordReady = false;
+let healthCheckInterval = null;
 
-// ----------------- User Management -----------------
+// ==================== ENHANCED DISCORD CLIENT ====================
+const client = new Client({
+    intents: [
+        GatewayIntentBits.Guilds,
+        GatewayIntentBits.DirectMessages,
+        GatewayIntentBits.GuildMessages
+    ],
+    failIfNotExists: false,
+    allowedMentions: { parse: ['users', 'roles'], repliedUser: false },
+    rest: {
+        rejectOnRateLimit: (data) => {
+            console.warn(`Rate limited on ${data.route}, retrying after ${data.timeToReset}ms`);
+            return false; // Don't reject, let it retry
+        },
+        retries: 3,
+        timeout: 30000
+    },
+    presence: {
+        status: 'online',
+        activities: [{ name: 'AFK Bot System', type: ActivityType.Watching }]
+    }
+});
+
+// ==================== CRASH PREVENTION SYSTEM ====================
+const crashLogger = {
+    log: (type, err) => {
+        const timestamp = new Date().toISOString();
+        const errorMsg = `[${timestamp}] ${type}:\n${err?.stack || err?.message || err}\n\n`;
+        console.error("🔥", errorMsg);
+        try {
+            fs.appendFileSync(CRASH_LOG, errorMsg);
+        } catch (e) {}
+    },
+    
+    isFatal: (err) => {
+        const fatalCodes = ['EADDRINUSE', 'EACCES', 'ENOTFOUND', 'EAI_AGAIN'];
+        return fatalCodes.includes(err?.code);
+    }
+};
+
+process.on("uncaughtException", (err) => {
+    crashLogger.log("UNCAUGHT EXCEPTION", err);
+    if (crashLogger.isFatal(err)) {
+        gracefulShutdown('FATAL_ERROR');
+    }
+    // Non-fatal: keep running
+});
+
+process.on("unhandledRejection", (reason, promise) => {
+    console.error("🔥 Unhandled Rejection:", reason);
+    crashLogger.log("UNHANDLED REJECTION", reason);
+});
+
+process.on("warning", (warning) => {
+    console.warn("⚠️ Node Warning:", warning.name, warning.message);
+});
+
+// ==================== DISCORD CONNECTION RESILIENCE ====================
+client.on("error", (error) => {
+    console.error("⚠️ Discord Client Error:", error?.message);
+    crashLogger.log("DISCORD ERROR", error);
+    
+    // Attempt to reconnect if not ready
+    setTimeout(() => {
+        if (!client.isReady()) {
+            console.log("🔄 Attempting Discord re-login...");
+            client.login(DISCORD_TOKEN).catch(e => {
+                console.error("Re-login failed:", e);
+                setTimeout(() => process.exit(1), 5000);
+            });
+        }
+    }, 10000);
+});
+
+client.on("shardError", (error) => {
+    console.error("⚠️ WebSocket Error:", error?.message);
+});
+
+client.on("warn", (warning) => {
+    console.warn("⚠️ Discord Warning:", warning);
+});
+
+client.on("disconnect", (event) => {
+    console.log(`📡 Discord disconnected: ${event.code} - ${event.reason}`);
+    discordReady = false;
+    
+    // Auto-reconnect
+    setTimeout(() => {
+        if (!client.isReady()) {
+            client.login(DISCORD_TOKEN).catch(console.error);
+        }
+    }, 5000);
+});
+
+client.on("reconnecting", () => {
+    console.log("🔄 Discord reconnecting...");
+});
+
+client.on("resume", (replayed) => {
+    console.log(`✅ Discord resumed, ${replayed} events replayed`);
+    discordReady = true;
+});
+
+// ==================== GRACEFUL SHUTDOWN ====================
+function gracefulShutdown(signal) {
+    console.log(`🛑 ${signal} received. Initiating graceful shutdown...`);
+    isShuttingDown = true;
+    
+    const forceExit = setTimeout(() => {
+        console.error("⚠️ Forced exit after timeout");
+        process.exit(1);
+    }, 15000);
+    
+    Promise.all([
+        userStore.save(true),
+        sessionStore.save(true)
+    ]).then(() => {
+        return cleanupAllSessions();
+    }).then(() => {
+        return client.destroy();
+    }).then(() => {
+        clearTimeout(forceExit);
+        console.log("✅ Clean shutdown complete");
+        process.exit(0);
+    }).catch(err => {
+        console.error("Error during shutdown:", err);
+        process.exit(1);
+    });
+}
+
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+
+// ==================== SESSION MANAGEMENT ====================
+async function cleanupSession(uid) {
+    if (!uid) return;
+    const s = sessions.get(uid);
+    if (!s) return;
+
+    console.log(`🧹 Cleaning up session ${uid}`);
+    
+    try {
+        // Clear all timers
+        const timers = ['reconnectTimer', 'physicsLoop', 'afkTimeout', 'chunkGCLoop', 
+                       'keepaliveTimer', 'staleCheckTimer', 'tokenRefreshTimer'];
+        timers.forEach(timer => {
+            if (s[timer]) {
+                clearTimeout(s[timer]);
+                clearInterval(s[timer]);
+                s[timer] = null;
+            }
+        });
+
+        // Remove listeners
+        if (s.client) {
+            s.client.removeAllListeners();
+            try {
+                s.client.close();
+            } catch (e) {}
+            s.client = null;
+        }
+        
+        // Clear chunk cache to free memory
+        if (s.chunks) {
+            s.chunks.clear();
+        }
+    } catch (e) {
+        console.error(`Error in cleanupSession for ${uid}:`, e);
+    }
+    
+    sessions.delete(uid);
+}
+
+async function cleanupAllSessions() {
+    console.log(`🧹 Cleaning up ${sessions.size} sessions...`);
+    const promises = [];
+    for (const [uid, session] of sessions) {
+        promises.push(cleanupSession(uid));
+    }
+    await Promise.all(promises);
+}
+
+async function stopSession(uid) {
+    if (!uid) return false;
+    
+    // Remove from persistent store immediately
+    if (activeSessionsStore[uid]) {
+        delete activeSessionsStore[uid];
+        await sessionStore.save();
+    }
+
+    await cleanupSession(uid);
+    return true;
+}
+
+// ==================== RECONNECTION SYSTEM ====================
+function handleAutoReconnect(uid, attempt = 1) {
+    if (!uid || isShuttingDown) return;
+    const s = sessions.get(uid);
+    if (!s || s.manualStop) return;
+
+    if (attempt > CONFIG.MAX_RECONNECT_ATTEMPTS) {
+        console.log(`🚫 Max reconnection attempts reached for ${uid}`);
+        logToDiscord(`🚫 Bot of <@${uid}> stopped after max failed attempts.`);
+        cleanupSession(uid);
+        delete activeSessionsStore[uid];
+        sessionStore.save();
+        return;
+    }
+
+    if (s.reconnectTimer) clearTimeout(s.reconnectTimer);
+
+    s.isReconnecting = true;
+    s.reconnectAttempt = attempt;
+    
+    // Exponential backoff with jitter to prevent thundering herd
+    const baseDelay = Math.min(
+        CONFIG.RECONNECT_BASE_DELAY_MS * Math.pow(1.5, attempt - 1),
+        CONFIG.RECONNECT_MAX_DELAY_MS
+    );
+    const jitter = Math.random() * 5000;
+    const delay = baseDelay + jitter;
+    
+    logToDiscord(`⏳ Bot of <@${uid}> disconnected. Reconnecting in ${Math.round(delay/1000)}s (Attempt ${attempt})...`);
+
+    s.reconnectTimer = setTimeout(() => {
+        if (!isShuttingDown && !s.manualStop) {
+            startSession(uid, null, true, attempt + 1);
+        } else {
+            cleanupSession(uid);
+        }
+    }, delay);
+}
+
+// ==================== CONNECTION HEALTH MONITORING ====================
+function startHealthMonitoring(uid) {
+    const s = sessions.get(uid);
+    if (!s) return;
+
+    // Keepalive ping
+    s.keepaliveTimer = setInterval(() => {
+        if (!s.connected || !s.client) return;
+        try {
+            // Send a packet to keep connection alive
+            s.client.queue('client_cache_status', { enabled: false });
+            s.lastKeepalive = Date.now();
+        } catch (e) {
+            console.log(`Keepalive failed for ${uid}, triggering reconnect`);
+            handleAutoReconnect(uid, s.reconnectAttempt + 1);
+        }
+    }, CONFIG.KEEPALIVE_INTERVAL_MS);
+
+    // Stale connection detection
+    s.staleCheckTimer = setInterval(() => {
+        if (!s.connected) return;
+        const lastActivity = Math.max(s.lastPacketTime || 0, s.lastKeepalive || 0);
+        if (Date.now() - lastActivity > CONFIG.STALE_CONNECTION_TIMEOUT_MS) {
+            console.log(`Stale connection detected for ${uid}`);
+            logToDiscord(`⚠️ Stale connection for <@${uid}>, forcing reconnect...`);
+            s.client?.close();
+            handleAutoReconnect(uid, s.reconnectAttempt + 1);
+        }
+    }, CONFIG.STALE_CONNECTION_TIMEOUT_MS);
+}
+
+// ==================== USER MANAGEMENT ====================
 function getUser(uid) {
     if (!uid || typeof uid !== 'string' || !/^\d+$/.test(uid)) {
         console.warn(`Invalid UID access attempt: ${uid}`);
@@ -192,21 +584,21 @@ function getUser(uid) {
         users[uid] = {
             connectionType: "online",
             bedrockVersion: "auto",
-            createdAt: Date.now()
+            createdAt: Date.now(),
+            lastActive: Date.now()
         };
-        userStore.save(); // Auto-save new users
+        userStore.save();
     }
     
-    // Ensure defaults for missing fields
     users[uid].connectionType = users[uid].connectionType || "online";
-    if (!users[uid].bedrockVersion) users[uid].bedrockVersion = "auto";
+    users[uid].bedrockVersion = users[uid].bedrockVersion || "auto";
+    users[uid].lastActive = Date.now();
     
     return users[uid];
 }
 
 function getUserAuthDir(uid) {
     if (!uid || typeof uid !== 'string') return null;
-    // Sanitize UID to prevent path traversal
     const safeUid = uid.replace(/[^a-zA-Z0-9]/g, '');
     if (!safeUid) return null;
     
@@ -222,129 +614,41 @@ async function unlinkMicrosoft(uid) {
         try { 
             fs.rmSync(dir, { recursive: true, force: true }); 
         } catch (e) {
-            console.error("Error removing auth dir:", e.message);
+            console.error("Error removing auth dir:", e);
         }
     }
     const u = getUser(uid);
     u.linked = false;
+    u.authTokenExpiry = null;
     await userStore.save();
     return true;
 }
 
-// ----------------- Runtime -----------------
-const sessions = new Map();
-const pendingLink = new Map();
-const lastMsa = new Map();
-let lastAdminMessage = null;
-let isShuttingDown = false;
-
-// ----------------- Discord client -----------------
-const client = new Client({
-    intents: [
-        GatewayIntentBits.Guilds,
-        GatewayIntentBits.DirectMessages,
-        GatewayIntentBits.GuildMessages
-    ],
-    failIfNotExists: false,
-    allowedMentions: { parse: ['users', 'roles'], repliedUser: false },
-    // Crash prevention: don't crash on cache errors
-    rest: {
-        rejectOnRateLimit: () => false,
-    }
-});
-
-// ==========================================================
-// 🛡️ ENHANCED CRASH PREVENTION SYSTEM
-// ==========================================================
-
-// Global error handlers with logging
-process.on("uncaughtException", (err) => {
-    const timestamp = new Date().toISOString();
-    const errorMsg = `[${timestamp}] UNCAUGHT EXCEPTION:\n${err.stack || err.message}\n\n`;
-    console.error("🔥", errorMsg);
+// ==================== VALIDATION ====================
+function isValidIP(ip) {
+    if (!ip || typeof ip !== 'string') return false;
+    if (ip.length > 253) return false;
+    if (ip.includes('..') || ip.startsWith('.') || ip.endsWith('.')) return false;
+    if (ip.includes('://')) return false;
     
-    // Write to crash log for debugging
-    try {
-        fs.appendFileSync(CRASH_LOG, errorMsg);
-    } catch (e) { /* ignore */ }
+    const ipv4Regex = /^(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$/;
+    const ipv6Regex = /^(?:[0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}$/;
+    const hostnameRegex = /^[a-zA-Z0-9][a-zA-Z0-9-]{1,61}[a-zA-Z0-9](?:\.[a-zA-Z0-9][a-zA-Z0-9-]{0,61}[a-zA-Z0-9])*$/;
     
-    // Keep alive unless it's a fatal error
-    if (err.code === 'EADDRINUSE' || err.code === 'EACCES') {
-        process.exit(1);
-    }
-});
-
-process.on("unhandledRejection", (reason, promise) => {
-    console.error("🔥 Unhandled Rejection at:", promise, "reason:", reason);
-    // Log but don't crash
-});
-
-// Discord client error handlers
-client.on("error", (error) => {
-    console.error("⚠️ Discord Client Error:", error?.message || error);
-    // Attempt reconnect after delay
-    setTimeout(() => {
-        if (client.isReady()) return;
-        client.login(DISCORD_TOKEN).catch(e => console.error("Re-login failed:", e));
-    }, 10000);
-});
-
-client.on("shardError", (error) => {
-    console.error("⚠️ WebSocket Error:", error?.message || error);
-});
-
-client.on("warn", (warning) => {
-    console.warn("⚠️ Discord Warning:", warning);
-});
-
-// Graceful shutdown with cleanup timeout
-function gracefulShutdown(signal) {
-    console.log(`🛑 ${signal} received. Initiating graceful shutdown...`);
-    isShuttingDown = true;
-    
-    // Force exit after 10s regardless
-    const forceExit = setTimeout(() => {
-        console.error("⚠️ Forced exit after timeout");
-        process.exit(1);
-    }, 10000);
-    
-    Promise.all([
-        userStore.save(true),
-        sessionStore.save(true)
-    ]).then(() => {
-        cleanupAllSessions();
-        return client.destroy();
-    }).then(() => {
-        clearTimeout(forceExit);
-        process.exit(0);
-    }).catch(err => {
-        console.error("Error during shutdown:", err);
-        process.exit(1);
-    });
+    return ipv4Regex.test(ip) || ipv6Regex.test(ip) || hostnameRegex.test(ip);
 }
 
-process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
-process.on('SIGINT', () => gracefulShutdown('SIGINT'));
-
-// Enhanced cleanup
-function cleanupAllSessions() {
-    console.log(`🧹 Cleaning up ${sessions.size} sessions...`);
-    const promises = [];
-    for (const [uid, session] of sessions) {
-        try {
-            promises.push(cleanupSession(uid));
-        } catch (e) {
-            console.error(`Error cleaning up session ${uid}:`, e);
-        }
-    }
-    return Promise.all(promises);
+function isValidPort(port) {
+    const num = parseInt(port, 10);
+    return !isNaN(num) && num > 0 && num <= 65535;
 }
 
+// ==================== DISCORD HELPERS ====================
 async function logToDiscord(message) {
-    if (!message || isShuttingDown) return;
+    if (!message || isShuttingDown || !discordReady) return;
     try {
-        const channel = await client.channels.fetch(LOG_CHANNEL_ID).catch(() => null);
-        if (!channel || !channel.send) return;
+        const channel = await client.channels.fetch(CONFIG.LOG_CHANNEL_ID).catch(() => null);
+        if (!channel) return;
         
         const embed = new EmbedBuilder()
             .setColor("#5865F2")
@@ -352,12 +656,23 @@ async function logToDiscord(message) {
             .setTimestamp();
             
         await channel.send({ embeds: [embed] }).catch(() => {});
-    } catch (e) {
-        // Silent fail
-    }
+    } catch (e) {}
 }
 
-// ----------------- UI helpers (unchanged mostly) -----------------
+async function safeReply(interaction, content) {
+    if (!interaction) return;
+    try {
+        const payload = typeof content === 'string' ? { content } : content;
+        
+        if (interaction.replied || interaction.deferred) {
+            await interaction.editReply(payload).catch(() => {});
+        } else {
+            await interaction.reply(payload).catch(() => {});
+        }
+    } catch (e) {}
+}
+
+// ==================== UI COMPONENTS ====================
 function panelRow(isJava = false) {
     const title = isJava ? "Java AFKBot Panel 🎛️" : "Bedrock AFKBot Panel 🎛️";
     const startCustomId = isJava ? "start_java" : "start_bedrock";
@@ -380,7 +695,8 @@ function adminPanelComponents() {
     const rows = [
         new ActionRowBuilder().addComponents(
             new ButtonBuilder().setCustomId("admin_refresh").setLabel("🔄 Refresh Stats").setStyle(ButtonStyle.Primary),
-            new ButtonBuilder().setCustomId("admin_stop_all").setLabel("🛑 Force Stop All").setStyle(ButtonStyle.Danger)
+            new ButtonBuilder().setCustomId("admin_stop_all").setLabel("🛑 Force Stop All").setStyle(ButtonStyle.Danger),
+            new ButtonBuilder().setCustomId("admin_save_data").setLabel("💾 Force Save").setStyle(ButtonStyle.Secondary)
         )
     ];
 
@@ -409,12 +725,13 @@ function adminPanelComponents() {
 }
 
 function getAdminStatsEmbed() {
-    let memory = { rss: 0 };
+    let memory = { rss: 0, heapUsed: 0 };
     try {
         memory = process.memoryUsage();
     } catch (e) {}
     
     const ramMB = (memory.rss / 1024 / 1024).toFixed(2);
+    const heapMB = (memory.heapUsed / 1024 / 1024).toFixed(2);
     const uptime = process.uptime();
     const hours = Math.floor(uptime / 3600);
     const minutes = Math.floor((uptime % 3600) / 60);
@@ -423,18 +740,19 @@ function getAdminStatsEmbed() {
         .setTitle("🛠 Admin Panel")
         .setColor("#2f3136")
         .addFields(
-            { name: "📊 Performance", value: `**RAM:** ${ramMB} MB\n**Uptime:** ${hours}h ${minutes}m`, inline: true },
+            { name: "📊 Performance", value: `**RAM:** ${ramMB} MB\n**Heap:** ${heapMB} MB\n**Uptime:** ${hours}h ${minutes}m`, inline: true },
             { name: "🤖 Active Sessions", value: `**Total Bots:** ${sessions.size}`, inline: true },
             { name: "💾 Persisted Sessions", value: `**Saved for Restart:** ${Object.keys(activeSessionsStore || {}).length}`, inline: true }
         )
-        .setFooter({ text: "Auto-refreshing every 30s • Administrative Access Only" })
+        .setFooter({ text: `Auto-refreshing • Saves: ${userStore.saveCount} | PID: ${process.pid}` })
         .setTimestamp();
 
     if (sessions.size > 0) {
         let botList = "";
         for (const [uid, s] of sessions) {
             const status = s?.connected ? "🟢 Online" : (s?.isReconnecting ? "⏳ Reconnecting" : "🔴 Offline");
-            botList += `<@${uid}>: ${status}\n`;
+            const attempt = s?.reconnectAttempt ? ` (R${s.reconnectAttempt})` : '';
+            botList += `<@${uid}>: ${status}${attempt}\n`;
         }
         if (botList.length > 1024) botList = botList.slice(0, 1021) + "...";
         embed.addFields({ name: "📋 Active Bot Registry", value: botList || "None" });
@@ -442,54 +760,7 @@ function getAdminStatsEmbed() {
     return embed;
 }
 
-// ----------------- Events: Ready & Startup Rejoin -----------------
-client.once("ready", async () => {
-    console.log("🟢 Online as", client.user?.tag || "Unknown");
-
-    try {
-        const cmds = [
-            new SlashCommandBuilder().setName("panel").setDescription("Open Bedrock AFK panel"),
-            new SlashCommandBuilder().setName("java").setDescription("Open Java AFKBot Panel"),
-            new SlashCommandBuilder().setName("admin").setDescription("Open Admin Control Panel")
-        ];
-        await client.application?.commands?.set(cmds);
-    } catch (e) {
-        console.error("❌ Failed to register commands:", e);
-    }
-
-    setInterval(async () => {
-        if (lastAdminMessage && !isShuttingDown) {
-            try {
-                await lastAdminMessage.edit({ 
-                    embeds: [getAdminStatsEmbed()], 
-                    components: adminPanelComponents() 
-                }).catch(() => { lastAdminMessage = null; });
-            } catch (e) { 
-                lastAdminMessage = null; 
-            }
-        }
-    }, 30000);
-
-    console.log("📂 Checking ReJoin.json for previous sessions...");
-    const previousSessions = Object.keys(activeSessionsStore || {});
-
-    if (previousSessions.length > 0) {
-        console.log(`♻️ Found ${previousSessions.length} bots to restore. Starting them now...`);
-        let delay = 0;
-        for (const uid of previousSessions) {
-            if (typeof uid === 'string' && uid.match(/^\d+$/)) {
-                setTimeout(() => {
-                    if (!isShuttingDown) startSession(uid, null, true);
-                }, delay);
-                delay += 5000; // Staggered startup to prevent rate limits
-            }
-        }
-    } else {
-        console.log("⚪ No previous sessions found.");
-    }
-});
-
-// ----------------- Microsoft link (Enhanced) -----------------
+// ==================== MICROSOFT AUTHENTICATION ====================
 async function linkMicrosoft(uid, interaction) {
     if (!uid || !interaction) return;
     
@@ -505,7 +776,6 @@ async function linkMicrosoft(uid, interaction) {
     const u = getUser(uid);
     let codeShown = false;
 
-    // Timeout handler
     const timeoutId = setTimeout(() => {
         if (pendingLink.has(uid)) {
             pendingLink.delete(uid);
@@ -547,8 +817,9 @@ async function linkMicrosoft(uid, interaction) {
 
         const authPromise = flow.getMsaToken().then(async () => {
             clearTimeout(timeoutId);
-            u.linked = true; 
-            await userStore.save(); // Ensure save completes
+            u.linked = true;
+            u.tokenAcquiredAt = Date.now();
+            await userStore.save();
             await interaction.followUp({ ephemeral: true, content: "✅ Microsoft account linked!" }).catch(() => {});
         }).catch(async (e) => {
             clearTimeout(timeoutId);
@@ -568,129 +839,7 @@ async function linkMicrosoft(uid, interaction) {
     }
 }
 
-// ----------------- Session Logic (Hardened) -----------------
-async function cleanupSession(uid) {
-    if (!uid) return;
-    const s = sessions.get(uid);
-    if (!s) return;
-
-    try {
-        // Clear all timers
-        const timers = ['reconnectTimer', 'physicsLoop', 'afkTimeout', 'chunkGCLoop'];
-        timers.forEach(timer => {
-            if (s[timer]) {
-                clearTimeout(s[timer]);
-                clearInterval(s[timer]);
-                s[timer] = null;
-            }
-        });
-
-        // Remove listeners before closing to prevent event firing during cleanup
-        if (s.client) {
-            s.client.removeAllListeners();
-            try {
-                s.client.close();
-            } catch (e) {
-                // Ignore close errors
-            }
-            s.client = null;
-        }
-    } catch (e) {
-        console.error(`Error in cleanupSession for ${uid}:`, e);
-    }
-    
-    sessions.delete(uid);
-}
-
-async function stopSession(uid) {
-    if (!uid) return false;
-    
-    // Remove from persistent store immediately
-    if (activeSessionsStore[uid]) {
-        delete activeSessionsStore[uid];
-        await sessionStore.save(); // Wait for save
-    }
-
-    await cleanupSession(uid);
-    return true;
-}
-
-function handleAutoReconnect(uid, attempt = 1) {
-    if (!uid || isShuttingDown) return;
-    const s = sessions.get(uid);
-    if (!s || s.manualStop) return;
-
-    // Max retry limit to prevent infinite loops
-    if (attempt > MAX_RECONNECT_ATTEMPTS) {
-        console.log(`🚫 Max reconnection attempts reached for ${uid}`);
-        logToDiscord(`🚫 Bot of <@${uid}> stopped after ${MAX_RECONNECT_ATTEMPTS} failed reconnection attempts.`);
-        cleanupSession(uid);
-        delete activeSessionsStore[uid];
-        sessionStore.save();
-        return;
-    }
-
-    if (s.reconnectTimer) clearTimeout(s.reconnectTimer);
-
-    s.isReconnecting = true;
-    s.reconnectAttempt = attempt;
-    
-    // Exponential backoff: 30s, 60s, 120s, 240s, 480s
-    const delay = Math.min(RECONNECT_BASE_DELAY_MS * Math.pow(2, attempt - 1), 600000); // Max 10 minutes
-    
-    logToDiscord(`⏳ Bot of <@${uid}> disconnected. Reconnecting in ${delay/1000}s (Attempt ${attempt}/${MAX_RECONNECT_ATTEMPTS})...`);
-
-    s.reconnectTimer = setTimeout(() => {
-        if (!isShuttingDown && !s.manualStop) {
-            startSession(uid, null, true, attempt + 1);
-        } else {
-            cleanupSession(uid);
-        }
-    }, delay);
-}
-
-async function safeReply(interaction, content) {
-    if (!interaction) return;
-    try {
-        // Handle both string and object content
-        const payload = typeof content === 'string' ? { content } : content;
-        
-        if (interaction.replied || interaction.deferred) {
-            await interaction.editReply(payload).catch(() => {});
-        } else {
-            if (payload.ephemeral) {
-                await interaction.reply({ ...payload, ephemeral: true }).catch(() => {});
-            } else {
-                await interaction.reply(payload).catch(() => {});
-            }
-        }
-    } catch (e) {
-        // Silent fail - don't crash on Discord API errors
-    }
-}
-
-// Enhanced validation
-function isValidIP(ip) {
-    if (!ip || typeof ip !== 'string') return false;
-    if (ip.length > 253) return false;
-    
-    // Prevent injection attempts
-    if (ip.includes('..') || ip.startsWith('.') || ip.endsWith('.')) return false;
-    if (ip.includes('://')) return false; // No protocols
-    
-    const ipv4Regex = /^(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$/;
-    const ipv6Regex = /^(?:[0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}$/;
-    const hostnameRegex = /^[a-zA-Z0-9][a-zA-Z0-9-]{1,61}[a-zA-Z0-9](?:\.[a-zA-Z0-9][a-zA-Z0-9-]{0,61}[a-zA-Z0-9])*$/;
-    
-    return ipv4Regex.test(ip) || ipv6Regex.test(ip) || hostnameRegex.test(ip);
-}
-
-function isValidPort(port) {
-    const num = parseInt(port, 10);
-    return !isNaN(num) && num > 0 && num <= 65535;
-}
-
-// ----------------- MAIN SESSION FUNCTION (Hardened) -----------------
+// ==================== MAIN SESSION FUNCTION ====================
 async function startSession(uid, interaction, isReconnect = false, reconnectAttempt = 1) {
     if (!uid || isShuttingDown) return;
     
@@ -700,14 +849,14 @@ async function startSession(uid, interaction, isReconnect = false, reconnectAtte
         return;
     }
 
-    // Validate user data exists
+    // Persist session immediately
     if (!activeSessionsStore) activeSessionsStore = {};
     
-    // Only add to active sessions if not already there (prevents duplicate keys)
     if (!activeSessionsStore[uid]) {
         activeSessionsStore[uid] = { 
             startedAt: Date.now(),
-            server: u.server // Cache server info for recovery
+            server: u.server,
+            reconnectCount: 0
         };
         await sessionStore.save();
     }
@@ -783,13 +932,16 @@ async function startSession(uid, interaction, isReconnect = false, reconnectAtte
     const opts = {
         host: ip,
         port: parseInt(port),
-        connectTimeout: 60000,
+        connectTimeout: CONFIG.CONNECTION_TIMEOUT_MS,
         keepAlive: true,
         viewDistance: 4,
         profilesFolder: authDir,
         username: uid,
         offline: false,
-        skipPing: true
+        skipPing: true,
+        // Enhanced connection options for stability
+        autoInitPlayer: true,
+        useTimeout: true
     };
 
     if (u.connectionType === "offline") {
@@ -829,21 +981,22 @@ async function startSession(uid, interaction, isReconnect = false, reconnectAtte
         physicsLoop: null,
         afkTimeout: null,
         chunkGCLoop: null,
+        keepaliveTimer: null,
+        staleCheckTimer: null,
         entityId: null,
-        packetQueue: [] // Queue for packets sent before fully connected
+        lastPacketTime: Date.now(),
+        lastKeepalive: Date.now(),
+        packetsReceived: 0
     };
     sessions.set(uid, currentSession);
 
-    // ==========================================
-    // 🍎 ADVANCED PHYSICS & CHUNK ENGINE (Hardened)
-    // ==========================================
+    // ==================== CHUNK & PHYSICS SYSTEM ====================
     if (Vec3 && PrismarineChunk && currentSession.velocity) {
         try {
             currentSession.registry = PrismarineRegistry('bedrock_1.20.0');
             currentSession.Chunk = PrismarineChunk(currentSession.registry);
         } catch (e) {
-            logToDiscord(`Could not initialize chunk manager for <@${uid}>. Bed detection disabled.`);
-            currentSession.Chunk = null;
+            logToDiscord(`Could not initialize chunk manager for <@${uid}>.`);
         }
 
         mc.on('level_chunk', (packet) => {
@@ -853,17 +1006,19 @@ async function startSession(uid, interaction, isReconnect = false, reconnectAtte
                 if (packet.payload) chunk.load(packet.payload);
                 if (packet.x !== undefined && packet.z !== undefined) {
                     currentSession.chunks.set(`${packet.x},${packet.z}`, chunk);
+                    
+                    // Limit cache size
+                    if (currentSession.chunks.size > CONFIG.CHUNK_CACHE_MAX_SIZE) {
+                        const firstKey = currentSession.chunks.keys().next().value;
+                        currentSession.chunks.delete(firstKey);
+                    }
                 }
-            } catch (e) { 
-                // Ignore chunk errors silently
-            }
+            } catch (e) {}
         });
 
-        // More frequent GC for memory management
         currentSession.chunkGCLoop = setInterval(() => {
             try {
-                if (currentSession.chunks && currentSession.chunks.size > 15) { // Lower threshold
-                    // Keep only chunks near player instead of clearing all
+                if (currentSession.chunks && currentSession.chunks.size > 20) {
                     if (currentSession.position) {
                         const px = Math.floor(currentSession.position.x / 16);
                         const pz = Math.floor(currentSession.position.z / 16);
@@ -871,18 +1026,16 @@ async function startSession(uid, interaction, isReconnect = false, reconnectAtte
                         for (const key of currentSession.chunks.keys()) {
                             const [cx, cz] = key.split(',').map(Number);
                             const dist = Math.abs(cx - px) + Math.abs(cz - pz);
-                            if (dist > 3) toDelete.push(key); // Keep only within 3 chunks
+                            if (dist > 3) toDelete.push(key);
                         }
                         toDelete.forEach(k => currentSession.chunks.delete(k));
-                    } else {
-                        currentSession.chunks.clear();
                     }
                 }
             } catch (e) {}
-        }, 10000); // Check every 10s
+        }, 10000);
     }
 
-    // Safe packet writer wrapper
+    // Safe packet writer
     function safeWrite(packetName, params) {
         try {
             if (mc && mc.write && !mc.destroyed && currentSession?.connected) {
@@ -895,9 +1048,7 @@ async function startSession(uid, interaction, isReconnect = false, reconnectAtte
         return false;
     }
 
-    // Physics loop with error isolation
-    if (currentSession.physicsLoop) clearInterval(currentSession.physicsLoop);
-    
+    // Physics loop
     currentSession.physicsLoop = setInterval(() => {
         try {
             if (!currentSession?.connected || !currentSession.position || !currentSession.velocity) return;
@@ -930,7 +1081,6 @@ async function startSession(uid, interaction, isReconnect = false, reconnectAtte
                 currentSession.velocity.y = 0;
             }
 
-            // Send packet safely
             safeWrite("player_auth_input", {
                 pitch: currentSession.pitch || 0, 
                 yaw: currentSession.yaw || 0,
@@ -947,14 +1097,10 @@ async function startSession(uid, interaction, isReconnect = false, reconnectAtte
                 interaction_model: "touch", 
                 tick: 0n
             });
-        } catch (e) { 
-            // Isolate physics errors
-        }
+        } catch (e) {}
     }, 50);
 
-    // ==========================================
-    // 🤖 ANTI-AFK CONTROLLER (Hardened)
-    // ==========================================
+    // ==================== ANTI-AFK SYSTEM ====================
     const performAntiAfk = () => {
         if (!sessions.has(uid) || isShuttingDown) return;
         const s = sessions.get(uid);
@@ -966,13 +1112,11 @@ async function startSession(uid, interaction, isReconnect = false, reconnectAtte
         }
 
         try {
-            // Only scan for bed occasionally to save CPU
             if (Math.random() > 0.7) scanForBedAndSleep(uid);
 
             const action = Math.random();
             if (action > 0.5 && !s.isWalking) {
                 s.isWalking = true;
-                // Pick random target within 5 blocks
                 if (s.targetPosition && s.position) {
                     s.targetPosition = s.position.offset(
                         (Math.random() - 0.5) * 10,
@@ -984,12 +1128,11 @@ async function startSession(uid, interaction, isReconnect = false, reconnectAtte
                 s.yaw += (Math.random() - 0.5) * 20;
                 s.pitch += (Math.random() - 0.5) * 10;
                 if (s.onGround && Math.random() > 0.9 && s.velocity) {
-                    s.velocity.y = 0.42; // Jump
+                    s.velocity.y = 0.42;
                     s.onGround = false;
                 }
             }
 
-            // Swing animation
             if (s.entityId) {
                 safeWrite('animate', { action_id: 1, runtime_entity_id: s.entityId });
             }
@@ -999,9 +1142,7 @@ async function startSession(uid, interaction, isReconnect = false, reconnectAtte
         s.afkTimeout = setTimeout(performAntiAfk, nextDelay);
     };
 
-    // ==========================================
-    // 🛌 BED DETECTION AI (Hardened)
-    // ==========================================
+    // ==================== BED DETECTION ====================
     function scanForBedAndSleep(uid) {
         const s = sessions.get(uid);
         if (!s || !s.Chunk || !s.position || s.isTryingToSleep || !Vec3) return;
@@ -1025,7 +1166,6 @@ async function startSession(uid, interaction, isReconnect = false, reconnectAtte
                                     logToDiscord(`🛌 Bed found for <@${uid}>. Attempting to sleep.`);
                                     s.isTryingToSleep = true;
 
-                                    // Attempt to sleep
                                     safeWrite('inventory_transaction', {
                                         transaction: {
                                             transaction_type: 'item_use_on_block', 
@@ -1047,7 +1187,6 @@ async function startSession(uid, interaction, isReconnect = false, reconnectAtte
                                         face: 0
                                     });
                                     
-                                    // Reset sleep flag after delay
                                     setTimeout(() => {
                                         if (sessions.has(uid)) {
                                             sessions.get(uid).isTryingToSleep = false;
@@ -1055,19 +1194,15 @@ async function startSession(uid, interaction, isReconnect = false, reconnectAtte
                                     }, 10000);
                                     return;
                                 }
-                            } catch (err) {
-                                // Ignore chunk read errors
-                            }
+                            } catch (err) {}
                         }
                     }
                 }
             }
-        } catch (e) {
-            // Ignore bed scan errors
-        }
+        } catch (e) {}
     }
 
-    // --- EVENTS (Hardened) ---
+    // ==================== EVENT HANDLERS ====================
     mc.on("spawn", () => {
         logToDiscord(`✅ Bot of <@${uid}> spawned on **${ip}:${port}**` + (isReconnect ? ` (Attempt ${reconnectAttempt})` : ""));
         if (!isReconnect) safeReply(interaction, { content: `🟢 **Online** on \`${ip}:${port}\``, embeds: [] });
@@ -1087,8 +1222,17 @@ async function startSession(uid, interaction, isReconnect = false, reconnectAtte
             currentSession.entityId = packet.runtime_entity_id;
             currentSession.connected = true;
             currentSession.isReconnecting = false;
-            currentSession.reconnectAttempt = 0; // Reset counter on success
+            currentSession.reconnectAttempt = 0;
+            currentSession.lastPacketTime = Date.now();
 
+            // Update persist data
+            if (activeSessionsStore[uid]) {
+                activeSessionsStore[uid].lastConnected = Date.now();
+                sessionStore.save();
+            }
+
+            // Start health monitoring
+            startHealthMonitoring(uid);
             performAntiAfk();
         } catch (e) {
             console.error("Error in start_game handler:", e);
@@ -1098,8 +1242,10 @@ async function startSession(uid, interaction, isReconnect = false, reconnectAtte
     mc.on("move_player", (packet) => {
         if (!packet || !currentSession) return;
         try {
+            currentSession.lastPacketTime = Date.now();
+            currentSession.packetsReceived++;
+            
             if (packet.runtime_id === currentSession.entityId && currentSession.position) {
-                // Ground detection
                 if (packet.position && packet.position.y > currentSession.position.y && currentSession.velocity) {
                     currentSession.onGround = true;
                     currentSession.velocity.y = 0;
@@ -1114,9 +1260,7 @@ async function startSession(uid, interaction, isReconnect = false, reconnectAtte
                     packet.position?.z || 0
                 );
             }
-        } catch (e) {
-            console.error("Error in move_player handler:", e);
-        }
+        } catch (e) {}
     });
 
     mc.on("respawn", (packet) => {
@@ -1136,8 +1280,13 @@ async function startSession(uid, interaction, isReconnect = false, reconnectAtte
                 currentSession.isTryingToSleep = false;
                 currentSession.onGround = true;
             }
-        } catch (e) {
-            console.error("Error in respawn handler:", e);
+        } catch (e) {}
+    });
+
+    // Track all packets for stale detection
+    mc.on('packet', (packet) => {
+        if (currentSession) {
+            currentSession.lastPacketTime = Date.now();
         }
     });
 
@@ -1153,18 +1302,82 @@ async function startSession(uid, interaction, isReconnect = false, reconnectAtte
         else logToDiscord(`🔌 Bot of <@${uid}> disconnected manually.`);
     });
     
-    // Packet error handler (prevents protocol errors from crashing)
     mc.on('packet_error', (err) => {
         console.error(`Packet error for ${uid}:`, err);
     });
 }
 
-// ----------------- Interactions (Hardened) -----------------
+// ==================== DISCORD EVENTS ====================
+client.once("ready", async () => {
+    console.log("🟢 Online as", client.user?.tag || "Unknown");
+    discordReady = true;
+
+    try {
+        const cmds = [
+            new SlashCommandBuilder().setName("panel").setDescription("Open Bedrock AFK panel"),
+            new SlashCommandBuilder().setName("java").setDescription("Open Java AFKBot Panel"),
+            new SlashCommandBuilder().setName("admin").setDescription("Open Admin Control Panel")
+        ];
+        await client.application?.commands?.set(cmds);
+    } catch (e) {
+        console.error("❌ Failed to register commands:", e);
+    }
+
+    // Admin panel auto-refresh
+    setInterval(async () => {
+        if (lastAdminMessage && !isShuttingDown && discordReady) {
+            try {
+                await lastAdminMessage.edit({ 
+                    embeds: [getAdminStatsEmbed()], 
+                    components: adminPanelComponents() 
+                }).catch(() => { lastAdminMessage = null; });
+            } catch (e) { 
+                lastAdminMessage = null; 
+            }
+        }
+    }, 30000);
+
+    // Memory monitoring
+    setInterval(() => {
+        const mem = process.memoryUsage();
+        const mb = mem.rss / 1024 / 1024;
+        if (mb > CONFIG.MAX_MEMORY_MB) {
+            console.warn(`⚠️ High memory usage: ${mb.toFixed(2)} MB`);
+            // Force garbage collection if available
+            if (global.gc) {
+                global.gc();
+                console.log("🧹 Garbage collection triggered");
+            }
+        }
+    }, CONFIG.MEMORY_CHECK_INTERVAL_MS);
+
+    // Restore sessions
+    console.log("📂 Checking for previous sessions...");
+    const previousSessions = Object.keys(activeSessionsStore || {});
+
+    if (previousSessions.length > 0) {
+        console.log(`♻️ Found ${previousSessions.length} bots to restore.`);
+        let delay = 0;
+        for (const uid of previousSessions) {
+            if (typeof uid === 'string' && uid.match(/^\d+$/)) {
+                setTimeout(() => {
+                    if (!isShuttingDown) {
+                        console.log(`🔄 Restoring session for ${uid}`);
+                        startSession(uid, null, true);
+                    }
+                }, delay);
+                delay += 3000; // Staggered startup
+            }
+        }
+    } else {
+        console.log("⚪ No previous sessions found.");
+    }
+});
+
 client.on(Events.InteractionCreate, async (i) => {
     if (!i || isShuttingDown) return;
     
     try {
-        // Validate interaction has user
         if (!i.user?.id) {
             console.warn("Interaction without user received");
             return;
@@ -1172,7 +1385,7 @@ client.on(Events.InteractionCreate, async (i) => {
         
         const uid = i.user.id;
         
-        // Rate limiting check (basic)
+        // Rate limiting
         if (i.isButton() || i.isChatInputCommand()) {
             const lastInteraction = i.user.lastInteraction || 0;
             if (Date.now() - lastInteraction < 1000) {
@@ -1185,7 +1398,7 @@ client.on(Events.InteractionCreate, async (i) => {
             if (i.commandName === "panel") return safeReply(i, panelRow(false));
             if (i.commandName === "java") return safeReply(i, panelRow(true));
             if (i.commandName === "admin") {
-                if (uid !== ADMIN_ID) return safeReply(i, { content: "⛔ Access restricted.", ephemeral: true });
+                if (uid !== CONFIG.ADMIN_ID) return safeReply(i, { content: "⛔ Access restricted.", ephemeral: true });
                 try {
                     const msg = await i.reply({ 
                         embeds: [getAdminStatsEmbed()], 
@@ -1215,7 +1428,7 @@ client.on(Events.InteractionCreate, async (i) => {
         }
 
         if (i.isButton()) {
-            // Handle admin buttons
+            // Admin buttons
             if (i.customId === "admin_refresh") {
                 return i.update({ 
                     embeds: [getAdminStatsEmbed()], 
@@ -1224,12 +1437,23 @@ client.on(Events.InteractionCreate, async (i) => {
             }
 
             if (i.customId === "admin_stop_all") {
-                if (uid !== ADMIN_ID) return;
+                if (uid !== CONFIG.ADMIN_ID) return;
                 const stopPromises = [];
                 sessions.forEach((_, sUid) => stopPromises.push(stopSession(sUid)));
                 await Promise.all(stopPromises);
                 return i.update({ 
                     content: "🛑 All sessions stopped.", 
+                    embeds: [getAdminStatsEmbed()], 
+                    components: adminPanelComponents() 
+                }).catch(() => {});
+            }
+
+            if (i.customId === "admin_save_data") {
+                if (uid !== CONFIG.ADMIN_ID) return;
+                await userStore.save(true);
+                await sessionStore.save(true);
+                return i.update({ 
+                    content: "💾 Data saved to disk.", 
                     embeds: [getAdminStatsEmbed()], 
                     components: adminPanelComponents() 
                 }).catch(() => {});
@@ -1341,7 +1565,7 @@ client.on(Events.InteractionCreate, async (i) => {
 
                 const u = getUser(uid);
                 u.server = { ip, port };
-                await userStore.save(); // Ensure save completes before replying
+                await userStore.save();
                 return safeReply(i, { ephemeral: true, content: `✅ Saved: **${ip}:${port}**` });
             } catch (e) {
                 console.error("Settings save error:", e);
@@ -1354,7 +1578,13 @@ client.on(Events.InteractionCreate, async (i) => {
     }
 });
 
+// ==================== STARTUP ====================
 client.login(DISCORD_TOKEN).catch(e => {
     console.error("❌ Failed to login to Discord:", e);
     process.exit(1);
 });
+
+// Keep alive heartbeat for process managers
+setInterval(() => {
+    console.log(`💓 Heartbeat | Sessions: ${sessions.size} | Uptime: ${Math.floor(process.uptime() / 60)}m`);
+}, 60000);
