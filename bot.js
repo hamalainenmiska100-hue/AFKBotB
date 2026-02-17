@@ -261,7 +261,7 @@ async function cleanupAllSessions() {
     await Promise.all(promises);
 }
 
-async function stopSession(uid, interaction = null) {
+async function stopSession(uid) {
     if (!uid) return false;
     
     const session = sessions.get(uid);
@@ -275,15 +275,6 @@ async function stopSession(uid, interaction = null) {
     }
 
     await cleanupSession(uid);
-    
-    if (interaction) {
-        await interaction.update({
-            content: "⏹ **Stopped**",
-            embeds: [],
-            components: []
-        }).catch(() => {});
-    }
-    
     return true;
 }
 
@@ -444,19 +435,6 @@ async function logToDiscord(message) {
     } catch (e) {}
 }
 
-async function safeReply(interaction, content) {
-    if (!interaction) return;
-    try {
-        const payload = typeof content === 'string' ? { content } : content;
-        
-        if (interaction.replied || interaction.deferred) {
-            await interaction.editReply(payload).catch(() => {});
-        } else {
-            await interaction.reply(payload).catch(() => {});
-        }
-    } catch (e) {}
-}
-
 function panelRow(isJava = false) {
     const title = isJava ? "Java AFKBot Panel 🎛️" : "Bedrock AFKBot Panel 🎛️";
     const startCustomId = isJava ? "start_java" : "start_bedrock";
@@ -536,12 +514,12 @@ async function linkMicrosoft(uid, interaction) {
     if (!uid || !interaction) return;
     
     if (pendingLink.has(uid)) {
-        return interaction.reply({ content: "⏳ Login already in progress.", ephemeral: true });
+        return interaction.reply({ content: "⏳ Login already in progress.", ephemeral: true }).catch(() => {});
     }
     
     const authDir = getUserAuthDir(uid);
     if (!authDir) {
-        return interaction.reply({ content: "❌ System error.", ephemeral: true });
+        return interaction.reply({ content: "❌ System error.", ephemeral: true }).catch(() => {});
     }
 
     await interaction.deferReply({ ephemeral: true });
@@ -587,7 +565,7 @@ async function linkMicrosoft(uid, interaction) {
             getUser(uid).linked = true;
             userStore.save();
             await interaction.editReply({ 
-                content: "✅ Account linked successfully!", 
+                content: "✅ Account linked!", 
                 components: [] 
             }).catch(() => {});
         }).catch(async (e) => {
@@ -607,7 +585,7 @@ async function linkMicrosoft(uid, interaction) {
         pendingLink.delete(uid);
         console.error("[AUTH] Flow creation error:", e);
         await interaction.editReply({ 
-            content: "❌ Authentication system error.",
+            content: "❌ Authentication error.",
             components: []
         }).catch(() => {});
     }
@@ -622,7 +600,7 @@ async function startSession(uid, interaction, isReconnect = false, reconnectAtte
     if (!u.server?.ip) {
         if (!isReconnect && interaction) {
             await interaction.editReply({ 
-                content: "⚠️ Configure server settings first with **Settings** button.",
+                content: "⚠️ Configure server settings first.",
                 components: [] 
             }).catch(() => {});
         }
@@ -644,7 +622,7 @@ async function startSession(uid, interaction, isReconnect = false, reconnectAtte
     if (sessions.has(uid) && !isReconnect) {
         if (interaction) {
             await interaction.editReply({ 
-                content: "⚠️ Active session exists. Use **Stop** first.",
+                content: "⚠️ Active session exists. Use Stop first.",
                 components: [] 
             }).catch(() => {});
         }
@@ -687,7 +665,7 @@ async function startSession(uid, interaction, isReconnect = false, reconnectAtte
     if (!authDir) {
         if (!isReconnect && interaction) {
             await interaction.editReply({ 
-                content: "❌ Auth directory error.",
+                content: "❌ Auth error.",
                 components: []
             }).catch(() => {});
         }
@@ -918,7 +896,7 @@ async function startSession(uid, interaction, isReconnect = false, reconnectAtte
         
         if (!isReconnect && session.interaction) {
             session.interaction.editReply({ 
-                content: `❌ **Error:** ${e?.message || 'Connection failed'}\n🔄 Reconnecting automatically...`,
+                content: `❌ **Error:** ${e?.message || 'Connection failed'}\n🔄 Reconnecting...`,
                 components: [] 
             }).catch(() => {});
         }
@@ -993,25 +971,16 @@ client.once("ready", async () => {
 
 client.on(Events.InteractionCreate, async (i) => {
     if (!i?.user?.id || isShuttingDown) return;
-    
     const uid = i.user.id;
-    
-    if (i.isButton() || i.isChatInputCommand()) {
-        const last = i.user.lastInteraction || 0;
-        if (Date.now() - last < 1000) {
-            return i.reply({ ephemeral: true, content: "⏳ Please wait..." }).catch(() => {});
-        }
-        i.user.lastInteraction = Date.now();
-    }
 
     try {
+        // PANEL COMMAND - creates visible panel (NOT ephemeral)
         if (i.isChatInputCommand()) {
             if (i.commandName === "panel") {
                 const panel = panelRow(false);
                 return i.reply({ 
                     content: panel.content, 
-                    components: panel.components,
-                    ephemeral: true 
+                    components: panel.components
                 }).catch(() => {});
             }
             if (i.commandName === "admin") {
@@ -1042,6 +1011,7 @@ client.on(Events.InteractionCreate, async (i) => {
         }
 
         if (i.isButton()) {
+            // ADMIN BUTTONS (update ephemeral admin panel)
             if (i.customId === "admin_refresh") {
                 return i.update({ 
                     embeds: [getAdminStatsEmbed()], 
@@ -1072,31 +1042,32 @@ client.on(Events.InteractionCreate, async (i) => {
                 }).catch(() => {});
             }
 
+            // USER BUTTONS - ALL create NEW ephemeral messages, NEVER update panel
             if (i.customId === "start_bedrock" || i.customId === "start_java") {
                 if (sessions.has(uid)) {
-                    return i.reply({ ephemeral: true, content: "⚠️ Already running" }).catch(() => {});
+                    return i.reply({ ephemeral: true, content: "⚠️ Already running!" }).catch(() => {});
                 }
                 
                 const isJava = i.customId === "start_java";
                 const embed = new EmbedBuilder()
                     .setTitle(isJava ? "Java Connection" : "Bedrock Connection")
-                    .setDescription(isJava ? "Requires GeyserMC + Floodgate" : "Ready to connect?")
+                    .setDescription("Ready to connect?")
                     .setColor(isJava ? "#E67E22" : "#2ECC71");
                     
                 const row = new ActionRowBuilder().addComponents(
-                    new ButtonBuilder()
-                        .setCustomId("confirm_start")
-                        .setLabel("▶ Confirm Start")
-                        .setStyle(ButtonStyle.Success),
-                    new ButtonBuilder()
-                        .setCustomId("cancel")
-                        .setLabel("✖ Cancel")
-                        .setStyle(ButtonStyle.Secondary)
+                    new ButtonBuilder().setCustomId("confirm_start").setLabel("▶ Confirm").setStyle(ButtonStyle.Success),
+                    new ButtonBuilder().setCustomId("cancel").setLabel("✖ Cancel").setStyle(ButtonStyle.Secondary)
                 );
                 
-                return i.update({ embeds: [embed], components: [row] }).catch(() => {});
+                // NEW ephemeral message - panel stays untouched
+                return i.reply({ 
+                    embeds: [embed], 
+                    components: [row], 
+                    ephemeral: true 
+                }).catch(() => {});
             }
 
+            // CONFIRM START - update the ephemeral message (not panel)
             if (i.customId === "confirm_start") {
                 await i.update({ 
                     content: "⏳ **Connecting...**",
@@ -1107,6 +1078,7 @@ client.on(Events.InteractionCreate, async (i) => {
                 return startSession(uid, i, false);
             }
 
+            // CANCEL - update the ephemeral message (not panel)
             if (i.customId === "cancel") {
                 return i.update({ 
                     content: "❌ Cancelled", 
@@ -1115,30 +1087,30 @@ client.on(Events.InteractionCreate, async (i) => {
                 }).catch(() => {});
             }
 
+            // STOP - NEW ephemeral message
             if (i.customId === "stop") {
-                const ok = await stopSession(uid, i);
-                if (!ok) {
-                    return i.update({ 
-                        content: "No active session",
-                        embeds: [],
-                        components: []
-                    }).catch(() => {});
-                }
-                return;
+                const ok = await stopSession(uid);
+                return i.reply({ 
+                    ephemeral: true, 
+                    content: ok ? "⏹ **Stopped**" : "No active session" 
+                }).catch(() => {});
             }
 
+            // LINK - NEW ephemeral message
             if (i.customId === "link") {
                 return linkMicrosoft(uid, i);
             }
 
+            // UNLINK - NEW ephemeral message
             if (i.customId === "unlink") {
                 await unlinkMicrosoft(uid);
                 return i.reply({ 
-                    content: "🗑 Unlinked Microsoft account", 
-                    ephemeral: true 
+                    ephemeral: true, 
+                    content: "🗑 Unlinked" 
                 }).catch(() => {});
             }
 
+            // SETTINGS - Modal (ephemeral by nature)
             if (i.customId === "settings") {
                 const u = getUser(uid);
                 const modal = new ModalBuilder()
@@ -1167,23 +1139,18 @@ client.on(Events.InteractionCreate, async (i) => {
             }
         }
 
+        // MODAL SUBMIT - reply ephemeral
         if (i.isModalSubmit() && i.customId === "settings_modal") {
             const ip = i.fields.getTextInputValue("ip")?.trim();
             const port = parseInt(i.fields.getTextInputValue("port"));
             
             if (!ip || !port || !isValidPort(port)) {
-                return i.reply({ 
-                    content: "❌ Invalid input", 
-                    ephemeral: true 
-                }).catch(() => {});
+                return i.reply({ ephemeral: true, content: "❌ Invalid input" }).catch(() => {});
             }
             
             getUser(uid).server = { ip, port };
             userStore.save();
-            return i.reply({ 
-                content: `✅ Saved: ${ip}:${port}`, 
-                ephemeral: true 
-            }).catch(() => {});
+            return i.reply({ ephemeral: true, content: `✅ Saved: ${ip}:${port}` }).catch(() => {});
         }
 
     } catch (e) {
