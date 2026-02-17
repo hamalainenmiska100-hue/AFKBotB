@@ -633,15 +633,16 @@ async function startSession(uid, interaction, isReconnect = false, reconnectAtte
         await cleanupSession(uid);
     }
 
+    // FIXED: Ping is now non-fatal. Many servers (Aternos, etc.) block ping but accept connections
     try {
         if (!isReconnect && interaction) {
             await interaction.editReply({ 
-                content: `🔍 **Pinging** \`${ip}:${port}\`...`,
+                content: `🔍 **Checking** \`${ip}:${port}\`...`,
                 components: [] 
             }).catch(() => {});
         }
         
-        await bedrock.ping({ host: ip, port: parseInt(port), timeout: 5000 });
+        await bedrock.ping({ host: ip, port: parseInt(port), timeout: 10000 });
         
         if (!isReconnect && interaction) {
             await interaction.editReply({ 
@@ -650,15 +651,15 @@ async function startSession(uid, interaction, isReconnect = false, reconnectAtte
             }).catch(() => {});
         }
     } catch (err) {
-        if (isReconnect) {
-            scheduleReconnect(uid, reconnectAttempt);
-        } else if (interaction) {
+        // Ping failed but server might still be online (firewall/query disabled)
+        console.log(`[PING] Ping failed for ${ip}:${port}, attempting direct connection anyway...`);
+        if (!isReconnect && interaction) {
             await interaction.editReply({ 
-                content: `❌ **Server offline:** \`${ip}:${port}\``,
+                content: `🟡 **Connecting** \`${ip}:${port}\`... (ping failed, trying anyway)`,
                 components: [] 
             }).catch(() => {});
         }
-        return;
+        // Continue to connection attempt instead of returning
     }
 
     const authDir = getUserAuthDir(uid);
@@ -892,11 +893,19 @@ async function startSession(uid, interaction, isReconnect = false, reconnectAtte
 
     mc.on("error", (e) => {
         console.error(`[SESSION] ${uid} error:`, e.message);
+        
+        // Better error messages for user
+        let errorMsg = "Connection failed";
+        if (e.code === 'ECONNREFUSED') errorMsg = "Connection refused (server offline)";
+        else if (e.code === 'ETIMEDOUT' || e.code === 'ECONNRESET') errorMsg = "Connection timeout (check IP/port)";
+        else if (e.message?.includes('handshake')) errorMsg = "Handshake failed (version mismatch?)";
+        else if (e.message?.includes('authentication')) errorMsg = "Auth failed (re-link Microsoft)";
+        
         if (!session.manualStop) scheduleReconnect(uid, reconnectAttempt);
         
         if (!isReconnect && session.interaction) {
             session.interaction.editReply({ 
-                content: `❌ **Error:** ${e?.message || 'Connection failed'}\n🔄 Reconnecting...`,
+                content: `❌ **${errorMsg}:** \`${ip}:${port}\`\n🔄 Reconnecting...`,
                 components: [] 
             }).catch(() => {});
         }
