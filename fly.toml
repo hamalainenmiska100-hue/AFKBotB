@@ -1,9 +1,6 @@
 app = "afkbot"
 primary_region = "arn"
 
-[build]
-  builder = "heroku/buildpacks:20"
-
 [processes]
   app = "node --optimize-for-size --max-old-space-size=512 index.js"
 
