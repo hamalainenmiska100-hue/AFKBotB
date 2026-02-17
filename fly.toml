@@ -2,7 +2,7 @@ app = "afkbot"
 primary_region = "arn"
 
 [processes]
-  app = "node --optimize-for-size --max-old-space-size=512 index.js"
+  app = "node --optimize-for-size --max-old-space-size=512 bot.js"
 
 [[vm]]
   size = "shared-cpu-1x"
