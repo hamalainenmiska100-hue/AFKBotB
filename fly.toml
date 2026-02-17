@@ -12,3 +12,8 @@ primary_region = "arn"
 
 [swap]
   size_mb = 512
+
+# Add this section to mount the existing volume
+[[mounts]]
+  source = "bot_data"
+  destination = "/app/data"
