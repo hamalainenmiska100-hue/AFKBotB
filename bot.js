@@ -831,7 +831,7 @@ async function linkMicrosoft(uid, interaction) {
                     u.linked = true;
                     u.tokenAcquiredAt = Date.now();
                     await userStore.save();
-                    await interaction.followUp({ ephemeral: true, content: "✅ Microsoft account linked!" }).catch(() => {});
+                    await interaction.followUp({ ephemeral: true, content: "✅ Microsoft account linked! You can now start the bot." }).catch(() => {});
                 } catch (e) {}
             }).catch(async (e) => {
                 try {
@@ -873,6 +873,25 @@ async function startSession(uid, interaction, isReconnect = false, reconnectAtte
         if (!u) {
             if (!isReconnect) safeReply(interaction, "❌ User data error.");
             return;
+        }
+
+        // Check authentication status (skip for offline mode)
+        if (u.connectionType !== "offline") {
+            const tokenAge = Date.now() - (u.tokenAcquiredAt || 0);
+            const isTokenExpired = !u.linked || !u.tokenAcquiredAt || (tokenAge > CONFIG.TOKEN_REFRESH_BUFFER_MS);
+            
+            if (isTokenExpired) {
+                if (!isReconnect && interaction) {
+                    // For initial start, trigger auth flow
+                    return linkMicrosoft(uid, interaction);
+                } else {
+                    // For reconnects without interaction context, just clean up and log
+                    logToDiscord(`⛔ Bot of <@${uid}> stopped: Microsoft authentication required or token expired.`);
+                    delete activeSessionsStore[uid];
+                    await sessionStore.save();
+                    return;
+                }
+            }
         }
 
         if (!activeSessionsStore) activeSessionsStore = {};
