@@ -474,7 +474,7 @@ async function stopSession(uid) {
 function handleAutoReconnect(uid, attempt = 1) {
     if (!uid || isShuttingDown) return;
     const s = sessions.get(uid);
-    if (!s || s.manualStop) return;
+    if (!s || s.manualStop || s.isReconnecting) return;
 
     if (attempt > CONFIG.MAX_RECONNECT_ATTEMPTS) {
         console.log(`🚫 Max reconnection attempts reached for ${uid}`);
@@ -520,7 +520,7 @@ function startHealthMonitoring(uid) {
             s.lastKeepalive = Date.now();
         } catch (e) {
             console.log(`Keepalive failed for ${uid}, triggering reconnect`);
-            handleAutoReconnect(uid, s.reconnectAttempt + 1);
+            if (!s.isReconnecting) handleAutoReconnect(uid, s.reconnectAttempt + 1);
         }
     }, CONFIG.KEEPALIVE_INTERVAL_MS);
 
@@ -531,7 +531,7 @@ function startHealthMonitoring(uid) {
             console.log(`Stale connection detected for ${uid}`);
             logToDiscord(`⚠️ Stale connection for <@${uid}>, forcing reconnect...`);
             s.client?.close();
-            handleAutoReconnect(uid, s.reconnectAttempt + 1);
+            if (!s.isReconnecting) handleAutoReconnect(uid, s.reconnectAttempt + 1);
         }
     }, CONFIG.STALE_CONNECTION_TIMEOUT_MS);
 }
@@ -942,7 +942,7 @@ async function startSession(uid, interaction, isReconnect = false, reconnectAtte
         if (!s || !s.connected) return;
 
         try {
-            if (s.entityId) {
+            if (s.entityId && s.client) {
                 // Random action: 0 = nothing, 1 = swing, 2 = crouch start, 3 = crouch stop
                 const action = Math.random();
                 
@@ -964,14 +964,17 @@ async function startSession(uid, interaction, isReconnect = false, reconnectAtte
                     
                     // Stop crouching after 2-4 seconds
                     setTimeout(() => {
-                        if (sessions.has(uid) && sessions.get(uid).connected) {
-                            s.client.write('player_action', {
-                                runtime_entity_id: s.entityId,
-                                action: 12, // stop_sneaking
-                                position: { x: 0, y: 0, z: 0 },
-                                result_code: 0,
-                                face: 0
-                            });
+                        const currentS = sessions.get(uid);
+                        if (currentS?.connected && currentS?.client && currentS?.entityId) {
+                            try {
+                                currentS.client.write('player_action', {
+                                    runtime_entity_id: currentS.entityId,
+                                    action: 12, // stop_sneaking
+                                    position: { x: 0, y: 0, z: 0 },
+                                    result_code: 0,
+                                    face: 0
+                                });
+                            } catch (e) {}
                         }
                     }, Math.random() * 2000 + 2000);
                 }
@@ -1018,13 +1021,17 @@ async function startSession(uid, interaction, isReconnect = false, reconnectAtte
 
     mc.on("error", (e) => {
         console.error(`Session error for ${uid}:`, e);
-        if (!currentSession.manualStop) handleAutoReconnect(uid, reconnectAttempt);
+        if (!currentSession.manualStop && !currentSession.isReconnecting) {
+            handleAutoReconnect(uid, currentSession.reconnectAttempt);
+        }
         logToDiscord(`❌ Bot of <@${uid}> error: \`${e?.message || 'Unknown error'}\``);
     });
 
     mc.on("close", () => {
         console.log(`Connection closed for ${uid}`);
-        if (!currentSession.manualStop) handleAutoReconnect(uid, reconnectAttempt);
+        if (!currentSession.manualStop && !currentSession.isReconnecting) {
+            handleAutoReconnect(uid, currentSession.reconnectAttempt);
+        }
         else logToDiscord(`🔌 Bot of <@${uid}> disconnected manually.`);
     });
     
