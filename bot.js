@@ -40,6 +40,7 @@ const CONFIG = {
     MAX_MEMORY_MB: 2048,
     SESSION_HEARTBEAT_INTERVAL_MS: 30000,
     TOKEN_REFRESH_BUFFER_MS: 300000,
+    NATIVE_CLEANUP_DELAY_MS: 2000, // Delay to prevent native memory corruption
 };
 
 // ==================== STORAGE SYSTEM ====================
@@ -424,6 +425,10 @@ async function cleanupSession(uid) {
 
     console.log(`🧹 Cleaning up session ${uid}`);
     
+    // Prevent concurrent cleanup
+    if (s.isCleaningUp) return;
+    s.isCleaningUp = true;
+    
     try {
         const timers = ['reconnectTimer', 'afkTimeout', 
                        'keepaliveTimer', 'staleCheckTimer', 'tokenRefreshTimer'];
@@ -442,6 +447,10 @@ async function cleanupSession(uid) {
             } catch (e) {}
             s.client = null;
         }
+        
+        // CRITICAL: Wait for native resources to cleanup to prevent "free(): invalid pointer"
+        await new Promise(resolve => setTimeout(resolve, CONFIG.NATIVE_CLEANUP_DELAY_MS));
+        
     } catch (e) {
         console.error(`Error in cleanupSession for ${uid}:`, e);
     }
@@ -474,7 +483,7 @@ async function stopSession(uid) {
 function handleAutoReconnect(uid, attempt = 1) {
     if (!uid || isShuttingDown) return;
     const s = sessions.get(uid);
-    if (!s || s.manualStop || s.isReconnecting) return;
+    if (!s || s.manualStop || s.isReconnecting || s.isCleaningUp) return;
 
     if (attempt > CONFIG.MAX_RECONNECT_ATTEMPTS) {
         console.log(`🚫 Max reconnection attempts reached for ${uid}`);
@@ -490,12 +499,14 @@ function handleAutoReconnect(uid, attempt = 1) {
     s.isReconnecting = true;
     s.reconnectAttempt = attempt;
     
+    // Add extra delay for native cleanup on first reconnect attempt
     const baseDelay = Math.min(
         CONFIG.RECONNECT_BASE_DELAY_MS * Math.pow(1.5, attempt - 1),
         CONFIG.RECONNECT_MAX_DELAY_MS
     );
     const jitter = Math.random() * 5000;
-    const delay = baseDelay + jitter;
+    const nativeDelay = attempt === 1 ? CONFIG.NATIVE_CLEANUP_DELAY_MS : 0;
+    const delay = baseDelay + jitter + nativeDelay;
     
     logToDiscord(`⏳ Bot of <@${uid}> disconnected. Reconnecting in ${Math.round(delay/1000)}s (Attempt ${attempt})...`);
 
@@ -520,7 +531,7 @@ function startHealthMonitoring(uid) {
             s.lastKeepalive = Date.now();
         } catch (e) {
             console.log(`Keepalive failed for ${uid}, triggering reconnect`);
-            if (!s.isReconnecting) handleAutoReconnect(uid, s.reconnectAttempt + 1);
+            if (!s.isReconnecting && !s.isCleaningUp) handleAutoReconnect(uid, s.reconnectAttempt + 1);
         }
     }, CONFIG.KEEPALIVE_INTERVAL_MS);
 
@@ -530,8 +541,10 @@ function startHealthMonitoring(uid) {
         if (Date.now() - lastActivity > CONFIG.STALE_CONNECTION_TIMEOUT_MS) {
             console.log(`Stale connection detected for ${uid}`);
             logToDiscord(`⚠️ Stale connection for <@${uid}>, forcing reconnect...`);
-            s.client?.close();
-            if (!s.isReconnecting) handleAutoReconnect(uid, s.reconnectAttempt + 1);
+            try {
+                s.client?.close();
+            } catch (e) {}
+            if (!s.isReconnecting && !s.isCleaningUp) handleAutoReconnect(uid, s.reconnectAttempt + 1);
         }
     }, CONFIG.STALE_CONNECTION_TIMEOUT_MS);
 }
@@ -807,6 +820,13 @@ async function linkMicrosoft(uid, interaction) {
 async function startSession(uid, interaction, isReconnect = false, reconnectAttempt = 1) {
     if (!uid || isShuttingDown) return;
     
+    // Prevent starting if cleanup is in progress for this user
+    const existingSession = sessions.get(uid);
+    if (existingSession?.isCleaningUp) {
+        console.log(`⏳ Waiting for cleanup to finish for ${uid}...`);
+        await new Promise(resolve => setTimeout(resolve, CONFIG.NATIVE_CLEANUP_DELAY_MS + 500));
+    }
+    
     const u = getUser(uid);
     if (!u) {
         if (!isReconnect) safeReply(interaction, "❌ User data error.");
@@ -849,6 +869,8 @@ async function startSession(uid, interaction, isReconnect = false, reconnectAtte
 
     if (isReconnect && sessions.has(uid)) {
         await cleanupSession(uid);
+        // Extra delay after cleanup before reconnect to prevent native memory corruption
+        await new Promise(resolve => setTimeout(resolve, CONFIG.NATIVE_CLEANUP_DELAY_MS));
     }
 
     const connectionEmbed = new EmbedBuilder()
@@ -923,6 +945,7 @@ async function startSession(uid, interaction, isReconnect = false, reconnectAtte
         manualStop: false,
         connected: false,
         isReconnecting: false,
+        isCleaningUp: false,
         reconnectAttempt: reconnectAttempt,
         entityId: null,
         reconnectTimer: null,
@@ -939,7 +962,7 @@ async function startSession(uid, interaction, isReconnect = false, reconnectAtte
     const performAntiAfk = () => {
         if (!sessions.has(uid) || isShuttingDown) return;
         const s = sessions.get(uid);
-        if (!s || !s.connected) return;
+        if (!s || !s.connected || s.isCleaningUp) return;
 
         try {
             if (s.entityId && s.client) {
@@ -965,7 +988,7 @@ async function startSession(uid, interaction, isReconnect = false, reconnectAtte
                     // Stop crouching after 2-4 seconds
                     setTimeout(() => {
                         const currentS = sessions.get(uid);
-                        if (currentS?.connected && currentS?.client && currentS?.entityId) {
+                        if (currentS?.connected && currentS?.client && currentS?.entityId && !currentS.isCleaningUp) {
                             try {
                                 currentS.client.write('player_action', {
                                     runtime_entity_id: currentS.entityId,
@@ -1021,7 +1044,7 @@ async function startSession(uid, interaction, isReconnect = false, reconnectAtte
 
     mc.on("error", (e) => {
         console.error(`Session error for ${uid}:`, e);
-        if (!currentSession.manualStop && !currentSession.isReconnecting) {
+        if (!currentSession.manualStop && !currentSession.isReconnecting && !currentSession.isCleaningUp) {
             handleAutoReconnect(uid, currentSession.reconnectAttempt);
         }
         logToDiscord(`❌ Bot of <@${uid}> error: \`${e?.message || 'Unknown error'}\``);
@@ -1029,7 +1052,7 @@ async function startSession(uid, interaction, isReconnect = false, reconnectAtte
 
     mc.on("close", () => {
         console.log(`Connection closed for ${uid}`);
-        if (!currentSession.manualStop && !currentSession.isReconnecting) {
+        if (!currentSession.manualStop && !currentSession.isReconnecting && !currentSession.isCleaningUp) {
             handleAutoReconnect(uid, currentSession.reconnectAttempt);
         }
         else logToDiscord(`🔌 Bot of <@${uid}> disconnected manually.`);
@@ -1095,7 +1118,7 @@ client.once("ready", async () => {
                         startSession(uid, null, true);
                     }
                 }, delay);
-                delay += 3000;
+                delay += 5000; // Increased delay between restarts to prevent native crashes
             }
         }
     } else {
