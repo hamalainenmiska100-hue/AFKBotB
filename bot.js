@@ -1377,10 +1377,12 @@ client.on(Events.InteractionCreate, async (i) => {
 
         if (i.isStringSelectMenu()) {
             if (i.customId === "admin_force_stop_select") {
+                // Defer update for thinking state
+                await i.deferUpdate().catch(() => {});
                 const targetUid = i.values?.[0];
                 if (targetUid && typeof targetUid === 'string') {
                     await stopSession(targetUid);
-                    return i.update({ 
+                    return i.editReply({ 
                         content: `🛑 Forced stop for <@${targetUid}>`, 
                         embeds: [getAdminStatsEmbed()], 
                         components: adminPanelComponents() 
@@ -1391,7 +1393,9 @@ client.on(Events.InteractionCreate, async (i) => {
 
         if (i.isButton()) {
             if (i.customId === "admin_refresh") {
-                return i.update({ 
+                // Defer update for thinking state
+                await i.deferUpdate().catch(() => {});
+                return i.editReply({ 
                     embeds: [getAdminStatsEmbed()], 
                     components: adminPanelComponents() 
                 }).catch(() => {});
@@ -1399,10 +1403,12 @@ client.on(Events.InteractionCreate, async (i) => {
 
             if (i.customId === "admin_stop_all") {
                 if (uid !== CONFIG.ADMIN_ID) return;
+                // Defer update for thinking state
+                await i.deferUpdate().catch(() => {});
                 const stopPromises = [];
                 sessions.forEach((_, sUid) => stopPromises.push(stopSession(sUid)));
                 await Promise.all(stopPromises);
-                return i.update({ 
+                return i.editReply({ 
                     content: "🛑 All sessions stopped.", 
                     embeds: [getAdminStatsEmbed()], 
                     components: adminPanelComponents() 
@@ -1411,9 +1417,11 @@ client.on(Events.InteractionCreate, async (i) => {
 
             if (i.customId === "admin_save_data") {
                 if (uid !== CONFIG.ADMIN_ID) return;
+                // Defer update for thinking state
+                await i.deferUpdate().catch(() => {});
                 await userStore.save(true);
                 await sessionStore.save(true);
-                return i.update({ 
+                return i.editReply({ 
                     content: "💾 Data saved to disk.", 
                     embeds: [getAdminStatsEmbed()], 
                     components: adminPanelComponents() 
@@ -1424,6 +1432,8 @@ client.on(Events.InteractionCreate, async (i) => {
                 if (sessions.has(uid)) {
                     return safeReply(i, { ephemeral: true, content: "⚠️ **Session Conflict**: Active session exists." });
                 }
+                // Defer reply for thinking state
+                await i.deferReply({ ephemeral: true }).catch(() => {});
                 const embed = new EmbedBuilder()
                     .setTitle("Bedrock Connection")
                     .setDescription("Start bot?")
@@ -1432,13 +1442,15 @@ client.on(Events.InteractionCreate, async (i) => {
                     new ButtonBuilder().setCustomId("confirm_start").setLabel("Start").setStyle(ButtonStyle.Success),
                     new ButtonBuilder().setCustomId("cancel").setLabel("Cancel").setStyle(ButtonStyle.Secondary)
                 );
-                return i.reply({ embeds: [embed], components: [row], ephemeral: true }).catch(() => {});
+                return i.editReply({ embeds: [embed], components: [row] }).catch(() => {});
             }
 
             if (i.customId === "start_java") {
                 if (sessions.has(uid)) {
                     return safeReply(i, { ephemeral: true, content: "⚠️ **Session Conflict**: Active session exists." });
                 }
+                // Defer reply for thinking state
+                await i.deferReply({ ephemeral: true }).catch(() => {});
                 const embed = new EmbedBuilder()
                     .setTitle("⚙️ Java Compatibility Check")
                     .setDescription("For a successful connection to a Java server, ensure the following plugins are installed.")
@@ -1448,7 +1460,7 @@ client.on(Events.InteractionCreate, async (i) => {
                     new ButtonBuilder().setCustomId("confirm_start").setLabel("Confirm & Start").setStyle(ButtonStyle.Success),
                     new ButtonBuilder().setCustomId("cancel").setLabel("Cancel").setStyle(ButtonStyle.Secondary)
                 );
-                return i.reply({ embeds: [embed], components: [row], ephemeral: true }).catch(() => {});
+                return i.editReply({ embeds: [embed], components: [row] }).catch(() => {});
             }
 
             if (i.customId === "confirm_start") {
@@ -1457,10 +1469,14 @@ client.on(Events.InteractionCreate, async (i) => {
             }
 
             if (i.customId === "cancel") {
-                return i.update({ content: "❌ Cancelled.", embeds: [], components: [] }).catch(() => {});
+                // Defer update for thinking state
+                await i.deferUpdate().catch(() => {});
+                return i.editReply({ content: "❌ Cancelled.", embeds: [], components: [] }).catch(() => {});
             }
 
             if (i.customId === "stop") {
+                // Defer reply for thinking state
+                await i.deferReply({ ephemeral: true }).catch(() => {});
                 const ok = await stopSession(uid);
                 return safeReply(i, { ephemeral: true, content: ok ? "⏹ **Session Terminated.**" : "No active sessions." });
             }
@@ -1471,6 +1487,8 @@ client.on(Events.InteractionCreate, async (i) => {
             }
 
             if (i.customId === "unlink") {
+                // Defer reply for thinking state
+                await i.deferReply({ ephemeral: true }).catch(() => {});
                 await unlinkMicrosoft(uid);
                 return safeReply(i, { ephemeral: true, content: "🗑 Unlinked Microsoft account." });
             }
