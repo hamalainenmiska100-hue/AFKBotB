@@ -18,16 +18,6 @@ const { Authflow, Titles } = require("prismarine-auth");
 const fs = require("fs");
 const path = require("path");
 
-// --- Optional Dependencies ---
-let Vec3, PrismarineChunk, PrismarineRegistry;
-try {
-    Vec3 = require("vec3");
-    PrismarineChunk = require("prismarine-chunk");
-    PrismarineRegistry = require("prismarine-registry");
-} catch (e) {
-    console.log("⚠️ Advanced features disabled - missing optional dependencies");
-}
-
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
 if (!DISCORD_TOKEN) {
     console.error("❌ DISCORD_TOKEN missing");
@@ -46,7 +36,6 @@ const CONFIG = {
     CONNECTION_TIMEOUT_MS: 30000,
     KEEPALIVE_INTERVAL_MS: 15000,
     STALE_CONNECTION_TIMEOUT_MS: 60000,
-    CHUNK_CACHE_MAX_SIZE: 50,
     MEMORY_CHECK_INTERVAL_MS: 60000,
     MAX_MEMORY_MB: 2048,
     SESSION_HEARTBEAT_INTERVAL_MS: 30000,
@@ -436,7 +425,7 @@ async function cleanupSession(uid) {
     console.log(`🧹 Cleaning up session ${uid}`);
     
     try {
-        const timers = ['reconnectTimer', 'physicsLoop', 'afkTimeout', 'chunkGCLoop', 
+        const timers = ['reconnectTimer', 'afkTimeout', 
                        'keepaliveTimer', 'staleCheckTimer', 'tokenRefreshTimer'];
         timers.forEach(timer => {
             if (s[timer]) {
@@ -452,10 +441,6 @@ async function cleanupSession(uid) {
                 s.client.close();
             } catch (e) {}
             s.client = null;
-        }
-        
-        if (s.chunks) {
-            s.chunks.clear();
         }
     } catch (e) {
         console.error(`Error in cleanupSession for ${uid}:`, e);
@@ -627,6 +612,7 @@ async function logToDiscord(message) {
     try {
         const channel = await client.channels.fetch(CONFIG.LOG_CHANNEL_ID).catch(() => null);
         if (!channel) return;
+        
         
         const embed = new EmbedBuilder()
             .setColor("#5865F2")
@@ -870,8 +856,6 @@ async function startSession(uid, interaction, isReconnect = false, reconnectAtte
         .setTitle("Bot Initialization")
         .setThumbnail("https://files.catbox.moe/9mqpoz.gif");
 
-    // ==================== FIXED MOTD/PING LOGIC ====================
-    // Ping is now non-blocking. Many servers (Aternos, etc.) block ping but accept connections.
     let pingSuccess = false;
     try {
         if (!isReconnect && interaction) {
@@ -891,15 +875,12 @@ async function startSession(uid, interaction, isReconnect = false, reconnectAtte
             await safeReply(interaction, { embeds: [connectionEmbed] });
         }
     } catch (err) {
-        // Ping failed but server might still accept connections (query disabled/firewall)
         console.log(`[PING] Ping failed for ${ip}:${port}, attempting direct connection anyway...`);
         if (!isReconnect && interaction) {
             connectionEmbed.setDescription(`⚠️ **Ping blocked (firewall?), attempting direct connection...**\n🌐 **Target:** \`${ip}:${port}\``);
             await safeReply(interaction, { embeds: [connectionEmbed] });
         }
-        // DO NOT RETURN - continue to connection attempt
     }
-    // ==================== END FIX ====================
 
     const authDir = getUserAuthDir(uid);
     if (!authDir) {
@@ -943,235 +924,65 @@ async function startSession(uid, interaction, isReconnect = false, reconnectAtte
         connected: false,
         isReconnecting: false,
         reconnectAttempt: reconnectAttempt,
-        position: null,
-        velocity: Vec3 ? new Vec3(0, 0, 0) : null,
-        yaw: 0,
-        pitch: 0,
-        onGround: false,
-        isWalking: false,
-        targetPosition: null,
-        isTryingToSleep: false,
-        chunks: new Map(),
-        registry: null,
-        Chunk: null,
+        entityId: null,
         reconnectTimer: null,
-        physicsLoop: null,
         afkTimeout: null,
-        chunkGCLoop: null,
         keepaliveTimer: null,
         staleCheckTimer: null,
-        entityId: null,
         lastPacketTime: Date.now(),
         lastKeepalive: Date.now(),
         packetsReceived: 0
     };
     sessions.set(uid, currentSession);
 
-    // ==================== CHUNK & PHYSICS SYSTEM ====================
-    if (Vec3 && PrismarineChunk && currentSession.velocity) {
-        try {
-            currentSession.registry = PrismarineRegistry('bedrock_1.20.0');
-            currentSession.Chunk = PrismarineChunk(currentSession.registry);
-        } catch (e) {
-            logToDiscord(`Could not initialize chunk manager for <@${uid}>.`);
-        }
-
-        mc.on('level_chunk', (packet) => {
-            if (!currentSession?.Chunk || !packet) return;
-            try {
-                const chunk = new currentSession.Chunk();
-                if (packet.payload) chunk.load(packet.payload);
-                if (packet.x !== undefined && packet.z !== undefined) {
-                    currentSession.chunks.set(`${packet.x},${packet.z}`, chunk);
-                    
-                    if (currentSession.chunks.size > CONFIG.CHUNK_CACHE_MAX_SIZE) {
-                        const firstKey = currentSession.chunks.keys().next().value;
-                        currentSession.chunks.delete(firstKey);
-                    }
-                }
-            } catch (e) {}
-        });
-
-        currentSession.chunkGCLoop = setInterval(() => {
-            try {
-                if (currentSession.chunks && currentSession.chunks.size > 20) {
-                    if (currentSession.position) {
-                        const px = Math.floor(currentSession.position.x / 16);
-                        const pz = Math.floor(currentSession.position.z / 16);
-                        const toDelete = [];
-                        for (const key of currentSession.chunks.keys()) {
-                            const [cx, cz] = key.split(',').map(Number);
-                            const dist = Math.abs(cx - px) + Math.abs(cz - pz);
-                            if (dist > 3) toDelete.push(key);
-                        }
-                        toDelete.forEach(k => currentSession.chunks.delete(k));
-                    }
-                }
-            } catch (e) {}
-        }, 10000);
-    }
-
-    function safeWrite(packetName, params) {
-        try {
-            if (mc && mc.write && !mc.destroyed && currentSession?.connected) {
-                mc.write(packetName, params);
-                return true;
-            }
-        } catch (e) {
-            console.error(`Packet write error (${packetName}):`, e.message);
-        }
-        return false;
-    }
-
-    currentSession.physicsLoop = setInterval(() => {
-        try {
-            if (!currentSession?.connected || !currentSession.position || !currentSession.velocity) return;
-
-            const gravity = 0.08;
-            const moveVector = { x: 0, z: 0 };
-
-            if (currentSession.isWalking && currentSession.targetPosition) {
-                const distance = currentSession.position.distanceTo(currentSession.targetPosition);
-                if (distance > 0.5) {
-                    const direction = currentSession.targetPosition.minus(currentSession.position).normalize();
-                    moveVector.x = direction.x;
-                    moveVector.z = direction.z;
-                } else {
-                    currentSession.isWalking = false;
-                }
-            }
-
-            if (!currentSession.onGround) {
-                currentSession.velocity.y -= gravity;
-            }
-
-            if (currentSession.velocity.y < -3.92) currentSession.velocity.y = -3.92;
-
-            currentSession.position.add(currentSession.velocity);
-
-            if (currentSession.position.y < -64) {
-                currentSession.position.y = 320;
-                currentSession.velocity.y = 0;
-            }
-
-            safeWrite("player_auth_input", {
-                pitch: currentSession.pitch || 0, 
-                yaw: currentSession.yaw || 0,
-                position: { 
-                    x: currentSession.position.x, 
-                    y: currentSession.position.y, 
-                    z: currentSession.position.z 
-                },
-                move_vector: moveVector, 
-                head_yaw: currentSession.yaw || 0, 
-                input_data: 0n,
-                input_mode: "mouse", 
-                play_mode: "screen", 
-                interaction_model: "touch", 
-                tick: 0n
-            });
-        } catch (e) {}
-    }, 50);
-
+    // Anti-AFK with animations: hand swing and crouch
     const performAntiAfk = () => {
         if (!sessions.has(uid) || isShuttingDown) return;
         const s = sessions.get(uid);
-        if (!s) return;
-
-        if (!s.connected || !s.position) {
-            s.afkTimeout = setTimeout(performAntiAfk, 5000);
-            return;
-        }
+        if (!s || !s.connected) return;
 
         try {
-            if (Math.random() > 0.7) scanForBedAndSleep(uid);
-
-            const action = Math.random();
-            if (action > 0.5 && !s.isWalking) {
-                s.isWalking = true;
-                if (s.targetPosition && s.position) {
-                    s.targetPosition = s.position.offset(
-                        (Math.random() - 0.5) * 10,
-                        0,
-                        (Math.random() - 0.5) * 10
-                    );
-                }
-            } else {
-                s.yaw += (Math.random() - 0.5) * 20;
-                s.pitch += (Math.random() - 0.5) * 10;
-                if (s.onGround && Math.random() > 0.9 && s.velocity) {
-                    s.velocity.y = 0.42;
-                    s.onGround = false;
-                }
-            }
-
             if (s.entityId) {
-                safeWrite('animate', { action_id: 1, runtime_entity_id: s.entityId });
+                // Random action: 0 = nothing, 1 = swing, 2 = crouch start, 3 = crouch stop
+                const action = Math.random();
+                
+                if (action < 0.6) {
+                    // 60% chance: Swing arm (action_id: 1)
+                    s.client.write('animate', { 
+                        action_id: 1, 
+                        runtime_entity_id: s.entityId 
+                    });
+                } else if (action < 0.8) {
+                    // 20% chance: Start crouching (action_id: 11 for start_sneaking)
+                    s.client.write('player_action', {
+                        runtime_entity_id: s.entityId,
+                        action: 11, // start_sneaking
+                        position: { x: 0, y: 0, z: 0 },
+                        result_code: 0,
+                        face: 0
+                    });
+                    
+                    // Stop crouching after 2-4 seconds
+                    setTimeout(() => {
+                        if (sessions.has(uid) && sessions.get(uid).connected) {
+                            s.client.write('player_action', {
+                                runtime_entity_id: s.entityId,
+                                action: 12, // stop_sneaking
+                                position: { x: 0, y: 0, z: 0 },
+                                result_code: 0,
+                                face: 0
+                            });
+                        }
+                    }, Math.random() * 2000 + 2000);
+                }
+                // 20% chance: do nothing this cycle
             }
         } catch (e) {}
 
-        const nextDelay = Math.random() * 20000 + 10000;
+        // Next check in 8-20 seconds
+        const nextDelay = Math.random() * 12000 + 8000;
         s.afkTimeout = setTimeout(performAntiAfk, nextDelay);
     };
-
-    function scanForBedAndSleep(uid) {
-        const s = sessions.get(uid);
-        if (!s || !s.Chunk || !s.position || s.isTryingToSleep || !Vec3) return;
-
-        try {
-            const searchRadius = 3;
-            const playerPos = s.position.floored();
-
-            for (let x = -searchRadius; x <= searchRadius; x++) {
-                for (let y = -searchRadius; y <= searchRadius; y++) {
-                    for (let z = -searchRadius; z <= searchRadius; z++) {
-                        const checkPos = playerPos.offset(x, y, z);
-                        const chunkX = Math.floor(checkPos.x / 16);
-                        const chunkZ = Math.floor(checkPos.z / 16);
-                        const chunk = s.chunks.get(`${chunkX},${chunkZ}`);
-
-                        if (chunk && chunk.getBlock) {
-                            try {
-                                const block = chunk.getBlock(checkPos);
-                                if (block && block.name && block.name.includes('bed')) {
-                                    logToDiscord(`🛌 Bed found for <@${uid}>. Attempting to sleep.`);
-                                    s.isTryingToSleep = true;
-
-                                    safeWrite('inventory_transaction', {
-                                        transaction: {
-                                            transaction_type: 'item_use_on_block', 
-                                            action_type: 0,
-                                            block_position: checkPos, 
-                                            block_face: 1, 
-                                            hotbar_slot: 0,
-                                            item_in_hand: { network_id: 0 }, 
-                                            player_position: s.position,
-                                            click_position: { x: 0, y: 0, z: 0 }
-                                        }
-                                    });
-
-                                    safeWrite('player_action', {
-                                        runtime_entity_id: s.entityId || 0n,
-                                        action: 'start_sleeping',
-                                        position: checkPos,
-                                        result_code: 0,
-                                        face: 0
-                                    });
-                                    
-                                    setTimeout(() => {
-                                        if (sessions.has(uid)) {
-                                            sessions.get(uid).isTryingToSleep = false;
-                                        }
-                                    }, 10000);
-                                    return;
-                                }
-                            } catch (err) {}
-                        }
-                    }
-                }
-            }
-        } catch (e) {}
-    }
 
     mc.on("spawn", () => {
         logToDiscord(`✅ Bot of <@${uid}> spawned on **${ip}:${port}**` + (isReconnect ? ` (Attempt ${reconnectAttempt})` : ""));
@@ -1181,14 +992,6 @@ async function startSession(uid, interaction, isReconnect = false, reconnectAtte
     mc.on("start_game", (packet) => {
         if (!packet || !currentSession) return;
         try {
-            if (Vec3 && currentSession.position) {
-                currentSession.position.set(
-                    packet.player_position?.x || 0, 
-                    packet.player_position?.y || 0, 
-                    packet.player_position?.z || 0
-                );
-                currentSession.targetPosition = currentSession.position.clone();
-            }
             currentSession.entityId = packet.runtime_entity_id;
             currentSession.connected = true;
             currentSession.isReconnecting = false;
@@ -1205,50 +1008,6 @@ async function startSession(uid, interaction, isReconnect = false, reconnectAtte
         } catch (e) {
             console.error("Error in start_game handler:", e);
         }
-    });
-
-    mc.on("move_player", (packet) => {
-        if (!packet || !currentSession) return;
-        try {
-            currentSession.lastPacketTime = Date.now();
-            currentSession.packetsReceived++;
-            
-            if (packet.runtime_id === currentSession.entityId && currentSession.position) {
-                if (packet.position && packet.position.y > currentSession.position.y && currentSession.velocity) {
-                    currentSession.onGround = true;
-                    currentSession.velocity.y = 0;
-                } else {
-                    currentSession.onGround = false;
-                }
-                
-                currentSession.isTryingToSleep = false;
-                currentSession.position.set(
-                    packet.position?.x || 0, 
-                    packet.position?.y || 0, 
-                    packet.position?.z || 0
-                );
-            }
-        } catch (e) {}
-    });
-
-    mc.on("respawn", (packet) => {
-        logToDiscord(`💀 Bot of <@${uid}> died and respawned.`);
-        if (!packet || !currentSession) return;
-        try {
-            if (currentSession.position) {
-                currentSession.position.set(
-                    packet.position?.x || 0, 
-                    packet.position?.y || 0, 
-                    packet.position?.z || 0
-                );
-                if (currentSession.targetPosition) {
-                    currentSession.targetPosition.set(currentSession.position.x, currentSession.position.y, currentSession.position.z);
-                }
-                if (currentSession.velocity) currentSession.velocity.set(0, 0, 0);
-                currentSession.isTryingToSleep = false;
-                currentSession.onGround = true;
-            }
-        } catch (e) {}
     });
 
     mc.on('packet', (packet) => {
@@ -1377,7 +1136,6 @@ client.on(Events.InteractionCreate, async (i) => {
 
         if (i.isStringSelectMenu()) {
             if (i.customId === "admin_force_stop_select") {
-                // Defer update for thinking state
                 await i.deferUpdate().catch(() => {});
                 const targetUid = i.values?.[0];
                 if (targetUid && typeof targetUid === 'string') {
@@ -1393,7 +1151,6 @@ client.on(Events.InteractionCreate, async (i) => {
 
         if (i.isButton()) {
             if (i.customId === "admin_refresh") {
-                // Defer update for thinking state
                 await i.deferUpdate().catch(() => {});
                 return i.editReply({ 
                     embeds: [getAdminStatsEmbed()], 
@@ -1403,7 +1160,6 @@ client.on(Events.InteractionCreate, async (i) => {
 
             if (i.customId === "admin_stop_all") {
                 if (uid !== CONFIG.ADMIN_ID) return;
-                // Defer update for thinking state
                 await i.deferUpdate().catch(() => {});
                 const stopPromises = [];
                 sessions.forEach((_, sUid) => stopPromises.push(stopSession(sUid)));
@@ -1417,7 +1173,6 @@ client.on(Events.InteractionCreate, async (i) => {
 
             if (i.customId === "admin_save_data") {
                 if (uid !== CONFIG.ADMIN_ID) return;
-                // Defer update for thinking state
                 await i.deferUpdate().catch(() => {});
                 await userStore.save(true);
                 await sessionStore.save(true);
@@ -1432,7 +1187,6 @@ client.on(Events.InteractionCreate, async (i) => {
                 if (sessions.has(uid)) {
                     return safeReply(i, { ephemeral: true, content: "⚠️ **Session Conflict**: Active session exists." });
                 }
-                // Defer reply for thinking state
                 await i.deferReply({ ephemeral: true }).catch(() => {});
                 const embed = new EmbedBuilder()
                     .setTitle("Bedrock Connection")
@@ -1449,7 +1203,6 @@ client.on(Events.InteractionCreate, async (i) => {
                 if (sessions.has(uid)) {
                     return safeReply(i, { ephemeral: true, content: "⚠️ **Session Conflict**: Active session exists." });
                 }
-                // Defer reply for thinking state
                 await i.deferReply({ ephemeral: true }).catch(() => {});
                 const embed = new EmbedBuilder()
                     .setTitle("⚙️ Java Compatibility Check")
@@ -1469,13 +1222,11 @@ client.on(Events.InteractionCreate, async (i) => {
             }
 
             if (i.customId === "cancel") {
-                // Defer update for thinking state
                 await i.deferUpdate().catch(() => {});
                 return i.editReply({ content: "❌ Cancelled.", embeds: [], components: [] }).catch(() => {});
             }
 
             if (i.customId === "stop") {
-                // Defer reply for thinking state
                 await i.deferReply({ ephemeral: true }).catch(() => {});
                 const ok = await stopSession(uid);
                 return safeReply(i, { ephemeral: true, content: ok ? "⏹ **Session Terminated.**" : "No active sessions." });
@@ -1487,7 +1238,6 @@ client.on(Events.InteractionCreate, async (i) => {
             }
 
             if (i.customId === "unlink") {
-                // Defer reply for thinking state
                 await i.deferReply({ ephemeral: true }).catch(() => {});
                 await unlinkMicrosoft(uid);
                 return safeReply(i, { ephemeral: true, content: "🗑 Unlinked Microsoft account." });
