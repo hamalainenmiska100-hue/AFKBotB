@@ -33,7 +33,7 @@ const CONFIG = {
     MAX_RECONNECT_ATTEMPTS: 1000,
     RECONNECT_BASE_DELAY_MS: 5000,
     RECONNECT_MAX_DELAY_MS: 300000,
-    CONNECTION_TIMEOUT_MS: 60000,
+    CONNECTION_TIMEOUT_MS: 30000,
     KEEPALIVE_INTERVAL_MS: 15000,
     STALE_CONNECTION_TIMEOUT_MS: 60000,
     MEMORY_CHECK_INTERVAL_MS: 60000,
@@ -41,8 +41,8 @@ const CONFIG = {
     SESSION_HEARTBEAT_INTERVAL_MS: 30000,
     TOKEN_REFRESH_BUFFER_MS: 300000,
     NATIVE_CLEANUP_DELAY_MS: 2000,
-    PING_TIMEOUT_MS: 10000,
-    OPERATION_TIMEOUT_MS: 60000,
+    PING_TIMEOUT_MS: 5000,
+    OPERATION_TIMEOUT_MS: 30000,
     MAX_DISCORD_RECONNECT_ATTEMPTS: 5,
 };
 
@@ -287,7 +287,6 @@ const lastMsa = new Map();
 let isShuttingDown = false;
 let discordReady = false;
 let discordReconnectAttempts = 0;
-let healthCheckInterval = null;
 
 // ==================== ENHANCED DISCORD CLIENT ====================
 const client = new Client({
@@ -350,7 +349,6 @@ client.on("error", (error) => {
         crashLogger.log("DISCORD ERROR", error);
         discordReady = false;
         
-        // Attempt reconnect with backoff
         discordReconnectAttempts++;
         if (discordReconnectAttempts > CONFIG.MAX_DISCORD_RECONNECT_ATTEMPTS) {
             console.error(`Discord reconnect failed ${discordReconnectAttempts} times, forcing exit...`);
@@ -390,7 +388,6 @@ client.on("disconnect", (event) => {
             if (!client.isReady()) {
                 client.login(DISCORD_TOKEN).catch((err) => {
                     console.error("Discord reconnect on disconnect failed:", err.message);
-                    // Next disconnect event will trigger another attempt
                 });
             }
         }, 5000 * discordReconnectAttempts);
@@ -404,7 +401,7 @@ client.on("reconnecting", () => {
 client.on("resume", (replayed) => {
     try {
         discordReady = true;
-        discordReconnectAttempts = 0; // Reset on successful resume
+        discordReconnectAttempts = 0;
         console.log("Discord connection resumed");
     } catch (e) {}
 });
@@ -438,19 +435,6 @@ function gracefulShutdown(signal) {
 process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
 process.on('SIGINT', () => gracefulShutdown('SIGINT'));
 
-// ==================== MEMORY MANAGEMENT FIXES ====================
-function clearChunkCache(mcClient) {
-    try {
-        if (mcClient?.world?.columns) {
-            const keys = Object.keys(mcClient.world.columns);
-            if (keys.length > 100) {
-                mcClient.world.columns = {};
-                console.log(`🗑️ Cleared ${keys.length} chunks from cache`);
-            }
-        }
-    } catch (e) {}
-}
-
 // ==================== SESSION MANAGEMENT ====================
 async function cleanupSession(uid) {
     if (!uid) return;
@@ -462,7 +446,7 @@ async function cleanupSession(uid) {
     
     try {
         const timers = ['reconnectTimer', 'afkTimeout', 
-                       'keepaliveTimer', 'staleCheckTimer', 'tokenRefreshTimer', 'chunkCleanupTimer'];
+                       'keepaliveTimer', 'staleCheckTimer', 'tokenRefreshTimer'];
         timers.forEach(timer => {
             try {
                 if (s[timer]) {
@@ -475,30 +459,12 @@ async function cleanupSession(uid) {
 
         if (s.client) {
             try {
-                clearChunkCache(s.client);
-                
-                try {
-                    if (s.client.queue) {
-                        s.client.queue('disconnect', { reason: 'Disconnected by user' });
-                    }
-                } catch (e) {}
-                
-                await new Promise(r => setTimeout(r, 500));
-                
-                try {
-                    if (typeof s.client.disconnect === 'function') {
-                        s.client.disconnect();
-                    } else if (typeof s.client.close === 'function') {
-                        s.client.close();
-                    }
-                } catch (e) {}
-                
-                try {
-                    s.client.removeAllListeners();
-                } catch (e) {}
-                
-                s.client = null;
+                s.client.removeAllListeners();
             } catch (e) {}
+            try {
+                s.client.close();
+            } catch (e) {}
+            s.client = null;
         }
         
         await new Promise(resolve => setTimeout(resolve, CONFIG.NATIVE_CLEANUP_DELAY_MS));
@@ -523,12 +489,14 @@ async function stopSession(uid) {
     if (!uid) return false;
     
     try {
-        const session = sessions.get(uid);
-        if (session) {
-            session.manualStop = true;
-            if (session.reconnectTimer) {
-                clearTimeout(session.reconnectTimer);
-                session.reconnectTimer = null;
+        // CRITICAL FIX: Set manualStop BEFORE cleaning up
+        const s = sessions.get(uid);
+        if (s) {
+            s.manualStop = true;
+            // Clear any pending reconnect
+            if (s.reconnectTimer) {
+                clearTimeout(s.reconnectTimer);
+                s.reconnectTimer = null;
             }
         }
         
@@ -546,6 +514,7 @@ function handleAutoReconnect(uid, attempt = 1) {
     try {
         if (!uid || isShuttingDown) return;
         const s = sessions.get(uid);
+        // CRITICAL: Check manualStop here
         if (!s || s.manualStop || s.isReconnecting || s.isCleaningUp) return;
 
         if (attempt > CONFIG.MAX_RECONNECT_ATTEMPTS) {
@@ -600,18 +569,10 @@ function startHealthMonitoring(uid) {
                 s.lastKeepalive = Date.now();
             } catch (e) {
                 try {
-                    if (!s.isReconnecting && !s.isCleaningUp) handleAutoReconnect(uid, s.reconnectAttempt + 1);
+                    if (!s.isReconnecting && !s.isCleaningUp && !s.manualStop) handleAutoReconnect(uid, s.reconnectAttempt + 1);
                 } catch (err) {}
             }
         }, CONFIG.KEEPALIVE_INTERVAL_MS);
-
-        s.chunkCleanupTimer = setInterval(() => {
-            try {
-                if (s.client && s.connected) {
-                    clearChunkCache(s.client);
-                }
-            } catch (e) {}
-        }, 60000);
 
         s.staleCheckTimer = setInterval(() => {
             try {
@@ -621,7 +582,7 @@ function startHealthMonitoring(uid) {
                     try {
                         s.client?.close();
                     } catch (e) {}
-                    if (!s.isReconnecting && !s.isCleaningUp) handleAutoReconnect(uid, s.reconnectAttempt + 1);
+                    if (!s.isReconnecting && !s.isCleaningUp && !s.manualStop) handleAutoReconnect(uid, s.reconnectAttempt + 1);
                 }
             } catch (e) {}
         }, CONFIG.STALE_CONNECTION_TIMEOUT_MS);
@@ -832,7 +793,7 @@ async function linkMicrosoft(uid, interaction) {
                     u.linked = true;
                     u.tokenAcquiredAt = Date.now();
                     await userStore.save();
-                    await interaction.followUp({ ephemeral: true, content: "✅ Microsoft account linked! You can now start the bot." }).catch(() => {});
+                    await interaction.followUp({ ephemeral: true, content: "✅ Microsoft account linked!" }).catch(() => {});
                 } catch (e) {}
             }).catch(async (e) => {
                 try {
@@ -874,22 +835,6 @@ async function startSession(uid, interaction, isReconnect = false, reconnectAtte
         if (!u) {
             if (!isReconnect) safeReply(interaction, "❌ User data error.");
             return;
-        }
-
-        if (u.connectionType !== "offline") {
-            const tokenAge = Date.now() - (u.tokenAcquiredAt || 0);
-            const isTokenExpired = !u.linked || !u.tokenAcquiredAt || (tokenAge > CONFIG.TOKEN_REFRESH_BUFFER_MS);
-            
-            if (isTokenExpired) {
-                if (!isReconnect && interaction) {
-                    return linkMicrosoft(uid, interaction);
-                } else {
-                    logToDiscord(`⛔ Bot of <@${uid}> stopped: Microsoft authentication required or token expired.`);
-                    delete activeSessionsStore[uid];
-                    await sessionStore.save();
-                    return;
-                }
-            }
         }
 
         if (!activeSessionsStore) activeSessionsStore = {};
@@ -998,37 +943,13 @@ async function startSession(uid, interaction, isReconnect = false, reconnectAtte
             opts.offline = true;
         }
 
+        // FIX: Don't use Promise.race - just create client and attach listeners immediately
         let mc;
-        let clientError = null;
-        
         try {
             mc = bedrock.createClient(opts);
-            
-            await new Promise((resolve, reject) => {
-                const timeoutId = setTimeout(() => {
-                    reject(new Error('Connection timeout'));
-                }, CONFIG.CONNECTION_TIMEOUT_MS);
-                
-                mc.once('connect', () => {
-                    clearTimeout(timeoutId);
-                    resolve();
-                });
-                
-                mc.once('error', (err) => {
-                    clearTimeout(timeoutId);
-                    reject(err);
-                });
-            });
-            
         } catch (err) {
-            clientError = err;
             if (!isReconnect) {
-                try {
-                    connectionEmbed.setDescription(`❌ **Failed to create client:** ${err.message}`);
-                    await safeReply(interaction, { embeds: [connectionEmbed] });
-                } catch (e) {
-                    safeReply(interaction, "❌ Failed to create client.");
-                }
+                safeReply(interaction, "❌ Failed to create client.");
             }
             if (isReconnect) handleAutoReconnect(uid, reconnectAttempt);
             return;
@@ -1047,7 +968,6 @@ async function startSession(uid, interaction, isReconnect = false, reconnectAtte
             afkTimeout: null,
             keepaliveTimer: null,
             staleCheckTimer: null,
-            chunkCleanupTimer: null,
             lastPacketTime: Date.now(),
             lastKeepalive: Date.now(),
             packetsReceived: 0
@@ -1059,6 +979,7 @@ async function startSession(uid, interaction, isReconnect = false, reconnectAtte
             return;
         }
 
+        // Anti-AFK with animations: hand swing and crouch
         const performAntiAfk = () => {
             try {
                 if (!sessions.has(uid) || isShuttingDown) return;
@@ -1172,7 +1093,7 @@ async function startSession(uid, interaction, isReconnect = false, reconnectAtte
 client.once("ready", async () => {
     try {
         discordReady = true;
-        discordReconnectAttempts = 0; // Reset counter on successful connection
+        discordReconnectAttempts = 0;
         console.log("Discord client ready");
 
         try {
@@ -1253,11 +1174,9 @@ client.on(Events.InteractionCreate, async (i) => {
                         discordReady = false;
                         console.log("Manual Discord refresh requested");
                         
-                        // Destroy and recreate connection
                         await client.destroy();
                         await new Promise(r => setTimeout(r, 1000));
                         
-                        // Reset counter and login
                         discordReconnectAttempts = 0;
                         await client.login(DISCORD_TOKEN);
                         
@@ -1288,7 +1207,6 @@ client.on(Events.InteractionCreate, async (i) => {
 
         if (i.isButton()) {
             try {
-                // Handle refresh button
                 if (i.customId === "refresh_discord") {
                     await i.deferReply({ ephemeral: true });
                     try {
@@ -1305,7 +1223,6 @@ client.on(Events.InteractionCreate, async (i) => {
                         discordReconnectAttempts = 0;
                         await client.login(DISCORD_TOKEN);
                         
-                        // Wait for ready state
                         let attempts = 0;
                         while (!client.isReady() && attempts < 20) {
                             await new Promise(r => setTimeout(r, 500));
