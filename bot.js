@@ -523,6 +523,12 @@ async function stopSession(uid) {
     if (!uid) return false;
     
     try {
+        // CRITICAL FIX: Set manualStop to prevent auto-reconnect from triggering
+        const session = sessions.get(uid);
+        if (session) {
+            session.manualStop = true;
+        }
+        
         if (activeSessionsStore[uid]) {
             delete activeSessionsStore[uid];
             await sessionStore.save();
