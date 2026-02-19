@@ -31,7 +31,7 @@ const CONFIG = {
     SAVE_DEBOUNCE_MS: 500,
     AUTO_SAVE_INTERVAL_MS: 15000,
     MAX_RECONNECT_ATTEMPTS: 1000,
-    RECONNECT_BASE_DELAY_MS: 10000, // Increased to prevent rate limiting
+    RECONNECT_BASE_DELAY_MS: 10000,
     RECONNECT_MAX_DELAY_MS: 300000,
     CONNECTION_TIMEOUT_MS: 30000,
     KEEPALIVE_INTERVAL_MS: 15000,
@@ -40,7 +40,7 @@ const CONFIG = {
     MAX_MEMORY_MB: 1536,
     SESSION_HEARTBEAT_INTERVAL_MS: 30000,
     TOKEN_REFRESH_BUFFER_MS: 300000,
-    NATIVE_CLEANUP_DELAY_MS: 3000, // Increased for better cleanup
+    NATIVE_CLEANUP_DELAY_MS: 3000,
     PING_TIMEOUT_MS: 5000,
     OPERATION_TIMEOUT_MS: 30000,
     MAX_DISCORD_RECONNECT_ATTEMPTS: 5,
@@ -435,26 +435,6 @@ function gracefulShutdown(signal) {
 process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
 process.on('SIGINT', () => gracefulShutdown('SIGINT'));
 
-// ==================== CHUNK DISCARD SYSTEM ====================
-function discardChunk(mcClient, x, z) {
-    try {
-        if (mcClient?.world?.columns) {
-            const key = `${x},${z}`;
-            if (mcClient.world.columns[key]) {
-                delete mcClient.world.columns[key];
-            }
-        }
-    } catch (e) {}
-}
-
-function clearAllChunks(mcClient) {
-    try {
-        if (mcClient?.world?.columns) {
-            mcClient.world.columns = {};
-        }
-    } catch (e) {}
-}
-
 // ==================== SESSION MANAGEMENT ====================
 async function cleanupSession(uid) {
     if (!uid) return;
@@ -466,7 +446,7 @@ async function cleanupSession(uid) {
     
     try {
         const timers = ['reconnectTimer', 'afkTimeout', 
-                       'keepaliveTimer', 'staleCheckTimer', 'tokenRefreshTimer', 'chunkCleanupTimer'];
+                       'keepaliveTimer', 'staleCheckTimer', 'tokenRefreshTimer'];
         timers.forEach(timer => {
             try {
                 if (s[timer]) {
@@ -479,7 +459,6 @@ async function cleanupSession(uid) {
 
         if (s.client) {
             try {
-                clearAllChunks(s.client);
                 s.client.removeAllListeners();
                 await new Promise(r => setTimeout(r, 500));
                 s.client.close();
@@ -590,14 +569,6 @@ function startHealthMonitoring(uid) {
                 } catch (err) {}
             }
         }, CONFIG.KEEPALIVE_INTERVAL_MS);
-
-        s.chunkCleanupTimer = setInterval(() => {
-            try {
-                if (s.client && s.connected) {
-                    clearAllChunks(s.client);
-                }
-            } catch (e) {}
-        }, 10000);
 
         s.staleCheckTimer = setInterval(() => {
             try {
@@ -986,7 +957,6 @@ async function startSession(uid, interaction, isReconnect = false, reconnectAtte
             afkTimeout: null,
             keepaliveTimer: null,
             staleCheckTimer: null,
-            chunkCleanupTimer: null,
             lastPacketTime: Date.now(),
             lastKeepalive: Date.now(),
             packetsReceived: 0
@@ -998,15 +968,6 @@ async function startSession(uid, interaction, isReconnect = false, reconnectAtte
             return;
         }
 
-        // Immediately discard chunks when received to prevent memory buildup
-        mc.on('level_chunk', (packet) => {
-            discardChunk(mc, packet.x, packet.z);
-        });
-
-        mc.on('subchunk', (packet) => {
-            discardChunk(mc, packet.x, packet.z);
-        });
-
         // Handle server disconnect messages
         mc.on('disconnect', (packet) => {
             try {
@@ -1016,7 +977,7 @@ async function startSession(uid, interaction, isReconnect = false, reconnectAtte
                 
                 // Don't auto-reconnect if server explicitly kicked us with certain messages
                 if (reason.includes("wait") || reason.includes("etwas") || reason.includes("before")) {
-                    currentSession.manualStop = true; // Prevent auto-reconnect for rate limiting
+                    currentSession.manualStop = true;
                     delete activeSessionsStore[uid];
                     sessionStore.save();
                 }
@@ -1180,7 +1141,7 @@ client.once("clientReady", async () => {
                             }
                         } catch (e) {}
                     }, delay);
-                    delay += 8000; // Increased delay between reconnects
+                    delay += 8000;
                 }
             }
         }
