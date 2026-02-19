@@ -43,6 +43,7 @@ const CONFIG = {
     NATIVE_CLEANUP_DELAY_MS: 2000,
     PING_TIMEOUT_MS: 10000,
     OPERATION_TIMEOUT_MS: 60000,
+    MAX_DISCORD_RECONNECT_ATTEMPTS: 5,
 };
 
 // ==================== STORAGE SYSTEM ====================
@@ -283,9 +284,9 @@ let activeSessionsStore = sessionStore.load({});
 const sessions = new Map();
 const pendingLink = new Map();
 const lastMsa = new Map();
-let lastAdminMessage = null;
 let isShuttingDown = false;
 let discordReady = false;
+let discordReconnectAttempts = 0;
 let healthCheckInterval = null;
 
 // ==================== ENHANCED DISCORD CLIENT ====================
@@ -347,36 +348,64 @@ process.on("warning", (warning) => {});
 client.on("error", (error) => {
     try {
         crashLogger.log("DISCORD ERROR", error);
+        discordReady = false;
+        
+        // Attempt reconnect with backoff
+        discordReconnectAttempts++;
+        if (discordReconnectAttempts > CONFIG.MAX_DISCORD_RECONNECT_ATTEMPTS) {
+            console.error(`Discord reconnect failed ${discordReconnectAttempts} times, forcing exit...`);
+            process.exit(1);
+        }
+        
         setTimeout(() => {
             if (!client.isReady()) {
-                client.login(DISCORD_TOKEN).catch(() => {
-                    setTimeout(() => process.exit(1), 5000);
+                console.log(`Discord reconnect attempt ${discordReconnectAttempts}...`);
+                client.login(DISCORD_TOKEN).catch((err) => {
+                    console.error("Discord reconnect error:", err.message);
                 });
             }
-        }, 10000);
+        }, 5000 * discordReconnectAttempts);
     } catch (e) {}
 });
 
-client.on("shardError", (error) => {});
+client.on("shardError", (error) => {
+    crashLogger.log("SHARD ERROR", error);
+});
 
 client.on("warn", (warning) => {});
 
 client.on("disconnect", (event) => {
     try {
         discordReady = false;
+        discordReconnectAttempts++;
+        
+        console.log(`Discord disconnected (code: ${event?.code}), attempt ${discordReconnectAttempts}`);
+        
+        if (discordReconnectAttempts > CONFIG.MAX_DISCORD_RECONNECT_ATTEMPTS) {
+            console.error("Max Discord reconnect attempts reached, exiting for restart...");
+            process.exit(1);
+        }
+        
         setTimeout(() => {
             if (!client.isReady()) {
-                client.login(DISCORD_TOKEN).catch(() => {});
+                client.login(DISCORD_TOKEN).catch((err) => {
+                    console.error("Discord reconnect on disconnect failed:", err.message);
+                    // Next disconnect event will trigger another attempt
+                });
             }
-        }, 5000);
+        }, 5000 * discordReconnectAttempts);
     } catch (e) {}
 });
 
-client.on("reconnecting", () => {});
+client.on("reconnecting", () => {
+    console.log("Discord reconnecting...");
+});
 
 client.on("resume", (replayed) => {
     try {
         discordReady = true;
+        discordReconnectAttempts = 0; // Reset on successful resume
+        console.log("Discord connection resumed");
     } catch (e) {}
 });
 
@@ -444,22 +473,18 @@ async function cleanupSession(uid) {
             } catch (e) {}
         });
 
-        // FIX: Properly disconnect client without removing listeners first
         if (s.client) {
             try {
                 clearChunkCache(s.client);
                 
-                // Send disconnect packet first if possible
                 try {
                     if (s.client.queue) {
                         s.client.queue('disconnect', { reason: 'Disconnected by user' });
                     }
                 } catch (e) {}
                 
-                // Wait a moment for disconnect to send
                 await new Promise(r => setTimeout(r, 500));
                 
-                // Now close connection
                 try {
                     if (typeof s.client.disconnect === 'function') {
                         s.client.disconnect();
@@ -468,7 +493,6 @@ async function cleanupSession(uid) {
                     }
                 } catch (e) {}
                 
-                // Remove listeners after closing
                 try {
                     s.client.removeAllListeners();
                 } catch (e) {}
@@ -499,11 +523,9 @@ async function stopSession(uid) {
     if (!uid) return false;
     
     try {
-        // Set manualStop to prevent auto-reconnect
         const session = sessions.get(uid);
         if (session) {
             session.manualStop = true;
-            // Stop any pending reconnect
             if (session.reconnectTimer) {
                 clearTimeout(session.reconnectTimer);
                 session.reconnectTimer = null;
@@ -737,90 +759,14 @@ function panelRow(isJava = false) {
                     new ButtonBuilder().setCustomId(startCustomId).setLabel("▶ Start").setStyle(ButtonStyle.Success),
                     new ButtonBuilder().setCustomId("stop").setLabel("⏹ Stop").setStyle(ButtonStyle.Danger),
                     new ButtonBuilder().setCustomId("settings").setLabel("⚙ Settings").setStyle(ButtonStyle.Secondary)
+                ),
+                new ActionRowBuilder().addComponents(
+                    new ButtonBuilder().setCustomId("refresh_discord").setLabel("🔄 Refresh Connection").setStyle(ButtonStyle.Primary)
                 )
             ]
         };
     } catch (e) {
         return { content: "Error", components: [] };
-    }
-}
-
-function adminPanelComponents() {
-    try {
-        const rows = [
-            new ActionRowBuilder().addComponents(
-                new ButtonBuilder().setCustomId("admin_refresh").setLabel("🔄 Refresh Stats").setStyle(ButtonStyle.Primary),
-                new ButtonBuilder().setCustomId("admin_stop_all").setLabel("🛑 Force Stop All").setStyle(ButtonStyle.Danger),
-                new ButtonBuilder().setCustomId("admin_save_data").setLabel("💾 Force Save").setStyle(ButtonStyle.Secondary)
-            )
-        ];
-
-        if (sessions.size > 0) {
-            const options = [];
-            let count = 0;
-            for (const [uid, session] of sessions) {
-                if (count >= 25) break;
-                const label = `User: ${uid.slice(0, 8)}...`;
-                const desc = session?.startedAt 
-                    ? `Started: ${new Date(session.startedAt).toLocaleTimeString()}` 
-                    : 'Unknown';
-                options.push({ label, description: desc, value: uid });
-                count++;
-            }
-            if (options.length > 0) {
-                rows.push(new ActionRowBuilder().addComponents(
-                    new StringSelectMenuBuilder()
-                        .setCustomId("admin_force_stop_select")
-                        .setPlaceholder("Select bot to Force Stop")
-                        .addOptions(options)
-                ));
-            }
-        }
-        return rows;
-    } catch (e) {
-        return [];
-    }
-}
-
-function getAdminStatsEmbed() {
-    try {
-        let memory = { rss: 0, heapUsed: 0 };
-        try {
-            memory = process.memoryUsage();
-        } catch (e) {}
-        
-        const ramMB = (memory.rss / 1024 / 1024).toFixed(2);
-        const heapMB = (memory.heapUsed / 1024 / 1024).toFixed(2);
-        const uptime = process.uptime();
-        const hours = Math.floor(uptime / 3600);
-        const minutes = Math.floor((uptime % 3600) / 60);
-
-        const embed = new EmbedBuilder()
-            .setTitle("🛠 Admin Panel")
-            .setColor("#2f3136")
-            .addFields(
-                { name: "📊 Performance", value: `**RAM:** ${ramMB} MB\n**Heap:** ${heapMB} MB\n**Uptime:** ${hours}h ${minutes}m`, inline: true },
-                { name: "🤖 Active Sessions", value: `**Total Bots:** ${sessions.size}`, inline: true },
-                { name: "💾 Persisted Sessions", value: `**Saved for Restart:** ${Object.keys(activeSessionsStore || {}).length}`, inline: true }
-            )
-            .setFooter({ text: `Auto-refreshing • Saves: ${userStore.saveCount} | PID: ${process.pid}` })
-            .setTimestamp();
-
-        if (sessions.size > 0) {
-            let botList = "";
-            for (const [uid, s] of sessions) {
-                try {
-                    const status = s?.connected ? "🟢 Online" : (s?.isReconnecting ? "⏳ Reconnecting" : "🔴 Offline");
-                    const attempt = s?.reconnectAttempt ? ` (R${s.reconnectAttempt})` : '';
-                    botList += `<@${uid}>: ${status}${attempt}\n`;
-                } catch (e) {}
-            }
-            if (botList.length > 1024) botList = botList.slice(0, 1021) + "...";
-            embed.addFields({ name: "📋 Active Bot Registry", value: botList || "None" });
-        }
-        return embed;
-    } catch (e) {
-        return new EmbedBuilder().setTitle("Error").setColor("#FF0000");
     }
 }
 
@@ -1052,14 +998,12 @@ async function startSession(uid, interaction, isReconnect = false, reconnectAtte
             opts.offline = true;
         }
 
-        // FIX: Create client without buggy timeout wrapper
         let mc;
         let clientError = null;
         
         try {
             mc = bedrock.createClient(opts);
             
-            // Wait for connection or error
             await new Promise((resolve, reject) => {
                 const timeoutId = setTimeout(() => {
                     reject(new Error('Connection timeout'));
@@ -1228,28 +1172,19 @@ async function startSession(uid, interaction, isReconnect = false, reconnectAtte
 client.once("ready", async () => {
     try {
         discordReady = true;
+        discordReconnectAttempts = 0; // Reset counter on successful connection
+        console.log("Discord client ready");
 
         try {
             const cmds = [
                 new SlashCommandBuilder().setName("panel").setDescription("Open Bedrock AFK panel"),
                 new SlashCommandBuilder().setName("java").setDescription("Open Java AFKBot Panel"),
-                new SlashCommandBuilder().setName("admin").setDescription("Open Admin Control Panel")
+                new SlashCommandBuilder().setName("refresh").setDescription("Refresh Discord connection without restart")
             ];
             await client.application?.commands?.set(cmds);
-        } catch (e) {}
-
-        setInterval(async () => {
-            try {
-                if (lastAdminMessage && !isShuttingDown && discordReady) {
-                    await lastAdminMessage.edit({ 
-                        embeds: [getAdminStatsEmbed()], 
-                        components: adminPanelComponents() 
-                    }).catch(() => { lastAdminMessage = null; });
-                }
-            } catch (e) { 
-                lastAdminMessage = null; 
-            }
-        }, 30000);
+        } catch (e) {
+            console.error("Failed to register commands:", e);
+        }
 
         setInterval(() => {
             try {
@@ -1263,8 +1198,8 @@ client.once("ready", async () => {
             } catch (e) {}
         }, CONFIG.MEMORY_CHECK_INTERVAL_MS);
 
+        // Restore previous sessions
         const previousSessions = Object.keys(activeSessionsStore || {});
-
         if (previousSessions.length > 0) {
             let delay = 0;
             for (const uid of previousSessions) {
@@ -1280,7 +1215,9 @@ client.once("ready", async () => {
                 }
             }
         }
-    } catch (e) {}
+    } catch (e) {
+        console.error("Error in ready event:", e);
+    }
 });
 
 client.on(Events.InteractionCreate, async (i) => {
@@ -1305,33 +1242,45 @@ client.on(Events.InteractionCreate, async (i) => {
             try {
                 if (i.commandName === "panel") return safeReply(i, panelRow(false));
                 if (i.commandName === "java") return safeReply(i, panelRow(true));
-                if (i.commandName === "admin") {
-                    if (uid !== CONFIG.ADMIN_ID) return safeReply(i, { content: "⛔ Access restricted.", ephemeral: true });
+                
+                if (i.commandName === "refresh") {
+                    await i.deferReply({ ephemeral: true });
                     try {
-                        const msg = await i.reply({ 
-                            embeds: [getAdminStatsEmbed()], 
-                            components: adminPanelComponents(), 
-                            fetchReply: true 
+                        if (!discordReady) {
+                            return safeReply(i, "⚠️ Discord already reconnecting, please wait...");
+                        }
+                        
+                        discordReady = false;
+                        console.log("Manual Discord refresh requested");
+                        
+                        // Destroy and recreate connection
+                        await client.destroy();
+                        await new Promise(r => setTimeout(r, 1000));
+                        
+                        // Reset counter and login
+                        discordReconnectAttempts = 0;
+                        await client.login(DISCORD_TOKEN);
+                        
+                        // Wait for ready
+                        await new Promise((resolve, reject) => {
+                            const timeout = setTimeout(() => reject(new Error("Timeout")), 10000);
+                            const checkReady = setInterval(() => {
+                                if (client.isReady()) {
+                                    clearTimeout(timeout);
+                                    clearInterval(checkReady);
+                                    resolve();
+                                }
+                            }, 500);
                         });
-                        lastAdminMessage = msg;
-                    } catch (e) {}
-                    return;
-                }
-            } catch (e) {}
-        }
-
-        if (i.isStringSelectMenu()) {
-            try {
-                if (i.customId === "admin_force_stop_select") {
-                    await i.deferUpdate().catch(() => {});
-                    const targetUid = i.values?.[0];
-                    if (targetUid && typeof targetUid === 'string') {
-                        await stopSession(targetUid);
-                        return i.editReply({ 
-                            content: `🛑 Forced stop for <@${targetUid}>`, 
-                            embeds: [getAdminStatsEmbed()], 
-                            components: adminPanelComponents() 
-                        }).catch(() => {});
+                        
+                        discordReady = true;
+                        discordReconnectAttempts = 0;
+                        
+                        return safeReply(i, "✅ Discord connection refreshed successfully!");
+                    } catch (err) {
+                        console.error("Refresh failed:", err);
+                        discordReady = false;
+                        return safeReply(i, `❌ Refresh failed: ${err.message}`);
                     }
                 }
             } catch (e) {}
@@ -1339,37 +1288,41 @@ client.on(Events.InteractionCreate, async (i) => {
 
         if (i.isButton()) {
             try {
-                if (i.customId === "admin_refresh") {
-                    await i.deferUpdate().catch(() => {});
-                    return i.editReply({ 
-                        embeds: [getAdminStatsEmbed()], 
-                        components: adminPanelComponents() 
-                    }).catch(() => {});
-                }
-
-                if (i.customId === "admin_stop_all") {
-                    if (uid !== CONFIG.ADMIN_ID) return;
-                    await i.deferUpdate().catch(() => {});
-                    const stopPromises = [];
-                    sessions.forEach((_, sUid) => stopPromises.push(stopSession(sUid)));
-                    await Promise.all(stopPromises);
-                    return i.editReply({ 
-                        content: "🛑 All sessions stopped.", 
-                        embeds: [getAdminStatsEmbed()], 
-                        components: adminPanelComponents() 
-                    }).catch(() => {});
-                }
-
-                if (i.customId === "admin_save_data") {
-                    if (uid !== CONFIG.ADMIN_ID) return;
-                    await i.deferUpdate().catch(() => {});
-                    await userStore.save(true);
-                    await sessionStore.save(true);
-                    return i.editReply({ 
-                        content: "💾 Data saved to disk.", 
-                        embeds: [getAdminStatsEmbed()], 
-                        components: adminPanelComponents() 
-                    }).catch(() => {});
+                // Handle refresh button
+                if (i.customId === "refresh_discord") {
+                    await i.deferReply({ ephemeral: true });
+                    try {
+                        if (!discordReady) {
+                            return safeReply(i, "⚠️ Already reconnecting, please wait...");
+                        }
+                        
+                        discordReady = false;
+                        console.log("Refresh button clicked");
+                        
+                        await client.destroy();
+                        await new Promise(r => setTimeout(r, 1000));
+                        
+                        discordReconnectAttempts = 0;
+                        await client.login(DISCORD_TOKEN);
+                        
+                        // Wait for ready state
+                        let attempts = 0;
+                        while (!client.isReady() && attempts < 20) {
+                            await new Promise(r => setTimeout(r, 500));
+                            attempts++;
+                        }
+                        
+                        if (client.isReady()) {
+                            discordReady = true;
+                            discordReconnectAttempts = 0;
+                            return safeReply(i, "✅ Connection refreshed!");
+                        } else {
+                            throw new Error("Did not become ready in time");
+                        }
+                    } catch (err) {
+                        discordReady = false;
+                        return safeReply(i, `❌ Failed: ${err.message}`);
+                    }
                 }
 
                 if (i.customId === "start_bedrock") {
@@ -1493,12 +1446,13 @@ client.on(Events.InteractionCreate, async (i) => {
 });
 
 // ==================== STARTUP ====================
-client.login(DISCORD_TOKEN).catch(() => {
+client.login(DISCORD_TOKEN).catch((err) => {
+    console.error("Initial login failed:", err);
     process.exit(1);
 });
 
 setInterval(() => {
     try {
-        console.log(`💓 Heartbeat | Sessions: ${sessions.size} | Uptime: ${Math.floor(process.uptime() / 60)}m`);
+        console.log(`💓 Heartbeat | Sessions: ${sessions.size} | Discord: ${discordReady ? 'Connected' : 'Disconnected'} | Uptime: ${Math.floor(process.uptime() / 60)}m`);
     } catch (e) {}
 }, 60000);
