@@ -43,7 +43,7 @@ const CONFIG = {
     NATIVE_CLEANUP_DELAY_MS: 3000,
     PING_TIMEOUT_MS: 5000,
     OPERATION_TIMEOUT_MS: 30000,
-    MAX_DISCORD_RECONNECT_ATTEMPTS: 5,
+    MAX_DISCORD_RECONNECT_ATTEMPTS: Infinity, // Loputon
 };
 
 // ==================== STORAGE SYSTEM ====================
@@ -344,66 +344,38 @@ process.on("unhandledRejection", (reason, promise) => {
 process.on("warning", (warning) => {});
 
 // ==================== DISCORD CONNECTION RESILIENCE ====================
+// KORJATTU: Discord.js hoitaa yhdistämisen automaattisesti, ei manuaalista login()
 client.on("error", (error) => {
-    try {
-        crashLogger.log("DISCORD ERROR", error);
-        discordReady = false;
-        
-        discordReconnectAttempts++;
-        if (discordReconnectAttempts > CONFIG.MAX_DISCORD_RECONNECT_ATTEMPTS) {
-            console.error(`Discord reconnect failed ${discordReconnectAttempts} times, forcing exit...`);
-            process.exit(1);
-        }
-        
-        setTimeout(() => {
-            if (!client.isReady()) {
-                console.log(`Discord reconnect attempt ${discordReconnectAttempts}...`);
-                client.login(DISCORD_TOKEN).catch((err) => {
-                    console.error("Discord reconnect error:", err.message);
-                });
-            }
-        }, 5000 * discordReconnectAttempts);
-    } catch (e) {}
+    // ÄLÄ yritä yhdistää manuaalisesti täällä!
+    console.error("DISCORD ERROR:", error);
+    crashLogger.log("DISCORD ERROR", error);
+    discordReady = false;
 });
 
 client.on("shardError", (error) => {
+    console.error("SHARD ERROR (Yhteysongelma Discordiin):", error);
     crashLogger.log("SHARD ERROR", error);
+    // Discord.js yrittää automaattisesti yhdistää uudelleen shard-virheen jälkeen.
 });
 
-client.on("warn", (warning) => {});
+client.on("warn", (warning) => {
+    console.warn("DISCORD WARN:", warning);
+});
 
 client.on("disconnect", (event) => {
-    try {
-        discordReady = false;
-        discordReconnectAttempts++;
-        
-        console.log(`Discord disconnected (code: ${event?.code}), attempt ${discordReconnectAttempts}`);
-        
-        if (discordReconnectAttempts > CONFIG.MAX_DISCORD_RECONNECT_ATTEMPTS) {
-            console.error("Max Discord reconnect attempts reached, exiting for restart...");
-            process.exit(1);
-        }
-        
-        setTimeout(() => {
-            if (!client.isReady()) {
-                client.login(DISCORD_TOKEN).catch((err) => {
-                    console.error("Discord reconnect on disconnect failed:", err.message);
-                });
-            }
-        }, 5000 * discordReconnectAttempts);
-    } catch (e) {}
+    discordReady = false;
+    console.log(`Discord websocket katkesi (code: ${event?.code || 'tuntematon'}). Odotetaan automaattista yhdistämistä...`);
+    // Poistettu manuaalinen client.login(), koska discord.js hoitaa sen itse!
 });
 
 client.on("reconnecting", () => {
-    console.log("Discord reconnecting...");
+    console.log("Discord yhdistää automaattisesti uudelleen...");
 });
 
 client.on("resume", (replayed) => {
-    try {
-        discordReady = true;
-        discordReconnectAttempts = 0;
-        console.log("Discord connection resumed");
-    } catch (e) {}
+    discordReady = true;
+    discordReconnectAttempts = 0;
+    console.log(`Discord yhteys palautettu! (Uudelleentoistetut eventit: ${replayed})`);
 });
 
 // ==================== GRACEFUL SHUTDOWN ====================
@@ -1116,14 +1088,15 @@ client.once("clientReady", async () => {
             console.error("Failed to register commands:", e);
         }
 
+        // KORJATTU: Poistettu global.gc() kutsu joka tukkii event loopin
+        // Jos muisti loppuu, Node.js hoitaa roskienkeruun automaattisesti
         setInterval(() => {
             try {
                 const mem = process.memoryUsage();
                 const mb = mem.rss / 1024 / 1024;
                 if (mb > CONFIG.MAX_MEMORY_MB) {
-                    if (global.gc) {
-                        global.gc();
-                    }
+                    // Ei pakoteta gc:tä, annetaan V8:n hoitaa se
+                    console.warn(`High memory usage: ${mb.toFixed(2)}MB (limit: ${CONFIG.MAX_MEMORY_MB}MB)`);
                 }
             } catch (e) {}
         }, CONFIG.MEMORY_CHECK_INTERVAL_MS);
