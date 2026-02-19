@@ -409,6 +409,66 @@ function gracefulShutdown(signal) {
 process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
 process.on('SIGINT', () => gracefulShutdown('SIGINT'));
 
+// ==================== MEMORY MANAGEMENT FIXES ====================
+function clearChunkCache(mcClient) {
+    try {
+        if (mcClient?.world?.columns) {
+            const keys = Object.keys(mcClient.world.columns);
+            if (keys.length > 100) {
+                mcClient.world.columns = {};
+                console.log(`🗑️ Cleared ${keys.length} chunks from cache`);
+            }
+        }
+    } catch (e) {}
+}
+
+async function createClientWithTimeout(opts, timeoutMs) {
+    return new Promise((resolve, reject) => {
+        let client = null;
+        let timeoutId = null;
+        let resolved = false;
+        
+        const cleanup = () => {
+            if (timeoutId) clearTimeout(timeoutId);
+            if (client && !resolved) {
+                try { client.close(); } catch(e) {}
+            }
+        };
+        
+        timeoutId = setTimeout(() => {
+            resolved = true;
+            cleanup();
+            reject(new Error('Client creation timeout'));
+        }, timeoutMs);
+        
+        try {
+            client = bedrock.createClient(opts);
+            
+            client.once('connect', () => {
+                if (!resolved) {
+                    resolved = true;
+                    clearTimeout(timeoutId);
+                    resolve(client);
+                }
+            });
+            
+            client.once('error', (err) => {
+                if (!resolved) {
+                    resolved = true;
+                    cleanup();
+                    reject(err);
+                }
+            });
+        } catch (e) {
+            if (!resolved) {
+                resolved = true;
+                cleanup();
+                reject(e);
+            }
+        }
+    });
+}
+
 // ==================== SESSION MANAGEMENT ====================
 async function cleanupSession(uid) {
     if (!uid) return;
@@ -420,7 +480,7 @@ async function cleanupSession(uid) {
     
     try {
         const timers = ['reconnectTimer', 'afkTimeout', 
-                       'keepaliveTimer', 'staleCheckTimer', 'tokenRefreshTimer'];
+                       'keepaliveTimer', 'staleCheckTimer', 'tokenRefreshTimer', 'chunkCleanupTimer'];
         timers.forEach(timer => {
             try {
                 if (s[timer]) {
@@ -434,11 +494,11 @@ async function cleanupSession(uid) {
         if (s.client) {
             try {
                 s.client.removeAllListeners();
-            } catch (e) {}
-            try {
+                clearChunkCache(s.client);
+                await new Promise(r => setTimeout(r, 100));
                 s.client.close();
+                s.client = null;
             } catch (e) {}
-            s.client = null;
         }
         
         await new Promise(resolve => setTimeout(resolve, CONFIG.NATIVE_CLEANUP_DELAY_MS));
@@ -535,6 +595,14 @@ function startHealthMonitoring(uid) {
                 } catch (err) {}
             }
         }, CONFIG.KEEPALIVE_INTERVAL_MS);
+
+        s.chunkCleanupTimer = setInterval(() => {
+            try {
+                if (s.client && s.connected) {
+                    clearChunkCache(s.client);
+                }
+            } catch (e) {}
+        }, 60000);
 
         s.staleCheckTimer = setInterval(() => {
             try {
@@ -875,17 +943,14 @@ async function startSession(uid, interaction, isReconnect = false, reconnectAtte
             return;
         }
 
-        // Check authentication status (skip for offline mode)
         if (u.connectionType !== "offline") {
             const tokenAge = Date.now() - (u.tokenAcquiredAt || 0);
             const isTokenExpired = !u.linked || !u.tokenAcquiredAt || (tokenAge > CONFIG.TOKEN_REFRESH_BUFFER_MS);
             
             if (isTokenExpired) {
                 if (!isReconnect && interaction) {
-                    // For initial start, trigger auth flow
                     return linkMicrosoft(uid, interaction);
                 } else {
-                    // For reconnects without interaction context, just clean up and log
                     logToDiscord(`⛔ Bot of <@${uid}> stopped: Microsoft authentication required or token expired.`);
                     delete activeSessionsStore[uid];
                     await sessionStore.save();
@@ -946,14 +1011,12 @@ async function startSession(uid, interaction, isReconnect = false, reconnectAtte
             .setTitle("Bot Initialization")
             .setThumbnail("https://files.catbox.moe/9mqpoz.gif");
 
-        // SKIPPED: Ping on reconnect to prevent native memory corruption
         let pingSuccess = false;
         if (!isReconnect && interaction) {
             try {
                 connectionEmbed.setDescription(`🔍 **Pinging server...**\n🌐 **Target:** \`${ip}:${port}\``);
                 await safeReply(interaction, { embeds: [connectionEmbed], content: null, components: [] });
 
-                // Add timeout wrapper for ping
                 const pingPromise = bedrock.ping({ 
                     host: ip, 
                     port: parseInt(port) || 19132, 
@@ -1004,21 +1067,7 @@ async function startSession(uid, interaction, isReconnect = false, reconnectAtte
 
         let mc;
         try {
-            // Add timeout wrapper for client creation
-            const createClientPromise = new Promise((resolve, reject) => {
-                try {
-                    const client = bedrock.createClient(opts);
-                    resolve(client);
-                } catch (e) {
-                    reject(e);
-                }
-            });
-            
-            const timeoutPromise = new Promise((_, reject) => 
-                setTimeout(() => reject(new Error('Client creation timeout')), CONFIG.OPERATION_TIMEOUT_MS)
-            );
-            
-            mc = await Promise.race([createClientPromise, timeoutPromise]);
+            mc = await createClientWithTimeout(opts, CONFIG.OPERATION_TIMEOUT_MS);
         } catch (err) {
             if (!isReconnect) safeReply(interaction, "❌ Failed to create client.");
             if (isReconnect) handleAutoReconnect(uid, reconnectAttempt);
@@ -1038,6 +1087,7 @@ async function startSession(uid, interaction, isReconnect = false, reconnectAtte
             afkTimeout: null,
             keepaliveTimer: null,
             staleCheckTimer: null,
+            chunkCleanupTimer: null,
             lastPacketTime: Date.now(),
             lastKeepalive: Date.now(),
             packetsReceived: 0
@@ -1049,7 +1099,6 @@ async function startSession(uid, interaction, isReconnect = false, reconnectAtte
             return;
         }
 
-        // Anti-AFK with animations: hand swing and crouch
         const performAntiAfk = () => {
             try {
                 if (!sessions.has(uid) || isShuttingDown) return;
