@@ -33,7 +33,7 @@ const CONFIG = {
     MAX_RECONNECT_ATTEMPTS: 1000,
     RECONNECT_BASE_DELAY_MS: 5000,
     RECONNECT_MAX_DELAY_MS: 300000,
-    CONNECTION_TIMEOUT_MS: 30000,
+    CONNECTION_TIMEOUT_MS: 60000,
     KEEPALIVE_INTERVAL_MS: 15000,
     STALE_CONNECTION_TIMEOUT_MS: 60000,
     MEMORY_CHECK_INTERVAL_MS: 60000,
@@ -41,8 +41,8 @@ const CONFIG = {
     SESSION_HEARTBEAT_INTERVAL_MS: 30000,
     TOKEN_REFRESH_BUFFER_MS: 300000,
     NATIVE_CLEANUP_DELAY_MS: 2000,
-    PING_TIMEOUT_MS: 5000,
-    OPERATION_TIMEOUT_MS: 30000,
+    PING_TIMEOUT_MS: 10000,
+    OPERATION_TIMEOUT_MS: 60000,
 };
 
 // ==================== STORAGE SYSTEM ====================
@@ -422,53 +422,6 @@ function clearChunkCache(mcClient) {
     } catch (e) {}
 }
 
-async function createClientWithTimeout(opts, timeoutMs) {
-    return new Promise((resolve, reject) => {
-        let client = null;
-        let timeoutId = null;
-        let resolved = false;
-        
-        const cleanup = () => {
-            if (timeoutId) clearTimeout(timeoutId);
-            if (client && !resolved) {
-                try { client.close(); } catch(e) {}
-            }
-        };
-        
-        timeoutId = setTimeout(() => {
-            resolved = true;
-            cleanup();
-            reject(new Error('Client creation timeout'));
-        }, timeoutMs);
-        
-        try {
-            client = bedrock.createClient(opts);
-            
-            client.once('connect', () => {
-                if (!resolved) {
-                    resolved = true;
-                    clearTimeout(timeoutId);
-                    resolve(client);
-                }
-            });
-            
-            client.once('error', (err) => {
-                if (!resolved) {
-                    resolved = true;
-                    cleanup();
-                    reject(err);
-                }
-            });
-        } catch (e) {
-            if (!resolved) {
-                resolved = true;
-                cleanup();
-                reject(e);
-            }
-        }
-    });
-}
-
 // ==================== SESSION MANAGEMENT ====================
 async function cleanupSession(uid) {
     if (!uid) return;
@@ -491,12 +444,35 @@ async function cleanupSession(uid) {
             } catch (e) {}
         });
 
+        // FIX: Properly disconnect client without removing listeners first
         if (s.client) {
             try {
-                s.client.removeAllListeners();
                 clearChunkCache(s.client);
-                await new Promise(r => setTimeout(r, 100));
-                s.client.close();
+                
+                // Send disconnect packet first if possible
+                try {
+                    if (s.client.queue) {
+                        s.client.queue('disconnect', { reason: 'Disconnected by user' });
+                    }
+                } catch (e) {}
+                
+                // Wait a moment for disconnect to send
+                await new Promise(r => setTimeout(r, 500));
+                
+                // Now close connection
+                try {
+                    if (typeof s.client.disconnect === 'function') {
+                        s.client.disconnect();
+                    } else if (typeof s.client.close === 'function') {
+                        s.client.close();
+                    }
+                } catch (e) {}
+                
+                // Remove listeners after closing
+                try {
+                    s.client.removeAllListeners();
+                } catch (e) {}
+                
                 s.client = null;
             } catch (e) {}
         }
@@ -523,10 +499,15 @@ async function stopSession(uid) {
     if (!uid) return false;
     
     try {
-        // CRITICAL FIX: Set manualStop to prevent auto-reconnect from triggering
+        // Set manualStop to prevent auto-reconnect
         const session = sessions.get(uid);
         if (session) {
             session.manualStop = true;
+            // Stop any pending reconnect
+            if (session.reconnectTimer) {
+                clearTimeout(session.reconnectTimer);
+                session.reconnectTimer = null;
+            }
         }
         
         if (activeSessionsStore[uid]) {
@@ -1071,11 +1052,40 @@ async function startSession(uid, interaction, isReconnect = false, reconnectAtte
             opts.offline = true;
         }
 
+        // FIX: Create client without buggy timeout wrapper
         let mc;
+        let clientError = null;
+        
         try {
-            mc = await createClientWithTimeout(opts, CONFIG.OPERATION_TIMEOUT_MS);
+            mc = bedrock.createClient(opts);
+            
+            // Wait for connection or error
+            await new Promise((resolve, reject) => {
+                const timeoutId = setTimeout(() => {
+                    reject(new Error('Connection timeout'));
+                }, CONFIG.CONNECTION_TIMEOUT_MS);
+                
+                mc.once('connect', () => {
+                    clearTimeout(timeoutId);
+                    resolve();
+                });
+                
+                mc.once('error', (err) => {
+                    clearTimeout(timeoutId);
+                    reject(err);
+                });
+            });
+            
         } catch (err) {
-            if (!isReconnect) safeReply(interaction, "❌ Failed to create client.");
+            clientError = err;
+            if (!isReconnect) {
+                try {
+                    connectionEmbed.setDescription(`❌ **Failed to create client:** ${err.message}`);
+                    await safeReply(interaction, { embeds: [connectionEmbed] });
+                } catch (e) {
+                    safeReply(interaction, "❌ Failed to create client.");
+                }
+            }
             if (isReconnect) handleAutoReconnect(uid, reconnectAttempt);
             return;
         }
