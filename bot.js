@@ -9,7 +9,6 @@ const {
     ModalBuilder,
     TextInputBuilder,
     TextInputStyle,
-    StringSelectMenuBuilder,
     EmbedBuilder,
     ActivityType
 } = require("discord.js");
@@ -37,7 +36,7 @@ const CONFIG = {
     KEEPALIVE_INTERVAL_MS: 15000,
     STALE_CONNECTION_TIMEOUT_MS: 60000,
     MEMORY_CHECK_INTERVAL_MS: 60000,
-    MAX_MEMORY_MB: 2048,
+    MAX_MEMORY_MB: 1536,
     SESSION_HEARTBEAT_INTERVAL_MS: 30000,
     TOKEN_REFRESH_BUFFER_MS: 300000,
     NATIVE_CLEANUP_DELAY_MS: 2000,
@@ -435,6 +434,27 @@ function gracefulShutdown(signal) {
 process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
 process.on('SIGINT', () => gracefulShutdown('SIGINT'));
 
+// ==================== CHUNK DISCARD SYSTEM ====================
+// Immediately discards chunks to prevent memory buildup
+function discardChunk(mcClient, x, z) {
+    try {
+        if (mcClient?.world?.columns) {
+            const key = `${x},${z}`;
+            if (mcClient.world.columns[key]) {
+                delete mcClient.world.columns[key];
+            }
+        }
+    } catch (e) {}
+}
+
+function clearAllChunks(mcClient) {
+    try {
+        if (mcClient?.world?.columns) {
+            mcClient.world.columns = {};
+        }
+    } catch (e) {}
+}
+
 // ==================== SESSION MANAGEMENT ====================
 async function cleanupSession(uid) {
     if (!uid) return;
@@ -446,7 +466,7 @@ async function cleanupSession(uid) {
     
     try {
         const timers = ['reconnectTimer', 'afkTimeout', 
-                       'keepaliveTimer', 'staleCheckTimer', 'tokenRefreshTimer'];
+                       'keepaliveTimer', 'staleCheckTimer', 'tokenRefreshTimer', 'chunkCleanupTimer'];
         timers.forEach(timer => {
             try {
                 if (s[timer]) {
@@ -456,6 +476,13 @@ async function cleanupSession(uid) {
                 }
             } catch (e) {}
         });
+
+        // Clear chunks before closing
+        if (s.client) {
+            try {
+                clearAllChunks(s.client);
+            } catch (e) {}
+        }
 
         if (s.client) {
             try {
@@ -489,11 +516,9 @@ async function stopSession(uid) {
     if (!uid) return false;
     
     try {
-        // CRITICAL FIX: Set manualStop BEFORE cleaning up
         const s = sessions.get(uid);
         if (s) {
             s.manualStop = true;
-            // Clear any pending reconnect
             if (s.reconnectTimer) {
                 clearTimeout(s.reconnectTimer);
                 s.reconnectTimer = null;
@@ -514,7 +539,6 @@ function handleAutoReconnect(uid, attempt = 1) {
     try {
         if (!uid || isShuttingDown) return;
         const s = sessions.get(uid);
-        // CRITICAL: Check manualStop here
         if (!s || s.manualStop || s.isReconnecting || s.isCleaningUp) return;
 
         if (attempt > CONFIG.MAX_RECONNECT_ATTEMPTS) {
@@ -573,6 +597,15 @@ function startHealthMonitoring(uid) {
                 } catch (err) {}
             }
         }, CONFIG.KEEPALIVE_INTERVAL_MS);
+
+        // Periodic chunk cleanup just in case
+        s.chunkCleanupTimer = setInterval(() => {
+            try {
+                if (s.client && s.connected) {
+                    clearAllChunks(s.client);
+                }
+            } catch (e) {}
+        }, 10000); // Every 10 seconds clear any accumulated chunks
 
         s.staleCheckTimer = setInterval(() => {
             try {
@@ -929,7 +962,7 @@ async function startSession(uid, interaction, isReconnect = false, reconnectAtte
             port: parseInt(port),
             connectTimeout: CONFIG.CONNECTION_TIMEOUT_MS,
             keepAlive: true,
-            viewDistance: 4,
+            viewDistance: 1, // Minimal view distance to reduce chunk sending
             profilesFolder: authDir,
             username: uid,
             offline: false,
@@ -943,7 +976,6 @@ async function startSession(uid, interaction, isReconnect = false, reconnectAtte
             opts.offline = true;
         }
 
-        // FIX: Don't use Promise.race - just create client and attach listeners immediately
         let mc;
         try {
             mc = bedrock.createClient(opts);
@@ -968,6 +1000,7 @@ async function startSession(uid, interaction, isReconnect = false, reconnectAtte
             afkTimeout: null,
             keepaliveTimer: null,
             staleCheckTimer: null,
+            chunkCleanupTimer: null,
             lastPacketTime: Date.now(),
             lastKeepalive: Date.now(),
             packetsReceived: 0
@@ -979,7 +1012,17 @@ async function startSession(uid, interaction, isReconnect = false, reconnectAtte
             return;
         }
 
-        // Anti-AFK with animations: hand swing and crouch
+        // IMMEDIATELY discard chunks when received
+        mc.on('level_chunk', (packet) => {
+            // Discard immediately to save memory - server thinks we got it
+            discardChunk(mc, packet.x, packet.z);
+        });
+
+        // Also discard on subchunk packets (1.18+)
+        mc.on('subchunk', (packet) => {
+            discardChunk(mc, packet.x, packet.z);
+        });
+
         const performAntiAfk = () => {
             try {
                 if (!sessions.has(uid) || isShuttingDown) return;
