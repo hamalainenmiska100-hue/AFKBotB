@@ -1,74 +1,86 @@
-# AFKBot
+# Bedrock AFK Bot
 
-AFKBot is a Discord bot that connects to a Minecraft server on your behalf, allowing you to stay AFK (away from keyboard) while performing other tasks. The bot can execute commands when it connects to the server, manage connection settings, and handle reconnections automatically. This is particularly useful for tasks like farming, waiting for in-game events, or simply maintaining your presence on the server.
+A Discord bot that manages persistent AFK (Away From Keyboard) sessions for Minecraft Bedrock Edition servers. The bot maintains 24/7 connections to Minecraft servers with automatic reconnection, anti-AFK mechanics, and Microsoft account integration.
 
-## Requirements
+## How It Works
 
-- Node.js (v16.6.0 or higher)
-- Discord Bot Token
-- Own discord server (for logging)
-- Mineflayer (A Minecraft bot API)
+The bot creates lightweight Minecraft Bedrock clients through Discord commands. Each user can run one bot instance that connects to a specified server, performs anti-AFK actions (arm swinging, crouching), and automatically reconnects if disconnected.
+
+### Core Architecture
+
+**Session Management**
+- Each Discord user gets one persistent Minecraft session
+- Sessions survive bot restarts through JSON-based storage (`rejoin.json`)
+- Write-ahead logging (WAL) ensures data integrity during crashes
+- Graceful shutdown with 15-second timeout for cleanup
+
+**Connection Lifecycle**
+1. User configures server IP/port via Settings modal
+2. Bot verifies Microsoft authentication (device code flow via `prismarine-auth`)
+3. Creates `bedrock-protocol` client with 30-second connection timeout
+4. Monitors health via keepalive packets (15s interval) and stale connection detection (60s timeout)
+5. On disconnect: exponential backoff reconnection (5s base, max 5min jitter)
+6. Native cleanup delays (2s) prevent heap corruption from rapid reconnects
+
+**Anti-AFK System**
+- Randomized actions every 8-20 seconds:
+  - 60% chance: Arm swing animation
+  - 20% chance: Crouch toggle (2-4s duration)
+  - 20% chance: No action
+- Prevents server kick for inactivity while maintaining minimal bandwidth
+
+### Authentication Flow
+
+**Online Mode (Default)**
+- Requires Microsoft account linking via `/link` command
+- Uses device code OAuth flow (Nintendo Switch device type)
+- Tokens stored locally per-user in `data/auth/[uid]/`
+- 5-minute timeout for authentication completion
+- Auto-detects expired tokens (5min buffer before expiry)
+
+**Offline Mode**
+- Optional per-user setting
+- Username auto-generated as `AFK_[last4digits]`
+- No Microsoft account required
+- Limited to cracked/offline-mode servers
+
+### Admin Panel
+
+Admin users (configured via `ADMIN_ID`) access:
+- Real-time RAM/Heap monitoring
+- Active session registry with connection status
+- Force-stop individual or all sessions
+- Manual data persistence triggers
+- Auto-refreshing embed (30s interval)
+
+### Safety Mechanisms
+
+**Crash Prevention**
+- Native memory corruption protection: 2-second delays between session cleanup and reconnection
+- Skips `bedrock.ping()` on reconnects to avoid double-free heap errors in RakNet native bindings
+- All errors caught silently with optional crash logging to `data/crash.log`
+- Operation timeouts (30s) on client creation to prevent hanging promises
+
+**Rate Limiting**
+- 1-second cooldown per user on button interactions
+- Discord REST retry logic with 3 attempts
+
+**Data Integrity**
+- Atomic file writes (write to `.tmp`, rename to target)
+- Automatic backup of corrupt JSON files
+- Emergency backup on save failures
 
 ## Installation
 
-1. **Clone the Repository**
+### Requirements
+- Node.js 18+
+- Discord Bot Token
+- 512MB+ RAM (scales with concurrent sessions)
 
-    ```bash
-    git clone https://github.com/NightMirror21/AFKBot.git
-    cd AFKBot
-    ```
-    
-2. **Configure your bot**
+### Setup
 
-    Replace `TOKEN` in the code with your Discord bot token.
-    Replace `LOG_CHANNEL` with the ID of the Discord channel where you want to log bot activities.
-
-3. **Install dependencies**
-    
-    ```bash
-    npm install discord.js mineflayer
-    ```
-
-4. **Run**
-
-    ```bash
-    node bot.js
-    ```
-
-## Usage
-Once the bot is running, you can control it through the following Discord commands:
-
-- `/settings <host> <port> <username>` - Sets the connection settings for the Minecraft server.
-  ```
-  host: The IP address of the Minecraft server.
-  port: The port number of the Minecraft server.
-  username: The username you want to connect with.
-  ```
-
-- `/connect` - Connects the bot to the Minecraft server using the previously set settings.
-
-- `/disconnect` - Disconnects the bot from the Minecraft server.
-
-- `/setcommand <command>` - Sets a command that the bot will execute upon connecting to the server. This is useful for logging in with a password or performing any other in-game tasks.
-  ```
-  command: The Minecraft command to execute.
-  ```
-
-- `/setdelay <delay_in_seconds>` - Sets the delay before the bot attempts to reconnect to the server if disconnected.
-  ```
-  delay_in_seconds: The number of seconds to wait before attempting to reconnect.
-  ```
-
-- `/help` - Displays a help message with detailed instructions on how to use the bot.
-
-### Example
-1. Set up the server connection settings:
-`/settings play.example.com 25565 MyUsername`
-2. Connect to the server:
-`/connect`
-3. Set a command to be executed upon connection (e.g., logging in):
-`/setcommand /login MySecretPassword`
-4. Set a custom delay before reconnecting:
-`/setdelay 10`
-5. Disconnect from the server:
-`/disconnect`
+1. **Clone and install**
+```bash
+git clone <repo>
+cd bedrock-afk-bot
+npm install discord.js bedrock-protocol prismarine-auth
