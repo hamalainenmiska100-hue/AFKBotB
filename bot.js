@@ -10,7 +10,8 @@ const {
     TextInputBuilder,
     TextInputStyle,
     EmbedBuilder,
-    ActivityType
+    ActivityType,
+    MessageFlags
 } = require("discord.js");
 const bedrock = require("bedrock-protocol");
 const { Authflow, Titles } = require("prismarine-auth");
@@ -30,7 +31,7 @@ const CONFIG = {
     SAVE_DEBOUNCE_MS: 500,
     AUTO_SAVE_INTERVAL_MS: 15000,
     MAX_RECONNECT_ATTEMPTS: 1000,
-    RECONNECT_BASE_DELAY_MS: 5000,
+    RECONNECT_BASE_DELAY_MS: 10000, // Increased to prevent rate limiting
     RECONNECT_MAX_DELAY_MS: 300000,
     CONNECTION_TIMEOUT_MS: 30000,
     KEEPALIVE_INTERVAL_MS: 15000,
@@ -39,7 +40,7 @@ const CONFIG = {
     MAX_MEMORY_MB: 1536,
     SESSION_HEARTBEAT_INTERVAL_MS: 30000,
     TOKEN_REFRESH_BUFFER_MS: 300000,
-    NATIVE_CLEANUP_DELAY_MS: 2000,
+    NATIVE_CLEANUP_DELAY_MS: 3000, // Increased for better cleanup
     PING_TIMEOUT_MS: 5000,
     OPERATION_TIMEOUT_MS: 30000,
     MAX_DISCORD_RECONNECT_ATTEMPTS: 5,
@@ -435,7 +436,6 @@ process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
 process.on('SIGINT', () => gracefulShutdown('SIGINT'));
 
 // ==================== CHUNK DISCARD SYSTEM ====================
-// Immediately discards chunks to prevent memory buildup
 function discardChunk(mcClient, x, z) {
     try {
         if (mcClient?.world?.columns) {
@@ -477,21 +477,14 @@ async function cleanupSession(uid) {
             } catch (e) {}
         });
 
-        // Clear chunks before closing
         if (s.client) {
             try {
                 clearAllChunks(s.client);
-            } catch (e) {}
-        }
-
-        if (s.client) {
-            try {
                 s.client.removeAllListeners();
-            } catch (e) {}
-            try {
+                await new Promise(r => setTimeout(r, 500));
                 s.client.close();
+                s.client = null;
             } catch (e) {}
-            s.client = null;
         }
         
         await new Promise(resolve => setTimeout(resolve, CONFIG.NATIVE_CLEANUP_DELAY_MS));
@@ -598,14 +591,13 @@ function startHealthMonitoring(uid) {
             }
         }, CONFIG.KEEPALIVE_INTERVAL_MS);
 
-        // Periodic chunk cleanup just in case
         s.chunkCleanupTimer = setInterval(() => {
             try {
                 if (s.client && s.connected) {
                     clearAllChunks(s.client);
                 }
             } catch (e) {}
-        }, 10000); // Every 10 seconds clear any accumulated chunks
+        }, 10000);
 
         s.staleCheckTimer = setInterval(() => {
             try {
@@ -770,12 +762,12 @@ async function linkMicrosoft(uid, interaction) {
         if (!uid || !interaction) return;
         
         if (pendingLink.has(uid)) {
-            return safeReply(interaction, "⏳ Login already in progress. Check your DMs or use the last code.");
+            return safeReply(interaction, { content: "⏳ Login already in progress. Check your DMs or use the last code.", flags: [MessageFlags.Ephemeral] });
         }
         
         const authDir = getUserAuthDir(uid);
         if (!authDir) {
-            return safeReply(interaction, "❌ System error: Cannot create auth directory.");
+            return safeReply(interaction, { content: "❌ System error: Cannot create auth directory.", flags: [MessageFlags.Ephemeral] });
         }
         
         const u = getUser(uid);
@@ -785,7 +777,7 @@ async function linkMicrosoft(uid, interaction) {
             try {
                 if (pendingLink.has(uid)) {
                     pendingLink.delete(uid);
-                    safeReply(interaction, "⏰ Login timed out after 5 minutes.").catch(() => {});
+                    safeReply(interaction, { content: "⏰ Login timed out after 5 minutes.", flags: [MessageFlags.Ephemeral] }).catch(() => {});
                 }
             } catch (e) {}
         }, 300000);
@@ -826,13 +818,13 @@ async function linkMicrosoft(uid, interaction) {
                     u.linked = true;
                     u.tokenAcquiredAt = Date.now();
                     await userStore.save();
-                    await interaction.followUp({ ephemeral: true, content: "✅ Microsoft account linked!" }).catch(() => {});
+                    await interaction.followUp({ content: "✅ Microsoft account linked!", flags: [MessageFlags.Ephemeral] }).catch(() => {});
                 } catch (e) {}
             }).catch(async (e) => {
                 try {
                     clearTimeout(timeoutId);
                     const errorMsg = e?.message || "Unknown error";
-                    await interaction.editReply(`❌ Login failed: ${errorMsg}`).catch(() => {});
+                    await interaction.editReply({ content: `❌ Login failed: ${errorMsg}` }).catch(() => {});
                 } catch (err) {}
             }).finally(() => { 
                 try {
@@ -846,7 +838,7 @@ async function linkMicrosoft(uid, interaction) {
             try {
                 clearTimeout(timeoutId);
                 pendingLink.delete(uid);
-                safeReply(interaction, "❌ Authentication system error.");
+                safeReply(interaction, { content: "❌ Authentication system error.", flags: [MessageFlags.Ephemeral] });
             } catch (err) {}
         }
     } catch (e) {}
@@ -866,7 +858,7 @@ async function startSession(uid, interaction, isReconnect = false, reconnectAtte
         
         const u = getUser(uid);
         if (!u) {
-            if (!isReconnect) safeReply(interaction, "❌ User data error.");
+            if (!isReconnect) safeReply(interaction, { content: "❌ User data error.", flags: [MessageFlags.Ephemeral] });
             return;
         }
 
@@ -884,7 +876,7 @@ async function startSession(uid, interaction, isReconnect = false, reconnectAtte
         }
 
         if (!u.server || !u.server.ip) {
-            if (!isReconnect) safeReply(interaction, "⚠️ Please configure your server settings first.");
+            if (!isReconnect) safeReply(interaction, { content: "⚠️ Please configure your server settings first.", flags: [MessageFlags.Ephemeral] });
             try {
                 delete activeSessionsStore[uid];
                 await sessionStore.save();
@@ -895,7 +887,7 @@ async function startSession(uid, interaction, isReconnect = false, reconnectAtte
         const { ip, port } = u.server;
         
         if (!isValidIP(ip) || !isValidPort(port)) {
-            if (!isReconnect) safeReply(interaction, "❌ Invalid server IP or port format.");
+            if (!isReconnect) safeReply(interaction, { content: "❌ Invalid server IP or port format.", flags: [MessageFlags.Ephemeral] });
             try {
                 delete activeSessionsStore[uid];
                 await sessionStore.save();
@@ -905,8 +897,8 @@ async function startSession(uid, interaction, isReconnect = false, reconnectAtte
 
         if (sessions.has(uid) && !isReconnect) {
             return safeReply(interaction, { 
-                ephemeral: true, 
-                content: "⚠️ **Session Conflict**: Active session already exists. Use `/stop` first." 
+                content: "⚠️ **Session Conflict**: Active session already exists. Use `/stop` first.", 
+                flags: [MessageFlags.Ephemeral] 
             });
         }
 
@@ -922,38 +914,31 @@ async function startSession(uid, interaction, isReconnect = false, reconnectAtte
             .setTitle("Bot Initialization")
             .setThumbnail("https://files.catbox.moe/9mqpoz.gif");
 
-        let pingSuccess = false;
         if (!isReconnect && interaction) {
             try {
                 connectionEmbed.setDescription(`🔍 **Pinging server...**\n🌐 **Target:** \`${ip}:${port}\``);
-                await safeReply(interaction, { embeds: [connectionEmbed], content: null, components: [] });
+                await safeReply(interaction, { embeds: [connectionEmbed], components: [] });
 
-                const pingPromise = bedrock.ping({ 
-                    host: ip, 
-                    port: parseInt(port) || 19132, 
-                    timeout: CONFIG.PING_TIMEOUT_MS 
-                });
+                try {
+                    await bedrock.ping({ 
+                        host: ip, 
+                        port: parseInt(port) || 19132, 
+                        timeout: CONFIG.PING_TIMEOUT_MS 
+                    });
+                    connectionEmbed.setDescription(`✅ **Server responded! Joining...**\n🌐 **Target:** \`${ip}:${port}\``);
+                } catch (err) {
+                    connectionEmbed.setDescription(`⚠️ **Ping failed, attempting direct connection...**\n🌐 **Target:** \`${ip}:${port}\``);
+                }
                 
-                const timeoutPromise = new Promise((_, reject) => 
-                    setTimeout(() => reject(new Error('Ping timeout')), CONFIG.PING_TIMEOUT_MS)
-                );
-                
-                await Promise.race([pingPromise, timeoutPromise]);
-                pingSuccess = true;
-
-                connectionEmbed.setDescription(`✅ **Server responded! Joining...**\n🌐 **Target:** \`${ip}:${port}\``);
                 await safeReply(interaction, { embeds: [connectionEmbed] });
             } catch (err) {
-                try {
-                    connectionEmbed.setDescription(`⚠️ **Ping failed or timed out, attempting direct connection...**\n🌐 **Target:** \`${ip}:${port}\``);
-                    await safeReply(interaction, { embeds: [connectionEmbed] });
-                } catch (e) {}
+                console.error("Ping error:", err);
             }
         }
 
         const authDir = getUserAuthDir(uid);
         if (!authDir) {
-            if (!isReconnect) safeReply(interaction, "❌ Auth directory error.");
+            if (!isReconnect) safeReply(interaction, { content: "❌ Auth directory error.", flags: [MessageFlags.Ephemeral] });
             return;
         }
 
@@ -962,7 +947,7 @@ async function startSession(uid, interaction, isReconnect = false, reconnectAtte
             port: parseInt(port),
             connectTimeout: CONFIG.CONNECTION_TIMEOUT_MS,
             keepAlive: true,
-            viewDistance: 1, // Minimal view distance to reduce chunk sending
+            viewDistance: 1,
             profilesFolder: authDir,
             username: uid,
             offline: false,
@@ -980,8 +965,9 @@ async function startSession(uid, interaction, isReconnect = false, reconnectAtte
         try {
             mc = bedrock.createClient(opts);
         } catch (err) {
+            console.error("Create client error:", err);
             if (!isReconnect) {
-                safeReply(interaction, "❌ Failed to create client.");
+                safeReply(interaction, { content: "❌ Failed to create client.", flags: [MessageFlags.Ephemeral] });
             }
             if (isReconnect) handleAutoReconnect(uid, reconnectAttempt);
             return;
@@ -1012,15 +998,29 @@ async function startSession(uid, interaction, isReconnect = false, reconnectAtte
             return;
         }
 
-        // IMMEDIATELY discard chunks when received
+        // Immediately discard chunks when received to prevent memory buildup
         mc.on('level_chunk', (packet) => {
-            // Discard immediately to save memory - server thinks we got it
             discardChunk(mc, packet.x, packet.z);
         });
 
-        // Also discard on subchunk packets (1.18+)
         mc.on('subchunk', (packet) => {
             discardChunk(mc, packet.x, packet.z);
+        });
+
+        // Handle server disconnect messages
+        mc.on('disconnect', (packet) => {
+            try {
+                const reason = packet?.reason || "Unknown reason";
+                console.log(`Server requested disconnect: ${reason}`);
+                logToDiscord(`⚠️ Bot of <@${uid}> was kicked: ${reason}`);
+                
+                // Don't auto-reconnect if server explicitly kicked us with certain messages
+                if (reason.includes("wait") || reason.includes("etwas") || reason.includes("before")) {
+                    currentSession.manualStop = true; // Prevent auto-reconnect for rate limiting
+                    delete activeSessionsStore[uid];
+                    sessionStore.save();
+                }
+            } catch (e) {}
         });
 
         const performAntiAfk = () => {
@@ -1108,6 +1108,7 @@ async function startSession(uid, interaction, isReconnect = false, reconnectAtte
 
         mc.on("error", (e) => {
             try {
+                console.error(`Bot error for ${uid}:`, e?.message);
                 if (!currentSession.manualStop && !currentSession.isReconnecting && !currentSession.isCleaningUp) {
                     handleAutoReconnect(uid, currentSession.reconnectAttempt);
                 }
@@ -1117,10 +1118,10 @@ async function startSession(uid, interaction, isReconnect = false, reconnectAtte
 
         mc.on("close", () => {
             try {
+                console.log(`Connection closed for ${uid}`);
                 if (!currentSession.manualStop && !currentSession.isReconnecting && !currentSession.isCleaningUp) {
                     handleAutoReconnect(uid, currentSession.reconnectAttempt);
-                }
-                else {
+                } else {
                     try {
                         logToDiscord(`🔌 Bot of <@${uid}> disconnected manually.`);
                     } catch (e) {}
@@ -1128,12 +1129,16 @@ async function startSession(uid, interaction, isReconnect = false, reconnectAtte
             } catch (e) {}
         });
         
-        mc.on('packet_error', (err) => {});
-    } catch (e) {}
+        mc.on('packet_error', (err) => {
+            console.error(`Packet error for ${uid}:`, err?.message);
+        });
+    } catch (e) {
+        console.error("Start session error:", e);
+    }
 }
 
 // ==================== DISCORD EVENTS ====================
-client.once("ready", async () => {
+client.once("clientReady", async () => {
     try {
         discordReady = true;
         discordReconnectAttempts = 0;
@@ -1162,7 +1167,7 @@ client.once("ready", async () => {
             } catch (e) {}
         }, CONFIG.MEMORY_CHECK_INTERVAL_MS);
 
-        // Restore previous sessions
+        // Restore previous sessions with delay between each
         const previousSessions = Object.keys(activeSessionsStore || {});
         if (previousSessions.length > 0) {
             let delay = 0;
@@ -1175,7 +1180,7 @@ client.once("ready", async () => {
                             }
                         } catch (e) {}
                     }, delay);
-                    delay += 5000;
+                    delay += 8000; // Increased delay between reconnects
                 }
             }
         }
@@ -1196,7 +1201,7 @@ client.on(Events.InteractionCreate, async (i) => {
             try {
                 const lastInteraction = i.user.lastInteraction || 0;
                 if (Date.now() - lastInteraction < 1000) {
-                    return safeReply(i, { ephemeral: true, content: "⏳ Please wait a moment before clicking again." });
+                    return safeReply(i, { content: "⏳ Please wait a moment before clicking again.", flags: [MessageFlags.Ephemeral] });
                 }
                 i.user.lastInteraction = Date.now();
             } catch (e) {}
@@ -1208,10 +1213,10 @@ client.on(Events.InteractionCreate, async (i) => {
                 if (i.commandName === "java") return safeReply(i, panelRow(true));
                 
                 if (i.commandName === "refresh") {
-                    await i.deferReply({ ephemeral: true });
+                    await i.deferReply({ flags: [MessageFlags.Ephemeral] });
                     try {
                         if (!discordReady) {
-                            return safeReply(i, "⚠️ Discord already reconnecting, please wait...");
+                            return safeReply(i, { content: "⚠️ Discord already reconnecting, please wait...", flags: [MessageFlags.Ephemeral] });
                         }
                         
                         discordReady = false;
@@ -1238,11 +1243,11 @@ client.on(Events.InteractionCreate, async (i) => {
                         discordReady = true;
                         discordReconnectAttempts = 0;
                         
-                        return safeReply(i, "✅ Discord connection refreshed successfully!");
+                        return safeReply(i, { content: "✅ Discord connection refreshed successfully!", flags: [MessageFlags.Ephemeral] });
                     } catch (err) {
                         console.error("Refresh failed:", err);
                         discordReady = false;
-                        return safeReply(i, `❌ Refresh failed: ${err.message}`);
+                        return safeReply(i, { content: `❌ Refresh failed: ${err.message}`, flags: [MessageFlags.Ephemeral] });
                     }
                 }
             } catch (e) {}
@@ -1251,10 +1256,10 @@ client.on(Events.InteractionCreate, async (i) => {
         if (i.isButton()) {
             try {
                 if (i.customId === "refresh_discord") {
-                    await i.deferReply({ ephemeral: true });
+                    await i.deferReply({ flags: [MessageFlags.Ephemeral] });
                     try {
                         if (!discordReady) {
-                            return safeReply(i, "⚠️ Already reconnecting, please wait...");
+                            return safeReply(i, { content: "⚠️ Already reconnecting, please wait...", flags: [MessageFlags.Ephemeral] });
                         }
                         
                         discordReady = false;
@@ -1275,21 +1280,21 @@ client.on(Events.InteractionCreate, async (i) => {
                         if (client.isReady()) {
                             discordReady = true;
                             discordReconnectAttempts = 0;
-                            return safeReply(i, "✅ Connection refreshed!");
+                            return safeReply(i, { content: "✅ Connection refreshed!", flags: [MessageFlags.Ephemeral] });
                         } else {
                             throw new Error("Did not become ready in time");
                         }
                     } catch (err) {
                         discordReady = false;
-                        return safeReply(i, `❌ Failed: ${err.message}`);
+                        return safeReply(i, { content: `❌ Failed: ${err.message}`, flags: [MessageFlags.Ephemeral] });
                     }
                 }
 
                 if (i.customId === "start_bedrock") {
                     if (sessions.has(uid)) {
-                        return safeReply(i, { ephemeral: true, content: "⚠️ **Session Conflict**: Active session exists." });
+                        return safeReply(i, { content: "⚠️ **Session Conflict**: Active session exists.", flags: [MessageFlags.Ephemeral] });
                     }
-                    await i.deferReply({ ephemeral: true }).catch(() => {});
+                    await i.deferReply({ flags: [MessageFlags.Ephemeral] }).catch(() => {});
                     const embed = new EmbedBuilder()
                         .setTitle("Bedrock Connection")
                         .setDescription("Start bot?")
@@ -1303,9 +1308,9 @@ client.on(Events.InteractionCreate, async (i) => {
 
                 if (i.customId === "start_java") {
                     if (sessions.has(uid)) {
-                        return safeReply(i, { ephemeral: true, content: "⚠️ **Session Conflict**: Active session exists." });
+                        return safeReply(i, { content: "⚠️ **Session Conflict**: Active session exists.", flags: [MessageFlags.Ephemeral] });
                     }
-                    await i.deferReply({ ephemeral: true }).catch(() => {});
+                    await i.deferReply({ flags: [MessageFlags.Ephemeral] }).catch(() => {});
                     const embed = new EmbedBuilder()
                         .setTitle("⚙️ Java Compatibility Check")
                         .setDescription("For a successful connection to a Java server, ensure the following plugins are installed.")
@@ -1329,20 +1334,20 @@ client.on(Events.InteractionCreate, async (i) => {
                 }
 
                 if (i.customId === "stop") {
-                    await i.deferReply({ ephemeral: true }).catch(() => {});
+                    await i.deferReply({ flags: [MessageFlags.Ephemeral] }).catch(() => {});
                     const ok = await stopSession(uid);
-                    return safeReply(i, { ephemeral: true, content: ok ? "⏹ **Session Terminated.**" : "No active sessions." });
+                    return safeReply(i, { content: ok ? "⏹ **Session Terminated.**" : "No active sessions.", flags: [MessageFlags.Ephemeral] });
                 }
 
                 if (i.customId === "link") {
-                    await i.deferReply({ ephemeral: true }).catch(() => {});
+                    await i.deferReply({ flags: [MessageFlags.Ephemeral] }).catch(() => {});
                     return linkMicrosoft(uid, i);
                 }
 
                 if (i.customId === "unlink") {
-                    await i.deferReply({ ephemeral: true }).catch(() => {});
+                    await i.deferReply({ flags: [MessageFlags.Ephemeral] }).catch(() => {});
                     await unlinkMicrosoft(uid);
-                    return safeReply(i, { ephemeral: true, content: "🗑 Unlinked Microsoft account." });
+                    return safeReply(i, { content: "🗑 Unlinked Microsoft account.", flags: [MessageFlags.Ephemeral] });
                 }
 
                 if (i.customId === "settings") {
@@ -1383,23 +1388,23 @@ client.on(Events.InteractionCreate, async (i) => {
                 const port = parseInt(portStr, 10);
 
                 if (!ip || !portStr) {
-                    return safeReply(i, { ephemeral: true, content: "❌ IP and Port are required." });
+                    return safeReply(i, { content: "❌ IP and Port are required.", flags: [MessageFlags.Ephemeral] });
                 }
 
                 if (!isValidIP(ip)) {
-                    return safeReply(i, { ephemeral: true, content: "❌ Invalid IP address format." });
+                    return safeReply(i, { content: "❌ Invalid IP address format.", flags: [MessageFlags.Ephemeral] });
                 }
 
                 if (!isValidPort(port)) {
-                    return safeReply(i, { ephemeral: true, content: "❌ Invalid port (must be 1-65535)." });
+                    return safeReply(i, { content: "❌ Invalid port (must be 1-65535).", flags: [MessageFlags.Ephemeral] });
                 }
 
                 const u = getUser(uid);
                 u.server = { ip, port };
                 await userStore.save();
-                return safeReply(i, { ephemeral: true, content: `✅ Saved: **${ip}:${port}**` });
+                return safeReply(i, { content: `✅ Saved: **${ip}:${port}**`, flags: [MessageFlags.Ephemeral] });
             } catch (e) {
-                return safeReply(i, { ephemeral: true, content: "❌ Failed to save settings." });
+                return safeReply(i, { content: "❌ Failed to save settings.", flags: [MessageFlags.Ephemeral] });
             }
         }
     } catch (e) {}
