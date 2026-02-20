@@ -1054,6 +1054,12 @@ client.on(Events.InteractionCreate, async (i) => {
 
             if (i.customId === "confirm_start") {
                 await i.deferUpdate(); // Fast acknowledgment
+                // Immediately update to show connecting state and remove buttons
+                await i.editReply({ 
+                    content: "⏳ **Connecting...**", 
+                    embeds: [], 
+                    components: [] 
+                }).catch(() => {});
                 // Run session start in background
                 startSession(uid, i, false);
                 return;
