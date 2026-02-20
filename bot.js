@@ -19,19 +19,23 @@ const fs = require("fs");
 const path = require("path");
 const EventEmitter = require('events');
 
-// Increase default max listeners to prevent warnings during reconnects
 EventEmitter.defaultMaxListeners = 50;
 
+console.log("📝 [STEP 1/10] Modules loaded successfully");
+
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
+console.log("🔑 [STEP 2/10] Token check:", DISCORD_TOKEN ? `Found (${DISCORD_TOKEN.slice(0, 10)}...)` : "MISSING!");
+
 if (!DISCORD_TOKEN) {
-    console.error("❌ DISCORD_TOKEN missing");
+    console.error("❌ DISCORD_TOKEN missing! Set environment variable DISCORD_TOKEN");
+    console.error("   Example: DISCORD_TOKEN=your_token_here node index.js");
     process.exit(1);
 }
 
 // ==================== CONFIGURATION ====================
 const CONFIG = {
     ADMIN_ID: "1144987924123881564",
-    LOG_CHANNEL_ID: "1473388236884676729",
+    LOG_CHANNEL_ID: "1464615030111731753",
     SAVE_DEBOUNCE_MS: 500,
     AUTO_SAVE_INTERVAL_MS: 15000,
     MAX_RECONNECT_ATTEMPTS: Infinity,
@@ -48,7 +52,7 @@ const CONFIG = {
     PING_TIMEOUT_MS: 5000,
     OPERATION_TIMEOUT_MS: 30000,
     MAX_DISCORD_RECONNECT_ATTEMPTS: Infinity,
-    DISCORD_REFRESH_INTERVAL_MS: 120000,
+    DISCORD_REFRESH_INTERVAL_MS: 86400000, // 24h (disabled)
 };
 
 // ==================== STORAGE SYSTEM ====================
@@ -76,6 +80,8 @@ if (!ensureDir(DATA) || !ensureDir(AUTH_ROOT)) {
     console.error("❌ Critical: Cannot create data directories");
     process.exit(1);
 }
+
+console.log("💾 [STEP 3/10] Storage directories ready");
 
 // ==================== ENHANCED LOGGING ====================
 const debugLogger = {
@@ -323,6 +329,8 @@ const sessionStore = new PersistentStore(REJOIN_STORE, wal);
 let users = userStore.load({});
 let activeSessionsStore = sessionStore.load({});
 
+console.log("💾 [STEP 4/10] Data stores loaded");
+
 // ==================== RUNTIME STATE ====================
 const sessions = new Map();
 const pendingLink = new Map();
@@ -334,6 +342,7 @@ let isFirstReady = true;
 let memoryCheckInterval = null;
 
 // ==================== ENHANCED DISCORD CLIENT ====================
+console.log("🔧 [STEP 5/10] Creating Discord client...");
 const client = new Client({
     intents: [
         GatewayIntentBits.Guilds,
@@ -359,6 +368,8 @@ const client = new Client({
         compress: false
     }
 });
+
+console.log("🔧 [STEP 6/10] Discord client created");
 
 // ==================== CRASH PREVENTION SYSTEM ====================
 const crashLogger = {
@@ -416,16 +427,6 @@ process.on('exit', (code) => {
     console.log(`🔚 Process exit with code: ${code}`);
 });
 
-// Monitor EventEmitter leaks globally
-const originalOn = EventEmitter.prototype.on;
-EventEmitter.prototype.on = function(event, listener) {
-    const count = this.listenerCount(event);
-    if (count >= 10) {
-        console.warn(`⚠️ High listener count (${count}) for event "${event}" on ${this.constructor.name}`);
-    }
-    return originalOn.call(this, event, listener);
-};
-
 // ==================== DISCORD CONNECTION RESILIENCE ====================
 client.on("error", (error) => {
     console.error("❌ DISCORD CLIENT ERROR:", error.message, error.code ? `(Code: ${error.code})` : '');
@@ -450,44 +451,24 @@ client.on("reconnecting", () => {
     console.log("🔄 Discord reconnecting...");
 });
 
+// TÄRKEÄ: Tämä fire kun botti on valmis
 client.on("ready", () => {
     discordReady = true;
     discordReconnectAttempts = 0;
-    console.log("✅ Discord connected successfully");
+    console.log("✅ [STEP 8/10] Discord client ready event fired!");
+    console.log(`🤖 Logged in as: ${client.user?.tag} (${client.user?.id})`);
+    console.log(`🌐 Guilds: ${client.guilds.cache.size} servers`);
 });
 
-// NEW: Session invalidation listener (critical auth error)
 client.on("invalidated", () => {
-    console.error("🚨 DISCORD SESSION INVALIDATED - The session became invalid");
+    console.error("🚨 DISCORD SESSION INVALIDATED");
     crashLogger.log("SESSION_INVALIDATED", new Error("Discord session invalidated"));
     discordReady = false;
 });
 
-// NEW: Rate limit listener
 client.on("rateLimit", (rateLimitInfo) => {
-    console.warn(`⏳ RATE LIMITED: ${rateLimitInfo.method} ${rateLimitInfo.route} - Retry after: ${rateLimitInfo.retryAfter}ms`);
+    console.warn(`⏳ RATE LIMITED: ${rateLimitInfo.method} ${rateLimitInfo.route}`);
     debugLogger.log('RATE_LIMIT', rateLimitInfo);
-});
-
-// NEW: Debug listener (verbose, but catches low-level issues)
-client.on("debug", (info) => {
-    if (info.includes('error') || info.includes('Error') || info.includes('failed') || info.includes('timeout')) {
-        console.log(`🔍 Discord Debug (Error-related): ${info}`);
-        debugLogger.log('DISCORD_DEBUG', info);
-    }
-});
-
-// NEW: Guild availability errors
-client.on("guildUnavailable", (guild) => {
-    console.warn(`🏰 Guild became unavailable: ${guild.name} (${guild.id})`);
-});
-
-client.on("guildCreate", (guild) => {
-    console.log(`🏰 Joined new guild: ${guild.name} (${guild.id})`);
-});
-
-client.on("guildDelete", (guild) => {
-    console.log(`🏰 Left guild: ${guild.name} (${guild.id})`);
 });
 
 // ==================== GRACEFUL SHUTDOWN ====================
@@ -504,13 +485,10 @@ function gracefulShutdown(signal) {
             userStore.save(true),
             sessionStore.save(true)
         ]).then(() => {
-            console.log("💾 Data saved");
             return cleanupAllSessions();
         }).then(() => {
-            console.log("🔌 Sessions cleaned up");
             return client.destroy();
         }).then(() => {
-            console.log("✅ Discord client destroyed");
             clearTimeout(forceExit);
             process.exit(0);
         }).catch((err) => {
@@ -529,13 +507,8 @@ async function cleanupSession(uid) {
     const s = sessions.get(uid);
     if (!s) return;
 
-    if (s.isCleaningUp) {
-        console.log(`⚠️ Session ${uid} already cleaning up`);
-        return;
-    }
+    if (s.isCleaningUp) return;
     s.isCleaningUp = true;
-    
-    console.log(`🧹 Cleaning up session ${uid}...`);
     
     try {
         const timers = ['reconnectTimer', 'afkTimeout', 'keepaliveTimer', 'staleCheckTimer', 'tokenRefreshTimer'];
@@ -546,55 +519,40 @@ async function cleanupSession(uid) {
                     clearInterval(s[timer]);
                     s[timer] = null;
                 }
-            } catch (e) {
-                console.error(`❌ Error clearing ${timer} for ${uid}:`, e.message);
-            }
+            } catch (e) {}
         });
 
         if (s.client) {
             try {
-                console.log(`🔌 Closing bedrock client for ${uid}`);
                 s.client.removeAllListeners();
                 await new Promise(r => setTimeout(r, 500));
                 s.client.close();
                 s.client = null;
-            } catch (e) {
-                console.error(`❌ Error closing client for ${uid}:`, e.message);
-            }
+            } catch (e) {}
         }
         
         await new Promise(resolve => setTimeout(resolve, CONFIG.NATIVE_CLEANUP_DELAY_MS));
-    } catch (e) {
-        console.error(`❌ Cleanup error for ${uid}:`, e.message);
-    }
+    } catch (e) {}
     
     try {
         sessions.delete(uid);
-        console.log(`✅ Session ${uid} cleaned up`);
-    } catch (e) {
-        console.error(`❌ Error deleting session ${uid} from Map:`, e.message);
-    }
+    } catch (e) {}
 }
 
 async function cleanupAllSessions() {
-    console.log(`🧹 Cleaning up ${sessions.size} sessions...`);
     try {
         const promises = [];
         for (const [uid, session] of sessions) {
             promises.push(cleanupSession(uid));
         }
         await Promise.all(promises);
-        console.log("✅ All sessions cleaned up");
-    } catch (e) {
-        console.error("❌ Error in cleanupAllSessions:", e.message);
-    }
+    } catch (e) {}
 }
 
 async function stopSession(uid) {
     if (!uid) return false;
     
     try {
-        console.log(`⏹ Stopping session ${uid}...`);
         const s = sessions.get(uid);
         if (s) {
             s.manualStop = true;
@@ -609,26 +567,16 @@ async function stopSession(uid) {
             await sessionStore.save();
         }
         await cleanupSession(uid);
-        console.log(`✅ Session ${uid} stopped`);
-    } catch (e) {
-        console.error(`❌ Error stopping session ${uid}:`, e.message);
-        return false;
-    }
+    } catch (e) {}
     return true;
 }
 
 // ==================== RECONNECTION SYSTEM ====================
 function handleAutoReconnect(uid, attempt = 1) {
     try {
-        if (!uid || isShuttingDown) {
-            console.log(`🚫 Reconnect blocked for ${uid} (shutting down: ${isShuttingDown})`);
-            return;
-        }
+        if (!uid || isShuttingDown) return;
         const s = sessions.get(uid);
-        if (!s || s.manualStop || s.isReconnecting || s.isCleaningUp) {
-            console.log(`🚫 Reconnect blocked for ${uid} (manualStop: ${s?.manualStop}, isReconnecting: ${s?.isReconnecting}, isCleaningUp: ${s?.isCleaningUp})`);
-            return;
-        }
+        if (!s || s.manualStop || s.isReconnecting || s.isCleaningUp) return;
 
         if (attempt > CONFIG.MAX_RECONNECT_ATTEMPTS) {
             try {
@@ -636,9 +584,7 @@ function handleAutoReconnect(uid, attempt = 1) {
                 cleanupSession(uid);
                 delete activeSessionsStore[uid];
                 sessionStore.save();
-            } catch (e) {
-                console.error("❌ Error in max reconnect handler:", e.message);
-            }
+            } catch (e) {}
             return;
         }
 
@@ -655,42 +601,27 @@ function handleAutoReconnect(uid, attempt = 1) {
         const nativeDelay = attempt === 1 ? CONFIG.NATIVE_CLEANUP_DELAY_MS : 0;
         const delay = baseDelay + jitter + nativeDelay;
         
-        console.log(`⏳ Scheduling reconnect for ${uid} in ${Math.round(delay/1000)}s (Attempt ${attempt})`);
-        
         try {
             logToDiscord(`⏳ Bot of <@${uid}> disconnected. Reconnecting in ${Math.round(delay/1000)}s (Attempt ${attempt})...`);
-        } catch (e) {
-            console.error("❌ Error logging to Discord:", e.message);
-        }
+        } catch (e) {}
 
         s.reconnectTimer = setTimeout(() => {
             try {
                 if (!isShuttingDown && !s.manualStop) {
-                    console.log(`🔄 Executing reconnect for ${uid} (Attempt ${attempt})`);
                     startSession(uid, null, true, attempt + 1);
                 } else {
-                    console.log(`🚫 Reconnect cancelled for ${uid} (shutting down or manual stop)`);
                     cleanupSession(uid);
                 }
-            } catch (e) {
-                console.error(`❌ Error in reconnect timeout for ${uid}:`, e.message);
-            }
+            } catch (e) {}
         }, delay);
-    } catch (e) {
-        console.error(`❌ Error in handleAutoReconnect for ${uid}:`, e.message);
-    }
+    } catch (e) {}
 }
 
 // ==================== CONNECTION HEALTH MONITORING ====================
 function startHealthMonitoring(uid) {
     try {
         const s = sessions.get(uid);
-        if (!s) {
-            console.error(`❌ Cannot start health monitoring - session ${uid} not found`);
-            return;
-        }
-
-        console.log(`🏥 Starting health monitoring for ${uid}`);
+        if (!s) return;
 
         s.keepaliveTimer = setInterval(() => {
             try {
@@ -698,12 +629,9 @@ function startHealthMonitoring(uid) {
                 s.client.queue('client_cache_status', { enabled: false });
                 s.lastKeepalive = Date.now();
             } catch (e) {
-                console.error(`❌ Keepalive error for ${uid}:`, e.message);
                 try {
                     if (!s.isReconnecting && !s.isCleaningUp && !s.manualStop) handleAutoReconnect(uid, s.reconnectAttempt + 1);
-                } catch (err) {
-                    console.error(`❌ Error triggering reconnect from keepalive for ${uid}:`, err.message);
-                }
+                } catch (err) {}
             }
         }, CONFIG.KEEPALIVE_INTERVAL_MS);
 
@@ -712,28 +640,20 @@ function startHealthMonitoring(uid) {
                 if (!s.connected) return;
                 const lastActivity = Math.max(s.lastPacketTime || 0, s.lastKeepalive || 0);
                 if (Date.now() - lastActivity > CONFIG.STALE_CONNECTION_TIMEOUT_MS) {
-                    console.warn(`⚠️ Stale connection detected for ${uid} (Last activity: ${Math.round((Date.now() - lastActivity)/1000)}s ago)`);
                     try {
                         s.client?.close();
-                    } catch (e) {
-                        console.error(`❌ Error closing stale connection for ${uid}:`, e.message);
-                    }
+                    } catch (e) {}
                     if (!s.isReconnecting && !s.isCleaningUp && !s.manualStop) handleAutoReconnect(uid, s.reconnectAttempt + 1);
                 }
-            } catch (e) {
-                console.error(`❌ Stale check error for ${uid}:`, e.message);
-            }
+            } catch (e) {}
         }, CONFIG.STALE_CONNECTION_TIMEOUT_MS);
-    } catch (e) {
-        console.error(`❌ Error starting health monitoring for ${uid}:`, e.message);
-    }
+    } catch (e) {}
 }
 
 // ==================== USER MANAGEMENT ====================
 function getUser(uid) {
     try {
         if (!uid || typeof uid !== 'string' || !/^\d+$/.test(uid)) {
-            console.error(`❌ Invalid UID format: ${uid}`);
             return { connectionType: "online", bedrockVersion: "auto", _temp: true };
         }
         
@@ -753,7 +673,6 @@ function getUser(uid) {
         
         return users[uid];
     } catch (e) {
-        console.error(`❌ Error in getUser(${uid}):`, e.message);
         return { connectionType: "online", bedrockVersion: "auto", _temp: true };
     }
 }
@@ -768,7 +687,6 @@ function getUserAuthDir(uid) {
         if (!ensureDir(dir)) return null;
         return dir;
     } catch (e) {
-        console.error(`❌ Error getting auth dir for ${uid}:`, e.message);
         return null;
     }
 }
@@ -779,11 +697,8 @@ async function unlinkMicrosoft(uid) {
         const dir = getUserAuthDir(uid);
         if (dir) {
             try { 
-                fs.rmSync(dir, { recursive: true, force: true });
-                console.log(`🗑 Removed auth directory for ${uid}`);
-            } catch (e) {
-                console.error(`❌ Error removing auth dir for ${uid}:`, e.message);
-            }
+                fs.rmSync(dir, { recursive: true, force: true }); 
+            } catch (e) {}
         }
         const u = getUser(uid);
         u.linked = false;
@@ -791,7 +706,6 @@ async function unlinkMicrosoft(uid) {
         await userStore.save();
         return true;
     } catch (e) {
-        console.error(`❌ Error unlinking Microsoft for ${uid}:`, e.message);
         return false;
     }
 }
@@ -810,7 +724,6 @@ function isValidIP(ip) {
         
         return ipv4Regex.test(ip) || ipv6Regex.test(ip) || hostnameRegex.test(ip);
     } catch (e) {
-        console.error("❌ Error in isValidIP:", e.message);
         return false;
     }
 }
@@ -820,7 +733,6 @@ function isValidPort(port) {
         const num = parseInt(port, 10);
         return !isNaN(num) && num > 0 && num <= 65535;
     } catch (e) {
-        console.error("❌ Error in isValidPort:", e.message);
         return false;
     }
 }
@@ -829,10 +741,7 @@ function isValidPort(port) {
 async function logToDiscord(message) {
     try {
         if (!message || isShuttingDown || !discordReady) return;
-        const channel = await client.channels.fetch(CONFIG.LOG_CHANNEL_ID).catch((e) => {
-            console.error("❌ Failed to fetch log channel:", e.message);
-            return null;
-        });
+        const channel = await client.channels.fetch(CONFIG.LOG_CHANNEL_ID).catch(() => null);
         if (!channel) return;
         
         const embed = new EmbedBuilder()
@@ -840,45 +749,28 @@ async function logToDiscord(message) {
             .setDescription(String(message).slice(0, 4096))
             .setTimestamp();
             
-        await channel.send({ embeds: [embed] }).catch((e) => {
-            console.error("❌ Failed to send log message:", e.message);
-        });
-    } catch (e) {
-        console.error("❌ Error in logToDiscord:", e.message);
-    }
+        await channel.send({ embeds: [embed] }).catch(() => {});
+    } catch (e) {}
 }
 
 async function safeReply(interaction, content) {
     try {
-        if (!interaction || !client.isReady()) {
-            console.log("⚠️ safeReply: Interaction or client not ready");
-            return;
-        }
+        if (!interaction || !client.isReady()) return;
         
         const created = interaction.createdTimestamp;
-        if (Date.now() - created > 900000) {
-            console.log("⚠️ safeReply: Interaction too old");
-            return;
-        }
+        if (Date.now() - created > 900000) return;
         
         const payload = typeof content === 'string' ? { content } : content;
         
         if (interaction.replied || interaction.deferred) {
-            await interaction.editReply(payload).catch((e) => {
-                console.error("❌ EditReply error:", e.message);
-            });
+            await interaction.editReply(payload).catch(() => {});
         } else {
             await interaction.reply(payload).catch((err) => {
-                if (err.code === 10062) {
-                    console.log("⚠️ Interaction expired (10062)");
-                    return;
-                }
-                console.error("❌ Reply error:", err.message);
+                if (err.code === 10062) return;
+                console.error("Reply error:", err.message);
             });
         }
-    } catch (e) {
-        console.error("❌ Error in safeReply:", e.message);
-    }
+    } catch (e) {}
 }
 
 // ==================== UI COMPONENTS ====================
@@ -903,18 +795,14 @@ function panelRow(isJava = false) {
             ]
         };
     } catch (e) {
-        console.error("❌ Error in panelRow:", e.message);
-        return { content: "Error generating panel", components: [] };
+        return { content: "Error", components: [] };
     }
 }
 
 // ==================== MICROSOFT AUTHENTICATION ====================
 async function linkMicrosoft(uid, interaction) {
     try {
-        if (!uid || !interaction) {
-            console.error("❌ linkMicrosoft: Missing uid or interaction");
-            return;
-        }
+        if (!uid || !interaction) return;
         
         if (pendingLink.has(uid)) {
             return safeReply(interaction, { content: "⏳ Login already in progress. Check your DMs or use the last code.", flags: [MessageFlags.Ephemeral] });
@@ -932,12 +820,9 @@ async function linkMicrosoft(uid, interaction) {
             try {
                 if (pendingLink.has(uid)) {
                     pendingLink.delete(uid);
-                    console.log(`⏰ Auth timeout for ${uid}`);
                     safeReply(interaction, { content: "⏰ Login timed out after 5 minutes.", flags: [MessageFlags.Ephemeral] }).catch(() => {});
                 }
-            } catch (e) {
-                console.error("❌ Error in auth timeout handler:", e.message);
-            }
+            } catch (e) {}
         }, 300000);
 
         try {
@@ -965,12 +850,8 @@ async function linkMicrosoft(uid, interaction) {
                                 .setURL(uri)
                         );
                         
-                        await interaction.editReply({ content: msg, components: [row] }).catch((e) => {
-                            console.error("❌ Error editing reply with auth code:", e.message);
-                        });
-                    } catch (e) {
-                        console.error("❌ Error in auth callback:", e.message);
-                    }
+                        await interaction.editReply({ content: msg, components: [row] }).catch(() => {});
+                    } catch (e) {}
                 }
             );
 
@@ -980,29 +861,18 @@ async function linkMicrosoft(uid, interaction) {
                     u.linked = true;
                     u.tokenAcquiredAt = Date.now();
                     await userStore.save();
-                    await interaction.followUp({ content: "✅ Microsoft account linked!", flags: [MessageFlags.Ephemeral] }).catch((e) => {
-                        console.error("❌ Error sending auth success followUp:", e.message);
-                    });
-                } catch (e) {
-                    console.error("❌ Error in auth success handler:", e.message);
-                }
+                    await interaction.followUp({ content: "✅ Microsoft account linked!", flags: [MessageFlags.Ephemeral] }).catch(() => {});
+                } catch (e) {}
             }).catch(async (e) => {
                 try {
                     clearTimeout(timeoutId);
                     const errorMsg = e?.message || "Unknown error";
-                    console.error(`❌ Auth failed for ${uid}:`, errorMsg);
-                    await interaction.editReply({ content: `❌ Login failed: ${errorMsg}` }).catch((e) => {
-                        console.error("❌ Error editing reply with auth failure:", e.message);
-                    });
-                } catch (err) {
-                    console.error("❌ Error in auth error handler:", err.message);
-                }
+                    await interaction.editReply({ content: `❌ Login failed: ${errorMsg}` }).catch(() => {});
+                } catch (err) {}
             }).finally(() => { 
                 try {
                     pendingLink.delete(uid);
-                } catch (e) {
-                    console.error("❌ Error cleaning up pendingLink:", e.message);
-                }
+                } catch (e) {}
             });
             
             pendingLink.set(uid, authPromise);
@@ -1011,40 +881,26 @@ async function linkMicrosoft(uid, interaction) {
             try {
                 clearTimeout(timeoutId);
                 pendingLink.delete(uid);
-                console.error("❌ Auth system error:", e.message);
                 safeReply(interaction, { content: "❌ Authentication system error.", flags: [MessageFlags.Ephemeral] });
-            } catch (err) {
-                console.error("❌ Error in auth catch block:", err.message);
-            }
+            } catch (err) {}
         }
-    } catch (e) {
-        console.error("❌ Critical error in linkMicrosoft:", e.message);
-    }
+    } catch (e) {}
 }
 
 // ==================== MAIN SESSION FUNCTION ====================
 async function startSession(uid, interaction, isReconnect = false, reconnectAttempt = 1) {
     try {
-        if (!uid || isShuttingDown) {
-            console.log(`🚫 startSession blocked for ${uid} (shutting down: ${isShuttingDown})`);
-            return;
-        }
-        
-        console.log(`🚀 Starting session for ${uid} (Reconnect: ${isReconnect}, Attempt: ${reconnectAttempt})`);
+        if (!uid || isShuttingDown) return;
         
         const existingSession = sessions.get(uid);
         if (existingSession?.isCleaningUp) {
-            console.log(`⏳ Waiting for cleanup of ${uid}...`);
             try {
                 await new Promise(resolve => setTimeout(resolve, CONFIG.NATIVE_CLEANUP_DELAY_MS + 500));
-            } catch (e) {
-                console.error("❌ Error in cleanup wait:", e.message);
-            }
+            } catch (e) {}
         }
         
         const u = getUser(uid);
         if (!u) {
-            console.error(`❌ User data error for ${uid}`);
             if (!isReconnect) safeReply(interaction, { content: "❌ User data error.", flags: [MessageFlags.Ephemeral] });
             return;
         }
@@ -1059,39 +915,30 @@ async function startSession(uid, interaction, isReconnect = false, reconnectAtte
                     reconnectCount: 0
                 };
                 await sessionStore.save();
-            } catch (e) {
-                console.error("❌ Error saving session store:", e.message);
-            }
+            } catch (e) {}
         }
 
         if (!u.server || !u.server.ip) {
-            console.log(`⚠️ No server configured for ${uid}`);
             if (!isReconnect) safeReply(interaction, { content: "⚠️ Please configure your server settings first.", flags: [MessageFlags.Ephemeral] });
             try {
                 delete activeSessionsStore[uid];
                 await sessionStore.save();
-            } catch (e) {
-                console.error("❌ Error clearing session store:", e.message);
-            }
+            } catch (e) {}
             return;
         }
 
         const { ip, port } = u.server;
         
         if (!isValidIP(ip) || !isValidPort(port)) {
-            console.error(`❌ Invalid server config for ${uid}: ${ip}:${port}`);
             if (!isReconnect) safeReply(interaction, { content: "❌ Invalid server IP or port format.", flags: [MessageFlags.Ephemeral] });
             try {
                 delete activeSessionsStore[uid];
                 await sessionStore.save();
-            } catch (e) {
-                console.error("❌ Error saving after validation fail:", e.message);
-            }
+            } catch (e) {}
             return;
         }
 
         if (sessions.has(uid) && !isReconnect) {
-            console.log(`⚠️ Session conflict for ${uid}`);
             return safeReply(interaction, { 
                 content: "⚠️ **Session Conflict**: Active session already exists. Use `/stop` first.", 
                 flags: [MessageFlags.Ephemeral] 
@@ -1099,13 +946,10 @@ async function startSession(uid, interaction, isReconnect = false, reconnectAtte
         }
 
         if (isReconnect && sessions.has(uid)) {
-            console.log(`🧹 Cleaning up existing session for reconnect ${uid}`);
             await cleanupSession(uid);
             try {
                 await new Promise(resolve => setTimeout(resolve, CONFIG.NATIVE_CLEANUP_DELAY_MS));
-            } catch (e) {
-                console.error("❌ Error in reconnect delay:", e.message);
-            }
+            } catch (e) {}
         }
 
         const connectionEmbed = new EmbedBuilder()
@@ -1126,19 +970,17 @@ async function startSession(uid, interaction, isReconnect = false, reconnectAtte
                     });
                     connectionEmbed.setDescription(`✅ **Server responded! Joining...**\n🌐 **Target:** \`${ip}:${port}\``);
                 } catch (err) {
-                    console.warn(`⚠️ Ping failed for ${ip}:${port} -`, err.message);
                     connectionEmbed.setDescription(`⚠️ **Ping failed, attempting direct connection...**\n🌐 **Target:** \`${ip}:${port}\``);
                 }
                 
                 await safeReply(interaction, { embeds: [connectionEmbed] });
             } catch (err) {
-                console.error("❌ Ping error:", err.message);
+                console.error("Ping error:", err);
             }
         }
 
         const authDir = getUserAuthDir(uid);
         if (!authDir) {
-            console.error(`❌ Auth directory error for ${uid}`);
             if (!isReconnect) safeReply(interaction, { content: "❌ Auth directory error.", flags: [MessageFlags.Ephemeral] });
             return;
         }
@@ -1164,10 +1006,9 @@ async function startSession(uid, interaction, isReconnect = false, reconnectAtte
 
         let mc;
         try {
-            console.log(`🔌 Creating bedrock client for ${uid} -> ${ip}:${port}`);
             mc = bedrock.createClient(opts);
         } catch (err) {
-            console.error("❌ Create client error:", err.message);
+            console.error("Create client error:", err);
             if (!isReconnect) {
                 safeReply(interaction, { content: "❌ Failed to create client.", flags: [MessageFlags.Ephemeral] });
             }
@@ -1195,49 +1036,22 @@ async function startSession(uid, interaction, isReconnect = false, reconnectAtte
         
         try {
             sessions.set(uid, currentSession);
-            console.log(`✅ Session ${uid} registered in Map`);
         } catch (e) {
-            console.error("❌ Error registering session:", e.message);
             return;
         }
-
-        // ==================== BEDROCK CLIENT LISTENERS ====================
-        
-        // NEW: Connection established (TCP level)
-        mc.on('connect', () => {
-            console.log(`[${uid}] 🔌 TCP Connected to ${ip}:${port}`);
-        });
-
-        // NEW: Login packet exchange complete
-        mc.on('login', () => {
-            console.log(`[${uid}] 📤 Login packet exchanged`);
-        });
 
         mc.on('disconnect', (packet) => {
             try {
                 const reason = packet?.reason || "Unknown reason";
-                console.log(`[${uid}] 📴 Server requested disconnect: ${reason}`);
+                console.log(`Server requested disconnect: ${reason}`);
                 logToDiscord(`⚠️ Bot of <@${uid}> was kicked: ${reason}`);
                 
                 if (reason.includes("wait") || reason.includes("etwas") || reason.includes("before")) {
-                    console.log(`[${uid}] ⛔ Rate limited by server, stopping reconnects`);
                     currentSession.manualStop = true;
                     delete activeSessionsStore[uid];
-                    sessionStore.save().catch(e => console.error("❌ Error saving after rate limit:", e.message));
+                    sessionStore.save();
                 }
-            } catch (e) {
-                console.error(`[${uid}] ❌ Error in disconnect handler:`, e.message);
-            }
-        });
-
-        // NEW: Session end listener
-        mc.on('session_end', (reason) => {
-            console.log(`[${uid}] 🏁 Session ended:`, reason);
-        });
-
-        // NEW: Connection error (pre-spawn)
-        mc.on('conn_error', (err) => {
-            console.error(`[${uid}] 💥 Connection Error:`, err.message);
+            } catch (e) {}
         });
 
         const performAntiAfk = () => {
@@ -1276,39 +1090,27 @@ async function startSession(uid, interaction, isReconnect = false, reconnectAtte
                                             face: 0
                                         });
                                     }
-                                } catch (e) {
-                                    console.error(`[${uid}] ❌ Error in anti-AFK reset:`, e.message);
-                                }
+                                } catch (e) {}
                             }, Math.random() * 2000 + 2000);
                         }
                     }
-                } catch (e) {
-                    console.error(`[${uid}] ❌ Error in anti-AFK action:`, e.message);
-                }
+                } catch (e) {}
 
                 const nextDelay = Math.random() * 12000 + 8000;
                 s.afkTimeout = setTimeout(performAntiAfk, nextDelay);
-            } catch (e) {
-                console.error(`[${uid}] ❌ Error in performAntiAfk:`, e.message);
-            }
+            } catch (e) {}
         };
 
         mc.on("spawn", () => {
             try {
-                console.log(`[${uid}] 🎮 Spawned in world`);
                 logToDiscord(`✅ Bot of <@${uid}> spawned on **${ip}:${port}**` + (isReconnect ? ` (Attempt ${reconnectAttempt})` : ""));
                 if (!isReconnect) safeReply(interaction, { content: `🟢 **Online** on \`${ip}:${port}\``, embeds: [] });
-            } catch (e) {
-                console.error(`[${uid}] ❌ Error in spawn handler:`, e.message);
-            }
+            } catch (e) {}
         });
 
         mc.on("start_game", (packet) => {
             try {
-                if (!packet || !currentSession) {
-                    console.error(`[${uid}] ⚠️ start_game packet or session missing`);
-                    return;
-                }
+                if (!packet || !currentSession) return;
                 currentSession.entityId = packet.runtime_entity_id;
                 currentSession.connected = true;
                 currentSession.isReconnecting = false;
@@ -1318,74 +1120,51 @@ async function startSession(uid, interaction, isReconnect = false, reconnectAtte
                 try {
                     if (activeSessionsStore[uid]) {
                         activeSessionsStore[uid].lastConnected = Date.now();
-                        sessionStore.save().catch(e => console.error("❌ Error saving start_game state:", e.message));
+                        sessionStore.save();
                     }
-                } catch (e) {
-                    console.error(`[${uid}] ❌ Error updating session store:`, e.message);
-                }
+                } catch (e) {}
 
                 startHealthMonitoring(uid);
                 performAntiAfk();
-            } catch (e) {
-                console.error(`[${uid}] ❌ Error in start_game handler:`, e.message);
-            }
+            } catch (e) {}
         });
 
         mc.on('packet', (packet) => {
             try {
                 if (currentSession) {
                     currentSession.lastPacketTime = Date.now();
-                    currentSession.packetsReceived++;
                 }
-            } catch (e) {
-                console.error(`[${uid}] ❌ Error in packet handler:`, e.message);
-            }
+            } catch (e) {}
         });
 
         mc.on("error", (e) => {
             try {
-                console.error(`[${uid}] ❌ Bot error:`, e?.message || e);
-                crashLogger.log(`BOT_ERROR_${uid}`, e);
+                console.error(`Bot error for ${uid}:`, e?.message);
                 if (!currentSession.manualStop && !currentSession.isReconnecting && !currentSession.isCleaningUp) {
                     handleAutoReconnect(uid, currentSession.reconnectAttempt);
                 }
                 logToDiscord(`❌ Bot of <@${uid}> error: \`${e?.message || 'Unknown error'}\``);
-            } catch (err) {
-                console.error(`[${uid}] ❌ Error in error handler:`, err.message);
-            }
+            } catch (err) {}
         });
 
         mc.on("close", () => {
             try {
-                console.log(`[${uid}] 🔒 Connection closed`);
+                console.log(`Connection closed for ${uid}`);
                 if (!currentSession.manualStop && !currentSession.isReconnecting && !currentSession.isCleaningUp) {
                     handleAutoReconnect(uid, currentSession.reconnectAttempt);
                 } else {
                     try {
                         logToDiscord(`🔌 Bot of <@${uid}> disconnected manually.`);
-                    } catch (e) {
-                        console.error(`[${uid}] ❌ Error logging manual disconnect:`, e.message);
-                    }
+                    } catch (e) {}
                 }
-            } catch (e) {
-                console.error(`[${uid}] ❌ Error in close handler:`, e.message);
-            }
+            } catch (e) {}
         });
         
         mc.on('packet_error', (err) => {
-            console.error(`[${uid}] 📦 Packet decode error:`, err?.message);
-            debugLogger.log('PACKET_ERROR', { uid, error: err?.message, stack: err?.stack });
+            console.error(`Packet error for ${uid}:`, err?.message);
         });
-
-        // NEW: Kick listener (explicit kick packet)
-        mc.on('kick', (reason) => {
-            console.warn(`[${uid}] 👢 Kicked from server:`, reason);
-            logToDiscord(`👢 Bot of <@${uid}> was kicked: ${reason}`);
-        });
-
     } catch (e) {
-        console.error(`[${uid}] ❌ Critical error in startSession:`, e.message);
-        crashLogger.log('START_SESSION_CRITICAL', e);
+        console.error("Start session error:", e);
     }
 }
 
@@ -1394,7 +1173,8 @@ client.on("ready", async () => {
     try {
         discordReady = true;
         discordReconnectAttempts = 0;
-        console.log("✅ Discord client ready");
+        console.log("✅ [STEP 9/10] Discord ready handler executing...");
+        console.log(`🤖 Bot User: ${client.user?.tag}`);
 
         if (isFirstReady) {
             isFirstReady = false;
@@ -1406,7 +1186,7 @@ client.on("ready", async () => {
                     new SlashCommandBuilder().setName("refresh").setDescription("Check Discord connection status")
                 ];
                 await client.application?.commands?.set(cmds);
-                console.log("✅ Slash commands registered");
+                console.log("✅ [STEP 10/10] Slash commands registered");
             } catch (e) {
                 console.error("❌ Failed to register commands:", e.message);
             }
@@ -1417,11 +1197,9 @@ client.on("ready", async () => {
                         const mem = process.memoryUsage();
                         const mb = mem.rss / 1024 / 1024;
                         if (mb > CONFIG.MAX_MEMORY_MB) {
-                            console.warn(`⚠️ High memory usage: ${mb.toFixed(2)}MB (limit: ${CONFIG.MAX_MEMORY_MB}MB)`);
+                            console.warn(`High memory usage: ${mb.toFixed(2)}MB`);
                         }
-                    } catch (e) {
-                        console.error("❌ Error in memory check:", e.message);
-                    }
+                    } catch (e) {}
                 }, CONFIG.MEMORY_CHECK_INTERVAL_MS);
             }
 
@@ -1436,16 +1214,12 @@ client.on("ready", async () => {
                                 if (!isShuttingDown) {
                                     startSession(uid, null, true);
                                 }
-                            } catch (e) {
-                                console.error(`❌ Error restoring session ${uid}:`, e.message);
-                            }
+                            } catch (e) {}
                         }, delay);
                         delay += 8000;
                     }
                 }
             }
-        } else {
-            console.log("🔄 Discord reconnected (not first ready)");
         }
     } catch (e) {
         console.error("❌ Error in ready event:", e.message);
@@ -1457,10 +1231,7 @@ client.on(Events.InteractionCreate, async (i) => {
     try {
         if (!i || isShuttingDown) return;
         
-        if (!i.user?.id) {
-            console.log("⚠️ Interaction without user ID");
-            return;
-        }
+        if (!i.user?.id) return;
         
         const uid = i.user.id;
         
@@ -1471,9 +1242,7 @@ client.on(Events.InteractionCreate, async (i) => {
                     return safeReply(i, { content: "⏳ Please wait a moment before clicking again.", flags: [MessageFlags.Ephemeral] });
                 }
                 i.user.lastInteraction = Date.now();
-            } catch (e) {
-                console.error("❌ Error in rate limiting:", e.message);
-            }
+            } catch (e) {}
         }
 
         if (i.isChatInputCommand()) {
@@ -1491,9 +1260,7 @@ client.on(Events.InteractionCreate, async (i) => {
                         flags: [MessageFlags.Ephemeral] 
                     });
                 }
-            } catch (e) {
-                console.error("❌ Error handling command:", e.message);
-            }
+            } catch (e) {}
         }
 
         if (i.isButton()) {
@@ -1513,9 +1280,7 @@ client.on(Events.InteractionCreate, async (i) => {
                     if (sessions.has(uid)) {
                         return safeReply(i, { content: "⚠️ **Session Conflict**: Active session exists.", flags: [MessageFlags.Ephemeral] });
                     }
-                    await i.deferReply({ flags: [MessageFlags.Ephemeral] }).catch((e) => {
-                        console.error("❌ Error deferring start_bedrock:", e.message);
-                    });
+                    await i.deferReply({ flags: [MessageFlags.Ephemeral] }).catch(() => {});
                     const embed = new EmbedBuilder()
                         .setTitle("Bedrock Connection")
                         .setDescription("Start bot?")
@@ -1524,18 +1289,14 @@ client.on(Events.InteractionCreate, async (i) => {
                         new ButtonBuilder().setCustomId("confirm_start").setLabel("Start").setStyle(ButtonStyle.Success),
                         new ButtonBuilder().setCustomId("cancel").setLabel("Cancel").setStyle(ButtonStyle.Secondary)
                     );
-                    return i.editReply({ embeds: [embed], components: [row] }).catch((e) => {
-                        console.error("❌ Error editing start reply:", e.message);
-                    });
+                    return i.editReply({ embeds: [embed], components: [row] }).catch(() => {});
                 }
 
                 if (i.customId === "start_java") {
                     if (sessions.has(uid)) {
                         return safeReply(i, { content: "⚠️ **Session Conflict**: Active session exists.", flags: [MessageFlags.Ephemeral] });
                     }
-                    await i.deferReply({ flags: [MessageFlags.Ephemeral] }).catch((e) => {
-                        console.error("❌ Error deferring start_java:", e.message);
-                    });
+                    await i.deferReply({ flags: [MessageFlags.Ephemeral] }).catch(() => {});
                     const embed = new EmbedBuilder()
                         .setTitle("⚙️ Java Compatibility Check")
                         .setDescription("For a successful connection to a Java server, ensure the following plugins are installed.")
@@ -1545,46 +1306,32 @@ client.on(Events.InteractionCreate, async (i) => {
                         new ButtonBuilder().setCustomId("confirm_start").setLabel("Confirm & Start").setStyle(ButtonStyle.Success),
                         new ButtonBuilder().setCustomId("cancel").setLabel("Cancel").setStyle(ButtonStyle.Secondary)
                     );
-                    return i.editReply({ embeds: [embed], components: [row] }).catch((e) => {
-                        console.error("❌ Error editing java reply:", e.message);
-                    });
+                    return i.editReply({ embeds: [embed], components: [row] }).catch(() => {});
                 }
 
                 if (i.customId === "confirm_start") {
-                    await i.deferUpdate().catch((e) => {
-                        console.error("❌ Error deferring confirm:", e.message);
-                    });
+                    await i.deferUpdate().catch(() => {});
                     return startSession(uid, i, false);
                 }
 
                 if (i.customId === "cancel") {
-                    await i.deferUpdate().catch((e) => {
-                        console.error("❌ Error deferring cancel:", e.message);
-                    });
-                    return i.editReply({ content: "❌ Cancelled.", embeds: [], components: [] }).catch((e) => {
-                        console.error("❌ Error editing cancel:", e.message);
-                    });
+                    await i.deferUpdate().catch(() => {});
+                    return i.editReply({ content: "❌ Cancelled.", embeds: [], components: [] }).catch(() => {});
                 }
 
                 if (i.customId === "stop") {
-                    await i.deferReply({ flags: [MessageFlags.Ephemeral] }).catch((e) => {
-                        console.error("❌ Error deferring stop:", e.message);
-                    });
+                    await i.deferReply({ flags: [MessageFlags.Ephemeral] }).catch(() => {});
                     const ok = await stopSession(uid);
                     return safeReply(i, { content: ok ? "⏹ **Session Terminated.**" : "No active sessions.", flags: [MessageFlags.Ephemeral] });
                 }
 
                 if (i.customId === "link") {
-                    await i.deferReply({ flags: [MessageFlags.Ephemeral] }).catch((e) => {
-                        console.error("❌ Error deferring link:", e.message);
-                    });
+                    await i.deferReply({ flags: [MessageFlags.Ephemeral] }).catch(() => {});
                     return linkMicrosoft(uid, i);
                 }
 
                 if (i.customId === "unlink") {
-                    await i.deferReply({ flags: [MessageFlags.Ephemeral] }).catch((e) => {
-                        console.error("❌ Error deferring unlink:", e.message);
-                    });
+                    await i.deferReply({ flags: [MessageFlags.Ephemeral] }).catch(() => {});
                     await unlinkMicrosoft(uid);
                     return safeReply(i, { content: "🗑 Unlinked Microsoft account.", flags: [MessageFlags.Ephemeral] });
                 }
@@ -1617,9 +1364,7 @@ client.on(Events.InteractionCreate, async (i) => {
                     );
                     return i.showModal(modal);
                 }
-            } catch (e) {
-                console.error("❌ Error handling button interaction:", e.message);
-            }
+            } catch (e) {}
         }
 
         if (i.isModalSubmit() && i.customId === "settings_modal") {
@@ -1645,45 +1390,42 @@ client.on(Events.InteractionCreate, async (i) => {
                 await userStore.save();
                 return safeReply(i, { content: `✅ Saved: **${ip}:${port}**`, flags: [MessageFlags.Ephemeral] });
             } catch (e) {
-                console.error("❌ Error handling modal submit:", e.message);
                 return safeReply(i, { content: "❌ Failed to save settings.", flags: [MessageFlags.Ephemeral] });
             }
         }
-    } catch (e) {
-        console.error("❌ Critical error in InteractionCreate:", e.message);
-        crashLogger.log('INTERACTION_CREATE_ERROR', e);
-    }
+    } catch (e) {}
 });
 
 // ==================== STARTUP ====================
-console.log("🚀 Starting bot...");
+console.log("🚀 [STEP 7/10] Attempting Discord login...");
 
-client.login(DISCORD_TOKEN).catch((err) => {
+client.login(DISCORD_TOKEN).then(() => {
+    console.log("✅ Login promise resolved - connection in progress...");
+}).catch((err) => {
     console.error("❌ Initial login failed:", err.message);
+    console.error("Error code:", err.code);
+    console.error("Full error:", err);
     crashLogger.log('INITIAL_LOGIN_FAILED', err);
     process.exit(1);
 });
 
-// Heartbeat logging with error catching
+// Heartbeat
 setInterval(() => {
     try {
         console.log(`💓 Heartbeat | Sessions: ${sessions.size} | Discord: ${discordReady ? 'Connected' : 'Disconnected'} | Uptime: ${Math.floor(process.uptime() / 60)}m`);
-    } catch (e) {
-        console.error("❌ Heartbeat error:", e.message);
-    }
+    } catch (e) {}
 }, 60000);
 
-// Discord refresh with comprehensive error catching
-setInterval(() => {
-    try {
-        if (!isShuttingDown && client.isReady()) {
-            console.log("🔄 Scheduled Discord WebSocket refresh (2min interval)");
-            client.ws.destroy();
-        }
-    } catch (e) {
-        console.error("❌ Discord refresh error:", e.message);
-        crashLogger.log('DISCORD_REFRESH_ERROR', e);
-    }
-}, CONFIG.DISCORD_REFRESH_INTERVAL_MS);
+console.log("⏳ Waiting for Discord connection...");
 
-console.log("✅ Bot initialization complete");
+// Jos 30 sekunnissa ei tapahdu mitään, force exit
+setTimeout(() => {
+    if (!discordReady) {
+        console.error("🚨 TIMEOUT: Discord connection failed within 30 seconds");
+        console.error("Check:");
+        console.error("1. Is DISCORD_TOKEN correct?");
+        console.error("2. Is your internet connection working?");
+        console.error("3. Are Discord's servers online?");
+        process.exit(1);
+    }
+}, 30000);
