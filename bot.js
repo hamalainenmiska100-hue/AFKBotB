@@ -593,13 +593,11 @@ function panelRow(isJava = false) {
                 new ButtonBuilder().setCustomId(startCustomId).setLabel("▶ Start").setStyle(ButtonStyle.Success),
                 new ButtonBuilder().setCustomId("stop").setLabel("⏹ Stop").setStyle(ButtonStyle.Danger),
                 new ButtonBuilder().setCustomId("settings").setLabel("⚙ Settings").setStyle(ButtonStyle.Secondary)
-            ),
-            new ActionRowBuilder().addComponents(
-                new ButtonBuilder().setCustomId("refresh_discord").setLabel("🔄 Refresh Connection").setStyle(ButtonStyle.Primary)
             )
         ]
     };
 }
+
 
 // ==================== MICROSOFT AUTHENTICATION ====================
 async function linkMicrosoft(uid, interaction) {
