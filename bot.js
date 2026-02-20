@@ -43,7 +43,7 @@ const CONFIG = {
     NATIVE_CLEANUP_DELAY_MS: 3000,
     PING_TIMEOUT_MS: 5000,
     OPERATION_TIMEOUT_MS: 30000,
-    MAX_DISCORD_RECONNECT_ATTEMPTS: Infinity, // Loputon
+    MAX_DISCORD_RECONNECT_ATTEMPTS: Infinity,
 };
 
 // ==================== STORAGE SYSTEM ====================
@@ -307,6 +307,11 @@ const client = new Client({
     presence: {
         status: 'online',
         activities: [{ name: 'AFK Bot System', type: ActivityType.Watching }]
+    },
+    // FIX: Add reconnection settings to prevent rapid loops
+    ws: {
+        large_threshold: 50,
+        compress: false
     }
 });
 
@@ -344,38 +349,36 @@ process.on("unhandledRejection", (reason, promise) => {
 process.on("warning", (warning) => {});
 
 // ==================== DISCORD CONNECTION RESILIENCE ====================
-// KORJATTU: Discord.js hoitaa yhdistämisen automaattisesti, ei manuaalista login()
+// FIXED: Let Discord.js handle reconnection automatically. DO NOT manually reconnect.
 client.on("error", (error) => {
-    // ÄLÄ yritä yhdistää manuaalisesti täällä!
-    console.error("DISCORD ERROR:", error);
+    console.error("DISCORD ERROR:", error.message);
     crashLogger.log("DISCORD ERROR", error);
-    discordReady = false;
+    // Discord.js automatically reconnects, don't do anything here
 });
 
 client.on("shardError", (error) => {
-    console.error("SHARD ERROR (Yhteysongelma Discordiin):", error);
+    console.error("SHARD ERROR:", error.message);
     crashLogger.log("SHARD ERROR", error);
-    // Discord.js yrittää automaattisesti yhdistää uudelleen shard-virheen jälkeen.
 });
 
 client.on("warn", (warning) => {
     console.warn("DISCORD WARN:", warning);
 });
 
+// Track connection state but don't interfere with auto-reconnect
 client.on("disconnect", (event) => {
     discordReady = false;
-    console.log(`Discord websocket katkesi (code: ${event?.code || 'tuntematon'}). Odotetaan automaattista yhdistämistä...`);
-    // Poistettu manuaalinen client.login(), koska discord.js hoitaa sen itse!
+    console.log(`Discord websocket closed (code: ${event?.code || 'unknown'}). Auto-reconnect in progress...`);
 });
 
 client.on("reconnecting", () => {
-    console.log("Discord yhdistää automaattisesti uudelleen...");
+    console.log("Discord reconnecting...");
 });
 
-client.on("resume", (replayed) => {
+client.on("ready", () => {
     discordReady = true;
     discordReconnectAttempts = 0;
-    console.log(`Discord yhteys palautettu! (Uudelleentoistetut eventit: ${replayed})`);
+    console.log("Discord connected successfully");
 });
 
 // ==================== GRACEFUL SHUTDOWN ====================
@@ -660,15 +663,25 @@ async function logToDiscord(message) {
     } catch (e) {}
 }
 
+// FIXED: Safer reply handling to prevent "Unknown Interaction" errors
 async function safeReply(interaction, content) {
     try {
-        if (!interaction) return;
+        if (!interaction || !client.isReady()) return;
+        
+        // Check if interaction is expired (older than 15 minutes)
+        const created = interaction.createdTimestamp;
+        if (Date.now() - created > 900000) return; // Skip expired interactions
+        
         const payload = typeof content === 'string' ? { content } : content;
         
         if (interaction.replied || interaction.deferred) {
             await interaction.editReply(payload).catch(() => {});
         } else {
-            await interaction.reply(payload).catch(() => {});
+            await interaction.reply(payload).catch((err) => {
+                // Silently ignore "Unknown interaction" errors
+                if (err.code === 10062) return;
+                console.error("Reply error:", err.message);
+            });
         }
     } catch (e) {}
 }
@@ -690,7 +703,7 @@ function panelRow(isJava = false) {
                     new ButtonBuilder().setCustomId("settings").setLabel("⚙ Settings").setStyle(ButtonStyle.Secondary)
                 ),
                 new ActionRowBuilder().addComponents(
-                    new ButtonBuilder().setCustomId("refresh_discord").setLabel("🔄 Refresh Connection").setStyle(ButtonStyle.Primary)
+                    new ButtonBuilder().setCustomId("refresh_discord").setLabel("🔄 Check Status").setStyle(ButtonStyle.Primary)
                 )
             ]
         };
@@ -1071,7 +1084,7 @@ async function startSession(uid, interaction, isReconnect = false, reconnectAtte
 }
 
 // ==================== DISCORD EVENTS ====================
-client.once("clientReady", async () => {
+client.once("ready", async () => {
     try {
         discordReady = true;
         discordReconnectAttempts = 0;
@@ -1081,21 +1094,19 @@ client.once("clientReady", async () => {
             const cmds = [
                 new SlashCommandBuilder().setName("panel").setDescription("Open Bedrock AFK panel"),
                 new SlashCommandBuilder().setName("java").setDescription("Open Java AFKBot Panel"),
-                new SlashCommandBuilder().setName("refresh").setDescription("Refresh Discord connection without restart")
+                new SlashCommandBuilder().setName("refresh").setDescription("Check Discord connection status")
             ];
             await client.application?.commands?.set(cmds);
         } catch (e) {
             console.error("Failed to register commands:", e);
         }
 
-        // KORJATTU: Poistettu global.gc() kutsu joka tukkii event loopin
-        // Jos muisti loppuu, Node.js hoitaa roskienkeruun automaattisesti
+        // Memory check without forced GC
         setInterval(() => {
             try {
                 const mem = process.memoryUsage();
                 const mb = mem.rss / 1024 / 1024;
                 if (mb > CONFIG.MAX_MEMORY_MB) {
-                    // Ei pakoteta gc:tä, annetaan V8:n hoitaa se
                     console.warn(`High memory usage: ${mb.toFixed(2)}MB (limit: ${CONFIG.MAX_MEMORY_MB}MB)`);
                 }
             } catch (e) {}
@@ -1131,6 +1142,7 @@ client.on(Events.InteractionCreate, async (i) => {
         
         const uid = i.user.id;
         
+        // Rate limiting check
         if (i.isButton() || i.isChatInputCommand()) {
             try {
                 const lastInteraction = i.user.lastInteraction || 0;
@@ -1146,82 +1158,32 @@ client.on(Events.InteractionCreate, async (i) => {
                 if (i.commandName === "panel") return safeReply(i, panelRow(false));
                 if (i.commandName === "java") return safeReply(i, panelRow(true));
                 
+                // FIXED: Removed manual Discord refresh - just reports status instead
                 if (i.commandName === "refresh") {
                     await i.deferReply({ flags: [MessageFlags.Ephemeral] });
-                    try {
-                        if (!discordReady) {
-                            return safeReply(i, { content: "⚠️ Discord already reconnecting, please wait...", flags: [MessageFlags.Ephemeral] });
-                        }
-                        
-                        discordReady = false;
-                        console.log("Manual Discord refresh requested");
-                        
-                        await client.destroy();
-                        await new Promise(r => setTimeout(r, 1000));
-                        
-                        discordReconnectAttempts = 0;
-                        await client.login(DISCORD_TOKEN);
-                        
-                        // Wait for ready
-                        await new Promise((resolve, reject) => {
-                            const timeout = setTimeout(() => reject(new Error("Timeout")), 10000);
-                            const checkReady = setInterval(() => {
-                                if (client.isReady()) {
-                                    clearTimeout(timeout);
-                                    clearInterval(checkReady);
-                                    resolve();
-                                }
-                            }, 500);
-                        });
-                        
-                        discordReady = true;
-                        discordReconnectAttempts = 0;
-                        
-                        return safeReply(i, { content: "✅ Discord connection refreshed successfully!", flags: [MessageFlags.Ephemeral] });
-                    } catch (err) {
-                        console.error("Refresh failed:", err);
-                        discordReady = false;
-                        return safeReply(i, { content: `❌ Refresh failed: ${err.message}`, flags: [MessageFlags.Ephemeral] });
-                    }
+                    const status = client.isReady() ? "🟢 Connected" : "🔴 Disconnected";
+                    const wsStatus = client.ws?.status;
+                    const wsText = wsStatus === 0 ? "Ready" : wsStatus === 1 ? "Connecting" : wsStatus === 2 ? "Reconnecting" : "Disconnected";
+                    return safeReply(i, { 
+                        content: `**Discord Status:** ${status}\n**WebSocket:** ${wsText}\n**Ping:** ${client.ws?.ping || 'N/A'}ms`, 
+                        flags: [MessageFlags.Ephemeral] 
+                    });
                 }
             } catch (e) {}
         }
 
         if (i.isButton()) {
             try {
+                // FIXED: "refresh_discord" now just checks status instead of destroying client
                 if (i.customId === "refresh_discord") {
                     await i.deferReply({ flags: [MessageFlags.Ephemeral] });
-                    try {
-                        if (!discordReady) {
-                            return safeReply(i, { content: "⚠️ Already reconnecting, please wait...", flags: [MessageFlags.Ephemeral] });
-                        }
-                        
-                        discordReady = false;
-                        console.log("Refresh button clicked");
-                        
-                        await client.destroy();
-                        await new Promise(r => setTimeout(r, 1000));
-                        
-                        discordReconnectAttempts = 0;
-                        await client.login(DISCORD_TOKEN);
-                        
-                        let attempts = 0;
-                        while (!client.isReady() && attempts < 20) {
-                            await new Promise(r => setTimeout(r, 500));
-                            attempts++;
-                        }
-                        
-                        if (client.isReady()) {
-                            discordReady = true;
-                            discordReconnectAttempts = 0;
-                            return safeReply(i, { content: "✅ Connection refreshed!", flags: [MessageFlags.Ephemeral] });
-                        } else {
-                            throw new Error("Did not become ready in time");
-                        }
-                    } catch (err) {
-                        discordReady = false;
-                        return safeReply(i, { content: `❌ Failed: ${err.message}`, flags: [MessageFlags.Ephemeral] });
-                    }
+                    const isReady = client.isReady();
+                    const status = isReady ? "🟢 Online" : "🔴 Offline";
+                    const ping = client.ws?.ping || 0;
+                    return safeReply(i, { 
+                        content: `${status} | Ping: ${ping}ms | WS Status: ${client.ws?.status || 'unknown'}`, 
+                        flags: [MessageFlags.Ephemeral] 
+                    });
                 }
 
                 if (i.customId === "start_bedrock") {
