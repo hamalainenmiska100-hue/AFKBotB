@@ -31,7 +31,7 @@ const CONFIG = {
     LOG_CHANNEL_ID: "1464615030111731753",
     SAVE_DEBOUNCE_MS: 100,
     AUTO_SAVE_INTERVAL_MS: 15000,
-    MAX_RECONNECT_ATTEMPTS: Infinity,
+    MAX_RECONNECT_ATTEMPTS: 10,
     RECONNECT_BASE_DELAY_MS: 10000,
     RECONNECT_MAX_DELAY_MS: 300000,
     CONNECTION_TIMEOUT_MS: 30000,
@@ -41,14 +41,13 @@ const CONFIG = {
     MAX_MEMORY_MB: 1536,
     SESSION_HEARTBEAT_INTERVAL_MS: 30000,
     TOKEN_REFRESH_BUFFER_MS: 300000,
-    NATIVE_CLEANUP_DELAY_MS: 3000,
+    NATIVE_CLEANUP_DELAY_MS: 5000,
     PING_TIMEOUT_MS: 5000,
     OPERATION_TIMEOUT_MS: 30000,
-    MAX_DISCORD_RECONNECT_ATTEMPTS: Infinity,
+    MAX_DISCORD_RECONNECT_ATTEMPTS: 5,
 };
 
 // ==================== FLY.IO VOLUME PATH ====================
-// Use /data for Fly.io persistent volume
 const DATA = process.env.FLY_VOLUME_PATH || "/data";
 const AUTH_ROOT = path.join(DATA, "auth");
 const STORE = path.join(DATA, "users.json");
@@ -225,7 +224,6 @@ class PersistentStore {
 
             const jsonString = JSON.stringify(this.data, null, 2);
             
-            // Atomic write
             await fs.writeFile(`${this.filePath}.tmp`, jsonString);
             await fs.rename(`${this.filePath}.tmp`, this.filePath);
             
@@ -260,7 +258,6 @@ let users = {};
 let activeSessionsStore = {};
 let storesInitialized = false;
 
-// Initialize stores synchronously before bot starts
 async function initializeStores() {
     await ensureDir(DATA);
     await ensureDir(AUTH_ROOT);
@@ -277,6 +274,7 @@ const lastMsa = new Map();
 let isShuttingDown = false;
 let discordReady = false;
 let discordReconnectAttempts = 0;
+const cleanupLocks = new Set();
 
 // ==================== ENHANCED DISCORD CLIENT ====================
 const client = new Client({
@@ -357,7 +355,6 @@ async function gracefulShutdown(signal) {
     const forceExit = setTimeout(() => process.exit(1), 15000);
     
     try {
-        // Save all session data before cleanup
         await saveAllSessionData();
         await Promise.all([
             userStore.save(true),
@@ -382,7 +379,6 @@ async function saveSessionData(uid) {
     const u = getUser(uid);
     if (!u) return;
     
-    // Save complete user data for rejoin
     activeSessionsStore[uid] = {
         startedAt: Date.now(),
         server: u.server,
@@ -413,30 +409,77 @@ async function clearSessionData(uid) {
 // ==================== SESSION MANAGEMENT ====================
 async function cleanupSession(uid) {
     if (!uid) return;
-    const s = sessions.get(uid);
-    if (!s || s.isCleaningUp) return;
-
-    s.isCleaningUp = true;
     
-    // Clear all timers immediately
-    const timers = ['reconnectTimer', 'afkTimeout', 'keepaliveTimer', 'staleCheckTimer', 'tokenRefreshTimer'];
-    timers.forEach(timer => {
-        if (s[timer]) {
-            clearTimeout(s[timer]);
-            clearInterval(s[timer]);
-            s[timer] = null;
-        }
-    });
-
-    if (s.client) {
-        s.client.removeAllListeners();
-        try {
-            s.client.close();
-        } catch (e) {}
-        s.client = null;
+    if (cleanupLocks.has(uid)) {
+        console.log(`Cleanup already in progress for ${uid}, skipping...`);
+        return;
     }
+    cleanupLocks.add(uid);
     
-    sessions.delete(uid);
+    try {
+        const s = sessions.get(uid);
+        if (!s) return;
+
+        s.isCleaningUp = true;
+        s.manualStop = true;
+        
+        const timers = ['reconnectTimer', 'afkTimeout', 'keepaliveTimer', 'staleCheckTimer', 'tokenRefreshTimer'];
+        timers.forEach(timer => {
+            if (s[timer]) {
+                clearTimeout(s[timer]);
+                clearInterval(s[timer]);
+                s[timer] = null;
+            }
+        });
+
+        await new Promise(resolve => setTimeout(resolve, 100));
+
+        if (s.client) {
+            try {
+                s.client.removeAllListeners('packet');
+                s.client.removeAllListeners('spawn');
+                s.client.removeAllListeners('start_game');
+                
+                await new Promise((resolve) => {
+                    const client = s.client;
+                    if (!client) {
+                        resolve();
+                        return;
+                    }
+                    
+                    const timeout = setTimeout(() => {
+                        console.log(`Force closing client for ${uid}`);
+                        resolve();
+                    }, 2000);
+                    
+                    try {
+                        client.once('close', () => {
+                            clearTimeout(timeout);
+                            resolve();
+                        });
+                        client.close();
+                    } catch (e) {
+                        clearTimeout(timeout);
+                        resolve();
+                    }
+                });
+                
+            } catch (e) {
+                console.error(`Error closing client for ${uid}:`, e);
+            } finally {
+                s.client = null;
+            }
+        }
+        
+        sessions.delete(uid);
+        
+        if (global.gc) {
+            global.gc();
+        }
+        
+    } finally {
+        cleanupLocks.delete(uid);
+    }
 }
 
 async function cleanupAllSessions() {
@@ -465,15 +508,16 @@ async function stopSession(uid) {
 }
 
 // ==================== RECONNECTION SYSTEM ====================
-function handleAutoReconnect(uid, attempt = 1) {
+async function handleAutoReconnect(uid, attempt = 1) {
     if (!uid || isShuttingDown) return;
+    
     const s = sessions.get(uid);
-    if (!s || s.manualStop || s.isReconnecting || s.isCleaningUp) return;
+    if (!s || s.manualStop || s.isCleaningUp) return;
 
     if (attempt > CONFIG.MAX_RECONNECT_ATTEMPTS) {
         logToDiscord(`Bot of <@${uid}> stopped after max failed attempts.`);
-        cleanupSession(uid);
-        clearSessionData(uid);
+        await cleanupSession(uid);
+        await clearSessionData(uid);
         return;
     }
 
@@ -491,11 +535,16 @@ function handleAutoReconnect(uid, attempt = 1) {
     
     logToDiscord(`Bot of <@${uid}> disconnected. Reconnecting in ${Math.round(delay/1000)}s (Attempt ${attempt})...`);
 
-    s.reconnectTimer = setTimeout(() => {
+    s.reconnectTimer = setTimeout(async () => {
         if (!isShuttingDown && !s.manualStop) {
-            startSession(uid, null, true, attempt + 1);
+            await cleanupSession(uid);
+            await new Promise(resolve => setTimeout(resolve, CONFIG.NATIVE_CLEANUP_DELAY_MS));
+            
+            if (!isShuttingDown) {
+                await startSession(uid, null, true, attempt + 1);
+            }
         } else {
-            cleanupSession(uid);
+            await cleanupSession(uid);
         }
     }, delay);
 }
@@ -508,23 +557,29 @@ function startHealthMonitoring(uid) {
     s.keepaliveTimer = setInterval(() => {
         try {
             if (!s.connected || !s.client) return;
+            if (s.isCleaningUp) return;
+            
             s.client.queue('client_cache_status', { enabled: false });
             s.lastKeepalive = Date.now();
         } catch (e) {
             if (!s.isReconnecting && !s.isCleaningUp && !s.manualStop) {
-                handleAutoReconnect(uid, s.reconnectAttempt + 1);
+                handleAutoReconnect(uid, (s.reconnectAttempt || 0) + 1);
             }
         }
     }, CONFIG.KEEPALIVE_INTERVAL_MS);
 
     s.staleCheckTimer = setInterval(() => {
         try {
-            if (!s.connected) return;
+            if (!s.connected || s.isCleaningUp) return;
             const lastActivity = Math.max(s.lastPacketTime || 0, s.lastKeepalive || 0);
             if (Date.now() - lastActivity > CONFIG.STALE_CONNECTION_TIMEOUT_MS) {
-                s.client?.close();
+                if (s.client && !s.isCleaningUp) {
+                    try {
+                        s.client.close();
+                    } catch (e) {}
+                }
                 if (!s.isReconnecting && !s.isCleaningUp && !s.manualStop) {
-                    handleAutoReconnect(uid, s.reconnectAttempt + 1);
+                    handleAutoReconnect(uid, (s.reconnectAttempt || 0) + 1);
                 }
             }
         } catch (e) {}
@@ -623,9 +678,7 @@ async function safeReply(interaction, content, ephemeral = true) {
             payload.flags = [MessageFlags.Ephemeral];
         }
         
-        // Yritä aina lähettää uusi viesti (followUp) jos mahdollista, muuten reply
         if (interaction.replied || interaction.deferred) {
-            // Jos editReply epäonnistuu (viesti poistettu), lähetä uusi ephemeral
             try {
                 await interaction.followUp(payload);
             } catch (err) {
@@ -705,7 +758,6 @@ async function linkMicrosoft(uid, interaction) {
                         .setURL(uri)
                 );
                 
-                // Käytä followUp uutena viestinä
                 await interaction.followUp({ content: msg, components: [row], flags: [MessageFlags.Ephemeral] }).catch(() => {});
             }
         );
@@ -737,7 +789,6 @@ async function linkMicrosoft(uid, interaction) {
 async function startSession(uid, interaction, isReconnect = false, reconnectAttempt = 1) {
     if (!uid || isShuttingDown) return;
     
-    // Wait for stores to be initialized
     if (!storesInitialized) {
         console.log("Waiting for stores to initialize...");
         await new Promise(resolve => setTimeout(resolve, 1000));
@@ -747,14 +798,17 @@ async function startSession(uid, interaction, isReconnect = false, reconnectAtte
         }
     }
     
-    // Jos interaction olemassa, defer heti
     if (interaction && !interaction.deferred && !interaction.replied) {
         await interaction.deferReply({ flags: [MessageFlags.Ephemeral] }).catch(() => {});
     }
     
-    const existingSession = sessions.get(uid);
-    if (existingSession?.isCleaningUp) {
-        await new Promise(resolve => setTimeout(resolve, 1000));
+    if (cleanupLocks.has(uid)) {
+        console.log(`Waiting for cleanup to finish for ${uid}...`);
+        let attempts = 0;
+        while (cleanupLocks.has(uid) && attempts < 10) {
+            await new Promise(resolve => setTimeout(resolve, 500));
+            attempts++;
+        }
     }
     
     const u = getUser(uid);
@@ -763,7 +817,11 @@ async function startSession(uid, interaction, isReconnect = false, reconnectAtte
         return;
     }
 
-    // Save session data for rejoin
+    if (!u.linked) {
+        if (interaction) safeReply(interaction, "Please auth with Xbox to use the bot");
+        return;
+    }
+
     await saveSessionData(uid);
 
     if (!u.server?.ip) {
@@ -787,10 +845,9 @@ async function startSession(uid, interaction, isReconnect = false, reconnectAtte
 
     if (isReconnect && sessions.has(uid)) {
         await cleanupSession(uid);
-        await new Promise(resolve => setTimeout(resolve, 500));
+        await new Promise(resolve => setTimeout(resolve, CONFIG.NATIVE_CLEANUP_DELAY_MS));
     }
 
-    // Quick ping in background
     if (!isReconnect && interaction) {
         try {
             await bedrock.ping({ 
@@ -799,7 +856,6 @@ async function startSession(uid, interaction, isReconnect = false, reconnectAtte
                 timeout: CONFIG.PING_TIMEOUT_MS 
             });
         } catch (err) {
-            // Continue anyway even if ping fails
         }
     }
 
@@ -828,7 +884,6 @@ async function startSession(uid, interaction, isReconnect = false, reconnectAtte
         opts.offline = true;
     }
 
-    // Create session object FIRST so handleAutoReconnect can find it if createClient fails
     const currentSession = {
         client: null,
         startedAt: Date.now(),
@@ -847,25 +902,31 @@ async function startSession(uid, interaction, isReconnect = false, reconnectAtte
         packetsReceived: 0
     };
     
-    // Add to Map immediately so reconnect logic works
     sessions.set(uid, currentSession);
 
     let mc;
     try {
         mc = bedrock.createClient(opts);
-        currentSession.client = mc; // Assign after successful creation
+        currentSession.client = mc;
     } catch (err) {
         console.error("Failed to create client:", err);
         if (interaction) safeReply(interaction, "Failed to create client.");
         if (isReconnect) handleAutoReconnect(uid, reconnectAttempt);
         else {
-            // Clean up if initial connection fails
             await cleanupSession(uid);
         }
         return;
     }
 
+    if (!mc) {
+        console.error("Client creation returned null");
+        await cleanupSession(uid);
+        return;
+    }
+
     mc.on('disconnect', (packet) => {
+        if (currentSession.isCleaningUp) return;
+        
         const reason = packet?.reason || "Unknown reason";
         logToDiscord(`Bot of <@${uid}> was kicked: ${reason}`);
         
@@ -881,7 +942,7 @@ async function startSession(uid, interaction, isReconnect = false, reconnectAtte
         if (!s || !s.connected || s.isCleaningUp) return;
 
         try {
-            if (s.entityId && s.client) {
+            if (s.entityId && s.client && !s.isCleaningUp) {
                 const action = Math.random();
                 
                 if (action < 0.6) {
@@ -919,22 +980,23 @@ async function startSession(uid, interaction, isReconnect = false, reconnectAtte
     };
 
     mc.on("spawn", () => {
+        if (currentSession.isCleaningUp) return;
+        
         logToDiscord(`Bot of <@${uid}> spawned on **${ip}:${port}**` + (isReconnect ? ` (Attempt ${reconnectAttempt})` : ""));
-        // Lähetä aina uusi ephemeral viesti sen sijaan että editoitaisiin vanhaa
         if (interaction) {
             safeReply(interaction, `**Online** on \`${ip}:${port}\``);
         }
     });
 
     mc.on("start_game", (packet) => {
-        if (!packet || !currentSession) return;
+        if (!packet || !currentSession || currentSession.isCleaningUp) return;
+        
         currentSession.entityId = packet.runtime_entity_id;
         currentSession.connected = true;
         currentSession.isReconnecting = false;
         currentSession.reconnectAttempt = 0;
         currentSession.lastPacketTime = Date.now();
 
-        // Update session data with connection info
         if (activeSessionsStore[uid]) {
             activeSessionsStore[uid].lastConnected = Date.now();
             activeSessionsStore[uid].entityId = packet.runtime_entity_id;
@@ -946,7 +1008,7 @@ async function startSession(uid, interaction, isReconnect = false, reconnectAtte
     });
 
     mc.on('packet', () => {
-        if (currentSession) {
+        if (currentSession && !currentSession.isCleaningUp) {
             currentSession.lastPacketTime = Date.now();
         }
     });
@@ -960,7 +1022,9 @@ async function startSession(uid, interaction, isReconnect = false, reconnectAtte
     });
 
     mc.on("close", () => {
-        if (!currentSession.manualStop && !currentSession.isReconnecting && !currentSession.isCleaningUp) {
+        if (currentSession.isCleaningUp) return;
+        
+        if (!currentSession.manualStop && !currentSession.isReconnecting) {
             handleAutoReconnect(uid, currentSession.reconnectAttempt);
         } else {
             logToDiscord(`Bot of <@${uid}> disconnected manually.`);
@@ -984,19 +1048,18 @@ client.once("ready", async () => {
         console.error("Failed to register commands:", e);
     }
 
-    // Memory check (non-blocking)
     setInterval(() => {
         const mem = process.memoryUsage();
         const mb = mem.rss / 1024 / 1024;
         if (mb > CONFIG.MAX_MEMORY_MB) {
             console.warn(`High memory usage: ${mb.toFixed(2)}MB`);
+            if (global.gc) global.gc();
         }
-    }, CONFIG.MEMORY_CHECK_INTERVAL_MS);
+    }, CONFIG.MUšORY_CHECK_INTERVAL_MS);
 
-    // Restore previous sessions with staggered delays
     setTimeout(() => {
         restoreSessions();
-    }, 5000);
+    }, 10000);
 });
 
 // ==================== SESSION RESTORATION ====================
@@ -1010,12 +1073,10 @@ async function restoreSessions() {
             const sessionData = activeSessionsStore[uid];
             if (!sessionData) continue;
             
-            // Restore user data from session store
             if (!users[uid]) {
                 users[uid] = {};
             }
             
-            // Merge saved session data into user data
             if (sessionData.server) users[uid].server = sessionData.server;
             if (sessionData.connectionType) users[uid].connectionType = sessionData.connectionType;
             if (sessionData.bedrockVersion) users[uid].bedrockVersion = sessionData.bedrockVersion;
@@ -1032,7 +1093,7 @@ async function restoreSessions() {
                     startSession(uid, null, true);
                 }
             }, delay);
-            delay += 5000; // Staggered to prevent overload
+            delay += 8000;
         }
     }
 }
@@ -1044,7 +1105,6 @@ client.on(Events.InteractionCreate, async (i) => {
         
         const uid = i.user.id;
         
-        // Rate limiting (1 second per user)
         const lastInteraction = i.user.lastInteraction || 0;
         if (Date.now() - lastInteraction < 1000) {
             return safeReply(i, "Please wait a moment before clicking again.");
@@ -1052,7 +1112,6 @@ client.on(Events.InteractionCreate, async (i) => {
         i.user.lastInteraction = Date.now();
 
         if (i.isChatInputCommand()) {
-            // PANEL EI OLE EPHEMERAL!
             if (i.commandName === "panel") {
                 const payload = panelRow(false);
                 return i.reply(payload).catch(() => {});
@@ -1076,7 +1135,6 @@ client.on(Events.InteractionCreate, async (i) => {
                     discordReconnectAttempts = 0;
                     await client.login(DISCORD_TOKEN);
                     
-                    // Wait for ready
                     await new Promise((resolve, reject) => {
                         const timeout = setTimeout(() => reject(new Error("Timeout")), 10000);
                         const checkReady = setInterval(() => {
@@ -1141,7 +1199,6 @@ client.on(Events.InteractionCreate, async (i) => {
                     new ButtonBuilder().setCustomId("confirm_start").setLabel("Start").setStyle(ButtonStyle.Success),
                     new ButtonBuilder().setCustomId("cancel").setLabel("Cancel").setStyle(ButtonStyle.Secondary)
                 );
-                // Käytä followUp jotta vältetään editReply ongelmat
                 return i.followUp({ embeds: [embed], components: [row], flags: [MessageFlags.Ephemeral] }).catch(() => {});
             }
 
@@ -1163,7 +1220,6 @@ client.on(Events.InteractionCreate, async (i) => {
             }
 
             if (i.customId === "confirm_start") {
-                // Älä käytä deferUpdate, käytä deferReply ja sitten followUp
                 if (!i.deferred && !i.replied) {
                     await i.deferReply({ flags: [MessageFlags.Ephemeral] }).catch(() => {});
                 }
@@ -1252,10 +1308,8 @@ client.on(Events.InteractionCreate, async (i) => {
 
 // ==================== STARTUP ====================
 async function main() {
-    // Initialize stores first
     await initializeStores();
     
-    // Then login to Discord
     client.login(DISCORD_TOKEN).catch((err) => {
         console.error("Initial login failed:", err);
         process.exit(1);
