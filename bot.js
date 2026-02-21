@@ -53,7 +53,6 @@ const AUTH_ROOT = path.join(DATA, "auth");
 const STORE = path.join(DATA, "users.json");
 const REJOIN_STORE = path.join(DATA, "rejoin.json");
 const CRASH_LOG = path.join(DATA, "crash.log");
-const WAL_FILE = path.join(DATA, "wal.json");
 
 async function ensureDir(dir) {
     try {
@@ -65,89 +64,19 @@ async function ensureDir(dir) {
     }
 }
 
-// ==================== WRITE-AHEAD LOGGING SYSTEM ====================
-class WriteAheadLog {
+// ==================== SIMPLIFIED PERSISTENT STORE ====================
+class PersistentStore {
     constructor(filePath) {
         this.filePath = filePath;
-        this.writeQueue = [];
-        this.writing = false;
-    }
-
-    async write(operation, data) {
-        try {
-            const entry = {
-                timestamp: Date.now(),
-                operation,
-                data: JSON.stringify(data),
-                checksum: this._checksum(data)
-            };
-            await fs.appendFile(this.filePath, JSON.stringify(entry) + '\n');
-            return true;
-        } catch (e) {
-            console.error("WAL write error:", e.message);
-            return false;
-        }
-    }
-
-    async replay(targetStore) {
-        try {
-            if (!await fs.access(this.filePath).then(() => true).catch(() => false)) return;
-            const content = await fs.readFile(this.filePath, 'utf8');
-            const lines = content.split('\n').filter(Boolean);
-            for (const line of lines) {
-                try {
-                    const entry = JSON.parse(line);
-                    if (entry.operation === 'update' && entry.data) {
-                        const data = JSON.parse(entry.data);
-                        Object.assign(targetStore, data);
-                    }
-                } catch (e) { /* Skip corrupt entries */ }
-            }
-            await fs.writeFile(this.filePath, '');
-        } catch (e) {
-            console.error("WAL replay error:", e.message);
-        }
-    }
-
-    async clear() {
-        try {
-            await fs.writeFile(this.filePath, '');
-        } catch (e) {
-            console.error("WAL clear error:", e.message);
-        }
-    }
-
-    _checksum(data) {
-        const str = JSON.stringify(data);
-        let hash = 0;
-        for (let i = 0; i < str.length; i++) {
-            const char = str.charCodeAt(i);
-            hash = ((hash << 5) - hash) + char;
-            hash = hash & hash;
-        }
-        return hash;
-    }
-}
-
-// ==================== ENHANCED PERSISTENT STORE ====================
-class PersistentStore {
-    constructor(filePath, wal) {
-        this.filePath = filePath;
-        this.wal = wal;
         this.data = null;
         this.saveTimeout = null;
         this.isSaving = false;
-        this.saveQueue = [];
         this.lastSaveTime = 0;
         this.saveCount = 0;
-        this.pendingWrites = [];
     }
 
     async load(defaultVal = {}) {
         this.data = defaultVal;
-        if (this.wal) {
-            await this.wal.replay(this.data);
-        }
         
         try {
             const content = await fs.readFile(this.filePath, "utf8");
@@ -215,21 +144,15 @@ class PersistentStore {
         this.isSaving = true;
 
         try {
-            if (this.wal) {
-                await this.wal.write('update', this.data);
-            }
-
             const dir = path.dirname(this.filePath);
             await fs.mkdir(dir, { recursive: true });
 
-            const jsonString = JSON.stringify(this.data, null, 2);
+            // Convert BigInt to string to avoid serialization errors
+            const jsonString = JSON.stringify(this.data, (key, value) => 
+                typeof value === 'bigint' ? value.toString() : value, null, 2);
             
             await fs.writeFile(`${this.filePath}.tmp`, jsonString);
             await fs.rename(`${this.filePath}.tmp`, this.filePath);
-            
-            if (this.wal) {
-                await this.wal.clear();
-            }
 
             this.lastSaveTime = Date.now();
             this.saveCount++;
@@ -244,15 +167,15 @@ class PersistentStore {
     async _emergencyBackup() {
         try {
             const emergencyPath = `${this.filePath}.emergency.${Date.now()}`;
-            await fs.writeFile(emergencyPath, JSON.stringify(this.data));
+            await fs.writeFile(emergencyPath, JSON.stringify(this.data, (key, value) => 
+                typeof value === 'bigint' ? value.toString() : value));
         } catch (e) {}
     }
 }
 
 // ==================== INITIALIZE STORES ====================
-const wal = new WriteAheadLog(WAL_FILE);
-const userStore = new PersistentStore(STORE, wal);
-const sessionStore = new PersistentStore(REJOIN_STORE, wal);
+const userStore = new PersistentStore(STORE);
+const sessionStore = new PersistentStore(REJOIN_STORE);
 
 let users = {};
 let activeSessionsStore = {};
@@ -1055,7 +978,7 @@ client.once("ready", async () => {
             console.warn(`High memory usage: ${mb.toFixed(2)}MB`);
             if (global.gc) global.gc();
         }
-    }, CONFIG.MUšORY_CHECK_INTERVAL_MS);
+    }, CONFIG.MEMORY_CHECK_INTERVAL_MS);
 
     setTimeout(() => {
         restoreSessions();
