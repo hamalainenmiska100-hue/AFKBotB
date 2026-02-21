@@ -1,12 +1,15 @@
-# fly.toml app configuration file generated for afkbot on 2026-02-20T17:13:49Z
-#
-# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
-#
-
-app = 'afkbot'
-primary_region = 'arn'
+app = "afkbot"
+primary_region = "arn"
 
 [build]
+
+
+[env]
+  FLY_VOLUME_PATH = "/data"
+
+[[mounts]]
+  source = "data_volume"
+  destination = "/data"
 
 [http_service]
   internal_port = 8080
@@ -14,10 +17,8 @@ primary_region = 'arn'
   auto_stop_machines = false
   auto_start_machines = true
   min_machines_running = 1
-  processes = ['app']
+  processes = ["app"]
 
 [[vm]]
-  memory = '1gb'
-  cpu_kind = 'shared'
-  cpus = 1
-  memory_mb = 1024
+  size = "shared-cpu-1x"
+  memory = "1gb"
