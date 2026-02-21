@@ -3,12 +3,11 @@ primary_region = "arn"
 
 [build]
 
-
 [env]
   FLY_VOLUME_PATH = "/data"
 
 [[mounts]]
-  source = "data_volume"
+  source = "bot_data"        # <-- VAIHDA TÄMÄ: bot_data eikä data_volume
   destination = "/data"
 
 [http_service]
