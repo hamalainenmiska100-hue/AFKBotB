@@ -615,17 +615,28 @@ async function logToDiscord(message) {
     } catch (e) {}
 }
 
-async function safeReply(interaction, content) {
+async function safeReply(interaction, content, ephemeral = true) {
     try {
         if (!interaction) return;
         const payload = typeof content === 'string' ? { content } : content;
-        
-        if (interaction.replied || interaction.deferred) {
-            await interaction.editReply(payload).catch(() => {});
-        } else {
-            await interaction.reply(payload).catch(() => {});
+        if (ephemeral) {
+            payload.flags = [MessageFlags.Ephemeral];
         }
-    } catch (e) {}
+        
+        // Yritä aina lähettää uusi viesti (followUp) jos mahdollista, muuten reply
+        if (interaction.replied || interaction.deferred) {
+            // Jos editReply epäonnistuu (viesti poistettu), lähetä uusi ephemeral
+            try {
+                await interaction.followUp(payload);
+            } catch (err) {
+                console.error("Failed to send followUp:", err);
+            }
+        } else {
+            await interaction.reply(payload);
+        }
+    } catch (e) {
+        console.error("SafeReply error:", e);
+    }
 }
 
 // ==================== UI COMPONENTS ====================
@@ -654,12 +665,12 @@ async function linkMicrosoft(uid, interaction) {
     await interaction.deferReply({ flags: [MessageFlags.Ephemeral] }).catch(() => {});
     
     if (pendingLink.has(uid)) {
-        return interaction.editReply({ content: "Login already in progress. Check your DMs or use the last code." }).catch(() => {});
+        return interaction.followUp({ content: "Login already in progress. Check your DMs or use the last code.", flags: [MessageFlags.Ephemeral] }).catch(() => {});
     }
     
     const authDir = await getUserAuthDir(uid);
     if (!authDir) {
-        return interaction.editReply({ content: "System error: Cannot create auth directory." }).catch(() => {});
+        return interaction.followUp({ content: "System error: Cannot create auth directory.", flags: [MessageFlags.Ephemeral] }).catch(() => {});
     }
     
     const u = getUser(uid);
@@ -667,7 +678,7 @@ async function linkMicrosoft(uid, interaction) {
 
     const timeoutId = setTimeout(() => {
         pendingLink.delete(uid);
-        interaction.editReply({ content: "Login timed out after 5 minutes." }).catch(() => {});
+        interaction.followUp({ content: "Login timed out after 5 minutes.", flags: [MessageFlags.Ephemeral] }).catch(() => {});
     }, 300000);
 
     try {
@@ -694,7 +705,8 @@ async function linkMicrosoft(uid, interaction) {
                         .setURL(uri)
                 );
                 
-                await interaction.editReply({ content: msg, components: [row] }).catch(() => {});
+                // Käytä followUp uutena viestinä
+                await interaction.followUp({ content: msg, components: [row], flags: [MessageFlags.Ephemeral] }).catch(() => {});
             }
         );
 
@@ -708,7 +720,7 @@ async function linkMicrosoft(uid, interaction) {
         }).catch(async (e) => {
             clearTimeout(timeoutId);
             const errorMsg = e?.message || "Unknown error";
-            await interaction.editReply({ content: `Login failed: ${errorMsg}` }).catch(() => {});
+            await interaction.followUp({ content: `Login failed: ${errorMsg}`, flags: [MessageFlags.Ephemeral] }).catch(() => {});
             pendingLink.delete(uid);
         });
         
@@ -717,7 +729,7 @@ async function linkMicrosoft(uid, interaction) {
     } catch (e) {
         clearTimeout(timeoutId);
         pendingLink.delete(uid);
-        await interaction.editReply({ content: "Authentication system error." }).catch(() => {});
+        await interaction.followUp({ content: "Authentication system error.", flags: [MessageFlags.Ephemeral] }).catch(() => {});
     }
 }
 
@@ -730,12 +742,12 @@ async function startSession(uid, interaction, isReconnect = false, reconnectAtte
         console.log("Waiting for stores to initialize...");
         await new Promise(resolve => setTimeout(resolve, 1000));
         if (!storesInitialized) {
-            if (interaction) interaction.editReply({ content: "System initializing, please try again." }).catch(() => {});
+            if (interaction) safeReply(interaction, "System initializing, please try again.");
             return;
         }
     }
     
-    // If interaction exists, defer immediately so Discord doesn't timeout
+    // Jos interaction olemassa, defer heti
     if (interaction && !interaction.deferred && !interaction.replied) {
         await interaction.deferReply({ flags: [MessageFlags.Ephemeral] }).catch(() => {});
     }
@@ -747,7 +759,7 @@ async function startSession(uid, interaction, isReconnect = false, reconnectAtte
     
     const u = getUser(uid);
     if (!u) {
-        if (interaction) interaction.editReply({ content: "User data error." }).catch(() => {});
+        if (interaction) safeReply(interaction, "User data error.");
         return;
     }
 
@@ -755,7 +767,7 @@ async function startSession(uid, interaction, isReconnect = false, reconnectAtte
     await saveSessionData(uid);
 
     if (!u.server?.ip) {
-        if (interaction) interaction.editReply({ content: "Please configure your server settings first." }).catch(() => {});
+        if (interaction) safeReply(interaction, "Please configure your server settings first.");
         await clearSessionData(uid);
         return;
     }
@@ -763,13 +775,13 @@ async function startSession(uid, interaction, isReconnect = false, reconnectAtte
     const { ip, port } = u.server;
     
     if (!isValidIP(ip) || !isValidPort(port)) {
-        if (interaction) interaction.editReply({ content: "Invalid server IP or port format." }).catch(() => {});
+        if (interaction) safeReply(interaction, "Invalid server IP or port format.");
         await clearSessionData(uid);
         return;
     }
 
     if (sessions.has(uid) && !isReconnect) {
-        if (interaction) interaction.editReply({ content: "**Session Conflict**: Active session exists. Use `/stop` first." }).catch(() => {});
+        if (interaction) safeReply(interaction, "**Session Conflict**: Active session exists. Use `/stop` first.");
         return;
     }
 
@@ -793,7 +805,7 @@ async function startSession(uid, interaction, isReconnect = false, reconnectAtte
 
     const authDir = await getUserAuthDir(uid);
     if (!authDir) {
-        if (interaction) interaction.editReply({ content: "Auth directory error." }).catch(() => {});
+        if (interaction) safeReply(interaction, "Auth directory error.");
         return;
     }
 
@@ -844,7 +856,7 @@ async function startSession(uid, interaction, isReconnect = false, reconnectAtte
         currentSession.client = mc; // Assign after successful creation
     } catch (err) {
         console.error("Failed to create client:", err);
-        if (interaction) interaction.editReply({ content: "Failed to create client." }).catch(() => {});
+        if (interaction) safeReply(interaction, "Failed to create client.");
         if (isReconnect) handleAutoReconnect(uid, reconnectAttempt);
         else {
             // Clean up if initial connection fails
@@ -908,7 +920,10 @@ async function startSession(uid, interaction, isReconnect = false, reconnectAtte
 
     mc.on("spawn", () => {
         logToDiscord(`Bot of <@${uid}> spawned on **${ip}:${port}**` + (isReconnect ? ` (Attempt ${reconnectAttempt})` : ""));
-        if (interaction) interaction.editReply({ content: `**Online** on \`${ip}:${port}\`` }).catch(() => {});
+        // Lähetä aina uusi ephemeral viesti sen sijaan että editoitaisiin vanhaa
+        if (interaction) {
+            safeReply(interaction, `**Online** on \`${ip}:${port}\``);
+        }
     });
 
     mc.on("start_game", (packet) => {
@@ -1032,19 +1047,26 @@ client.on(Events.InteractionCreate, async (i) => {
         // Rate limiting (1 second per user)
         const lastInteraction = i.user.lastInteraction || 0;
         if (Date.now() - lastInteraction < 1000) {
-            return safeReply(i, { content: "Please wait a moment before clicking again.", flags: [MessageFlags.Ephemeral] });
+            return safeReply(i, "Please wait a moment before clicking again.");
         }
         i.user.lastInteraction = Date.now();
 
         if (i.isChatInputCommand()) {
-            if (i.commandName === "panel") return safeReply(i, panelRow(false));
-            if (i.commandName === "java") return safeReply(i, panelRow(true));
+            // PANEL EI OLE EPHEMERAL!
+            if (i.commandName === "panel") {
+                const payload = panelRow(false);
+                return i.reply(payload).catch(() => {});
+            }
+            if (i.commandName === "java") {
+                const payload = panelRow(true);
+                return i.reply(payload).catch(() => {});
+            }
             
             if (i.commandName === "refresh") {
                 await i.deferReply({ flags: [MessageFlags.Ephemeral] });
                 try {
                     if (!discordReady) {
-                        return i.editReply({ content: "Discord already reconnecting, please wait..." });
+                        return safeReply(i, "Discord already reconnecting, please wait...");
                     }
                     
                     discordReady = false;
@@ -1067,10 +1089,10 @@ client.on(Events.InteractionCreate, async (i) => {
                     });
                     
                     discordReady = true;
-                    return i.editReply({ content: "Discord connection refreshed successfully!" });
+                    return safeReply(i, "Discord connection refreshed successfully!");
                 } catch (err) {
                     discordReady = false;
-                    return i.editReply({ content: `Refresh failed: ${err.message}` });
+                    return safeReply(i, `Refresh failed: ${err.message}`);
                 }
             }
         }
@@ -1080,7 +1102,7 @@ client.on(Events.InteractionCreate, async (i) => {
                 await i.deferReply({ flags: [MessageFlags.Ephemeral] });
                 try {
                     if (!discordReady) {
-                        return i.editReply({ content: "Already reconnecting, please wait..." });
+                        return safeReply(i, "Already reconnecting, please wait...");
                     }
                     
                     discordReady = false;
@@ -1096,19 +1118,19 @@ client.on(Events.InteractionCreate, async (i) => {
                     
                     if (client.isReady()) {
                         discordReady = true;
-                        return i.editReply({ content: "Connection refreshed!" });
+                        return safeReply(i, "Connection refreshed!");
                     } else {
                         throw new Error("Did not become ready in time");
                     }
                 } catch (err) {
                     discordReady = false;
-                    return i.editReply({ content: `Failed: ${err.message}` });
+                    return safeReply(i, `Failed: ${err.message}`);
                 }
             }
 
             if (i.customId === "start_bedrock") {
                 if (sessions.has(uid)) {
-                    return safeReply(i, { content: "**Session Conflict**: Active session exists.", flags: [MessageFlags.Ephemeral] });
+                    return safeReply(i, "**Session Conflict**: Active session exists.");
                 }
                 await i.deferReply({ flags: [MessageFlags.Ephemeral] });
                 const embed = new EmbedBuilder()
@@ -1119,12 +1141,13 @@ client.on(Events.InteractionCreate, async (i) => {
                     new ButtonBuilder().setCustomId("confirm_start").setLabel("Start").setStyle(ButtonStyle.Success),
                     new ButtonBuilder().setCustomId("cancel").setLabel("Cancel").setStyle(ButtonStyle.Secondary)
                 );
-                return i.editReply({ embeds: [embed], components: [row] });
+                // Käytä followUp jotta vältetään editReply ongelmat
+                return i.followUp({ embeds: [embed], components: [row], flags: [MessageFlags.Ephemeral] }).catch(() => {});
             }
 
             if (i.customId === "start_java") {
                 if (sessions.has(uid)) {
-                    return safeReply(i, { content: "**Session Conflict**: Active session exists.", flags: [MessageFlags.Ephemeral] });
+                    return safeReply(i, "**Session Conflict**: Active session exists.");
                 }
                 await i.deferReply({ flags: [MessageFlags.Ephemeral] });
                 const embed = new EmbedBuilder()
@@ -1136,29 +1159,28 @@ client.on(Events.InteractionCreate, async (i) => {
                     new ButtonBuilder().setCustomId("confirm_start").setLabel("Confirm & Start").setStyle(ButtonStyle.Success),
                     new ButtonBuilder().setCustomId("cancel").setLabel("Cancel").setStyle(ButtonStyle.Secondary)
                 );
-                return i.editReply({ embeds: [embed], components: [row] });
+                return i.followUp({ embeds: [embed], components: [row], flags: [MessageFlags.Ephemeral] }).catch(() => {});
             }
 
             if (i.customId === "confirm_start") {
-                await i.deferUpdate();
-                await i.editReply({ 
-                    content: "**Connecting...**", 
-                    embeds: [], 
-                    components: [] 
-                }).catch(() => {});
+                // Älä käytä deferUpdate, käytä deferReply ja sitten followUp
+                if (!i.deferred && !i.replied) {
+                    await i.deferReply({ flags: [MessageFlags.Ephemeral] }).catch(() => {});
+                }
+                safeReply(i, "**Connecting...**", true);
                 startSession(uid, i, false);
                 return;
             }
 
             if (i.customId === "cancel") {
-                await i.deferUpdate();
-                return i.editReply({ content: "Cancelled.", embeds: [], components: [] }).catch(() => {});
+                safeReply(i, "Cancelled.");
+                return;
             }
 
             if (i.customId === "stop") {
                 await i.deferReply({ flags: [MessageFlags.Ephemeral] });
                 const ok = await stopSession(uid);
-                return i.editReply({ content: ok ? "**Session Terminated.**" : "No active sessions." });
+                return safeReply(i, ok ? "**Session Terminated.**" : "No active sessions.");
             }
 
             if (i.customId === "link") {
@@ -1168,7 +1190,7 @@ client.on(Events.InteractionCreate, async (i) => {
             if (i.customId === "unlink") {
                 await i.deferReply({ flags: [MessageFlags.Ephemeral] });
                 await unlinkMicrosoft(uid);
-                return i.editReply({ content: "Unlinked Microsoft account." });
+                return safeReply(i, "Unlinked Microsoft account.");
             }
 
             if (i.customId === "settings") {
@@ -1207,21 +1229,21 @@ client.on(Events.InteractionCreate, async (i) => {
             const port = parseInt(portStr, 10);
 
             if (!ip || !portStr) {
-                return safeReply(i, { content: "IP and Port are required.", flags: [MessageFlags.Ephemeral] });
+                return safeReply(i, "IP and Port are required.");
             }
 
             if (!isValidIP(ip)) {
-                return safeReply(i, { content: "Invalid IP address format.", flags: [MessageFlags.Ephemeral] });
+                return safeReply(i, "Invalid IP address format.");
             }
 
             if (!isValidPort(port)) {
-                return safeReply(i, { content: "Invalid port (must be 1-65535).", flags: [MessageFlags.Ephemeral] });
+                return safeReply(i, "Invalid port (must be 1-65535).");
             }
 
             const u = getUser(uid);
             u.server = { ip, port };
             await userStore.save();
-            return safeReply(i, { content: `Saved: **${ip}:${port}**`, flags: [MessageFlags.Ephemeral] });
+            return safeReply(i, `Saved: **${ip}:${port}**`);
         }
     } catch (e) {
         console.error("Interaction error:", e);
