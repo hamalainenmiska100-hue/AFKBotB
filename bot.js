@@ -816,18 +816,9 @@ async function startSession(uid, interaction, isReconnect = false, reconnectAtte
         opts.offline = true;
     }
 
-    let mc;
-    try {
-        mc = bedrock.createClient(opts);
-    } catch (err) {
-        console.error("Failed to create client:", err);
-        if (interaction) interaction.editReply({ content: "Failed to create client." }).catch(() => {});
-        if (isReconnect) handleAutoReconnect(uid, reconnectAttempt);
-        return;
-    }
-
+    // Create session object FIRST so handleAutoReconnect can find it if createClient fails
     const currentSession = {
-        client: mc,
+        client: null,
         startedAt: Date.now(),
         manualStop: false,
         connected: false,
@@ -844,7 +835,23 @@ async function startSession(uid, interaction, isReconnect = false, reconnectAtte
         packetsReceived: 0
     };
     
+    // Add to Map immediately so reconnect logic works
     sessions.set(uid, currentSession);
+
+    let mc;
+    try {
+        mc = bedrock.createClient(opts);
+        currentSession.client = mc; // Assign after successful creation
+    } catch (err) {
+        console.error("Failed to create client:", err);
+        if (interaction) interaction.editReply({ content: "Failed to create client." }).catch(() => {});
+        if (isReconnect) handleAutoReconnect(uid, reconnectAttempt);
+        else {
+            // Clean up if initial connection fails
+            await cleanupSession(uid);
+        }
+        return;
+    }
 
     mc.on('disconnect', (packet) => {
         const reason = packet?.reason || "Unknown reason";
