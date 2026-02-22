@@ -22,6 +22,7 @@ const {
     ButtonBuilder,
     ButtonStyle,
     Events,
+    Partials,
     SlashCommandBuilder,
     ModalBuilder,
     TextInputBuilder,
@@ -107,8 +108,10 @@ class PersistentStore {
                 }
             }
         } catch (e) {
-            console.error(`Failed to load ${this.filePath}:`, e.message);
-            await this._backupCorruptFile();
+            if (e?.code !== 'ENOENT') {
+                console.error(`Failed to load ${this.filePath}:`, e.message);
+                await this._backupCorruptFile();
+            }
         }
         return this.data;
     }
@@ -216,6 +219,7 @@ async function initializeStores() {
 const sessions = new Map();
 const pendingLink = new Map();
 const lastMsa = new Map();
+const lastInteractionAt = new Map();
 let isShuttingDown = false;
 let discordReady = false;
 let discordReconnectAttempts = 0;
@@ -229,6 +233,8 @@ const client = new Client({
         GatewayIntentBits.DirectMessages,
         GatewayIntentBits.GuildMessages
     ],
+    // Required for reliable DM handling in discord.js v14+
+    partials: [Partials.Channel, Partials.Message, Partials.User],
     failIfNotExists: false,
     allowedMentions: { parse: ['users', 'roles'], repliedUser: false },
     rest: {
@@ -276,23 +282,23 @@ client.on("error", (error) => {
     discordReady = false;
 });
 
-client.on("shardError", (error) => {
+client.on(Events.ShardError, (error) => {
     console.error("SHARD ERROR:", error?.message);
 });
 
-client.on("disconnect", () => {
+client.on(Events.ShardDisconnect, () => {
     discordReady = false;
-    console.log("Discord disconnected. Auto-reconnecting...");
+    console.log("Discord shard disconnected. Auto-reconnecting...");
 });
 
-client.on("reconnecting", () => {
-    console.log("Discord reconnecting...");
+client.on(Events.ShardReconnecting, () => {
+    console.log("Discord shard reconnecting...");
 });
 
-client.on("resume", (replayed) => {
+client.on(Events.ShardResume, (_shardId, replayed) => {
     discordReady = true;
     discordReconnectAttempts = 0;
-    console.log(`Discord resumed. Replayed: ${replayed}`);
+    console.log(`Discord shard resumed. Replayed: ${replayed}`);
 });
 
 // ==================== GRACEFUL SHUTDOWN ====================
@@ -446,6 +452,7 @@ async function handleAutoReconnect(uid, attempt = 1) {
     if (!uid || isShuttingDown) return;
     const s = sessions.get(uid);
     if (!s || s.manualStop || s.isCleaningUp) return;
+    attempt = Math.max(1, attempt);
     if (attempt > CONFIG.MAX_RECONNECT_ATTEMPTS) {
         logToDiscord(`Bot of <@${uid}> stopped after max failed attempts.`);
         await cleanupSession(uid);
@@ -464,7 +471,7 @@ async function handleAutoReconnect(uid, attempt = 1) {
             await cleanupSession(uid);
             await new Promise(resolve => setTimeout(resolve, CONFIG.NATIVE_CLEANUP_DELAY_MS));
             if (!isShuttingDown) {
-                await startSession(uid, null, true, attempt + 1);
+                await startSession(uid, null, true, attempt);
             }
         } else {
             await cleanupSession(uid);
@@ -589,8 +596,8 @@ async function safeReply(interaction, content, ephemeral = true) {
     try {
         if (!interaction) return;
         const payload = typeof content === 'string' ? { content } : content;
-        if (ephemeral) {
-            payload.flags = [MessageFlags.Ephemeral];
+        if (ephemeral && payload.ephemeral === undefined) {
+            payload.ephemeral = true;
         }
         if (interaction.replied || interaction.deferred) {
             try {
@@ -629,18 +636,18 @@ function panelRow(isJava = false) {
 
 async function linkMicrosoft(uid, interaction) {
     if (!uid || !interaction) return;
-    await interaction.deferReply({ flags: [MessageFlags.Ephemeral] }).catch(() => {});
+    await interaction.deferReply({ ephemeral: true }).catch(() => {});
     if (pendingLink.has(uid)) {
-        return interaction.followUp({ content: "Login already in progress. Check your DMs or use the last code.", flags: [MessageFlags.Ephemeral] }).catch(() => {});
+        return interaction.followUp({ content: "Login already in progress. Check your DMs or use the last code.", ephemeral: true }).catch(() => {});
     }
     const authDir = await getUserAuthDir(uid);
     if (!authDir) {
-        return interaction.followUp({ content: "System error: Cannot create auth directory.", flags: [MessageFlags.Ephemeral] }).catch(() => {});
+        return interaction.followUp({ content: "System error: Cannot create auth directory.", ephemeral: true }).catch(() => {});
     }
     const u = getUser(uid);
     const timeoutId = setTimeout(() => {
         pendingLink.delete(uid);
-        interaction.followUp({ content: "Login timed out after 5 minutes.", flags: [MessageFlags.Ephemeral] }).catch(() => {});
+        interaction.followUp({ content: "Login timed out after 5 minutes.", ephemeral: true }).catch(() => {});
     }, 300000);
     try {
         const flow = new Authflow(
@@ -659,7 +666,7 @@ async function linkMicrosoft(uid, interaction) {
                 const row = new ActionRowBuilder().addComponents(
                     new ButtonBuilder().setLabel("Open link").setStyle(ButtonStyle.Link).setURL(uri)
                 );
-                await interaction.followUp({ content: msg, components: [row], flags: [MessageFlags.Ephemeral] }).catch(() => {});
+                await interaction.followUp({ content: msg, components: [row], ephemeral: true }).catch(() => {});
             }
         );
         flow.getMsaToken().then(async () => {
@@ -667,19 +674,19 @@ async function linkMicrosoft(uid, interaction) {
             u.linked = true;
             u.tokenAcquiredAt = Date.now();
             await userStore.save();
-            await interaction.followUp({ content: "Microsoft account linked!", flags: [MessageFlags.Ephemeral] }).catch(() => {});
+            await interaction.followUp({ content: "Microsoft account linked!", ephemeral: true }).catch(() => {});
             pendingLink.delete(uid);
         }).catch(async (e) => {
             clearTimeout(timeoutId);
             const errorMsg = e?.message || "Unknown error";
-            await interaction.followUp({ content: `Login failed: ${errorMsg}`, flags: [MessageFlags.Ephemeral] }).catch(() => {});
+            await interaction.followUp({ content: `Login failed: ${errorMsg}`, ephemeral: true }).catch(() => {});
             pendingLink.delete(uid);
         });
         pendingLink.set(uid, true);
     } catch (e) {
         clearTimeout(timeoutId);
         pendingLink.delete(uid);
-        await interaction.followUp({ content: "Authentication system error.", flags: [MessageFlags.Ephemeral] }).catch(() => {});
+        await interaction.followUp({ content: "Authentication system error.", ephemeral: true }).catch(() => {});
     }
 }
 
@@ -698,7 +705,7 @@ async function startSession(uid, interaction, isReconnect = false, reconnectAtte
     }
 
     if (interaction && !interaction.deferred && !interaction.replied) {
-        await interaction.deferReply({ flags: [MessageFlags.Ephemeral] }).catch(() => {});
+        await interaction.deferReply({ ephemeral: true }).catch(() => {});
     }
 
     if (cleanupLocks.has(uid)) {
@@ -718,6 +725,7 @@ async function startSession(uid, interaction, isReconnect = false, reconnectAtte
 
     if (!u.linked) {
         if (interaction) safeReply(interaction, "Please auth with Xbox to use the bot");
+        else await clearSessionData(uid);
         return;
     }
 
@@ -815,7 +823,7 @@ async function startSession(uid, interaction, isReconnect = false, reconnectAtte
     } catch (err) {
         console.error("Failed to create client:", err);
         if (interaction) safeReply(interaction, "Failed to create client.");
-        if (isReconnect) handleAutoReconnect(uid, reconnectAttempt);
+        if (isReconnect) handleAutoReconnect(uid, (reconnectAttempt || 0) + 1);
         else await cleanupSession(uid);
         return;
     }
@@ -978,15 +986,11 @@ async function startSession(uid, interaction, isReconnect = false, reconnectAtte
             if (s && s.connected && !s.isCleaningUp) performAntiAfk();
         }, 5000);
     });
-
-    mc.on('packet', () => {
+    // Track packets for connection health and server-provided move_player updates for position sync
+    mc.on('packet', (data, meta) => {
         if (currentSession && !currentSession.isCleaningUp) {
             currentSession.lastPacketTime = Date.now();
         }
-    });
-
-    // Track server-provided move_player updates for position sync
-    mc.on('packet', (data, meta) => {
         try {
             if (!data || !meta || currentSession.isCleaningUp) return;
             if (meta.name === 'move_player' && data?.position) {
@@ -1000,7 +1004,7 @@ async function startSession(uid, interaction, isReconnect = false, reconnectAtte
     mc.on("error", (e) => {
         console.error(`Session error for ${uid}:`, e);
         if (!currentSession.manualStop && !currentSession.isReconnecting && !currentSession.isCleaningUp) {
-            handleAutoReconnect(uid, currentSession.reconnectAttempt);
+            handleAutoReconnect(uid, (currentSession.reconnectAttempt || 0) + 1);
         }
         logToDiscord(`Bot of <@${uid}> error: \`${e?.message || 'Unknown error'}\``);
     });
@@ -1008,7 +1012,7 @@ async function startSession(uid, interaction, isReconnect = false, reconnectAtte
     mc.on("close", () => {
         if (currentSession.isCleaningUp) return;
         if (!currentSession.manualStop && !currentSession.isReconnecting) {
-            handleAutoReconnect(uid, currentSession.reconnectAttempt);
+            handleAutoReconnect(uid, (currentSession.reconnectAttempt || 0) + 1);
         } else {
             logToDiscord(`Bot of <@${uid}> disconnected manually.`);
         }
@@ -1058,6 +1062,14 @@ async function restoreSessions() {
             const sessionData = activeSessionsStore[uid];
             if (!sessionData) continue;
 
+            const hasServer = !!(sessionData.server && sessionData.server.ip && sessionData.server.port);
+            const isLinked = sessionData.linked === true;
+            if (!hasServer || !isLinked) {
+                console.log(`Skipping restore for user ${uid}: missing server settings or not linked.`);
+                await clearSessionData(uid);
+                continue;
+            }
+
             if (!users[uid]) users[uid] = {};
             if (sessionData.server) users[uid].server = sessionData.server;
             if (sessionData.connectionType) users[uid].connectionType = sessionData.connectionType;
@@ -1087,11 +1099,11 @@ client.on(Events.InteractionCreate, async (i) => {
         if (!i.user?.id) return;
         const uid = i.user.id;
 
-        const lastInteraction = i.user.lastInteraction || 0;
+        const lastInteraction = lastInteractionAt.get(uid) || 0;
         if (Date.now() - lastInteraction < 1000) {
             return safeReply(i, "Please wait a moment before clicking again.");
         }
-        i.user.lastInteraction = Date.now();
+        lastInteractionAt.set(uid, Date.now());
 
         if (i.isChatInputCommand()) {
             if (i.commandName === "panel") return i.reply(panelRow(false)).catch(() => {});
@@ -1101,7 +1113,7 @@ client.on(Events.InteractionCreate, async (i) => {
         if (i.isButton()) {
             if (i.customId === "start_bedrock" || i.customId === "start_java") {
                 if (sessions.has(uid)) return safeReply(i, "**Session Conflict**: Active session exists.");
-                await i.deferReply({ flags: [MessageFlags.Ephemeral] });
+                await i.deferReply({ ephemeral: true });
 
                 const embed = i.customId === "start_java"
                     ? new EmbedBuilder()
@@ -1119,11 +1131,11 @@ client.on(Events.InteractionCreate, async (i) => {
                     new ButtonBuilder().setCustomId("cancel").setLabel("Cancel").setStyle(ButtonStyle.Secondary)
                 );
 
-                return i.followUp({ embeds: [embed], components: [row], flags: [MessageFlags.Ephemeral] }).catch(() => {});
+                return i.followUp({ embeds: [embed], components: [row], ephemeral: true }).catch(() => {});
             }
 
             if (i.customId === "confirm_start") {
-                await i.deferReply({ flags: [MessageFlags.Ephemeral] }).catch(() => {});
+                await i.deferReply({ ephemeral: true }).catch(() => {});
                 safeReply(i, "**Connecting...**", true);
                 startSession(uid, i, false);
                 return;
@@ -1132,7 +1144,7 @@ client.on(Events.InteractionCreate, async (i) => {
             if (i.customId === "cancel") return safeReply(i, "Cancelled.");
 
             if (i.customId === "stop") {
-                await i.deferReply({ flags: [MessageFlags.Ephemeral] });
+                await i.deferReply({ ephemeral: true });
                 const ok = await stopSession(uid);
                 return safeReply(i, ok ? "**Session Terminated.**" : "No active sessions.");
             }
@@ -1140,7 +1152,7 @@ client.on(Events.InteractionCreate, async (i) => {
             if (i.customId === "link") return linkMicrosoft(uid, i);
 
             if (i.customId === "unlink") {
-                await i.deferReply({ flags: [MessageFlags.Ephemeral] });
+                await i.deferReply({ ephemeral: true });
                 await unlinkMicrosoft(uid);
                 return safeReply(i, "Unlinked Microsoft account.");
             }
