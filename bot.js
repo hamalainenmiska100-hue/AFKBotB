@@ -1,20 +1,17 @@
 /**
  * HYPER-IMMORTAL DISCORD BEDROCK BOT (FIXED + RAM FRIENDLY)
  * ========================================================
- * Major fixes in this version:
- * - Actually detects a successful server join via the bedrock-protocol "join" event
- *   (spawn can be slow on many servers; waiting only for "spawn" can look like a hang).
- * - Adds bedrock-protocol onMsaCode handler so if tokens expire or are missing, you
- *   get the Microsoft device-code link/code inside Discord (or via DM fallback).
- * - Sets authTitle/deviceType/flow consistently with prismarine-auth to avoid
- *   silent kicks during login on some servers.
- * - Uses ping (skipPing=false) when version is "auto" so bedrock-protocol can
- *   detect the correct server version automatically.
- * - Improves watchdog logic so it times out on "join", not on "spawn".
+ * Fixes in this build (2026-02-22):
+ * - Fix: prevents jsp-raknet/bedrock-protocol crash: "Cannot destructure property 'reason' of 'undefined'"
+ * - Fix: extends Bedrock pre-ping timeout (default 1000ms is too short on some hosts)
+ * - Fix: uses bedrock-protocol 'join' event (not only 'spawn') so it doesn't look stuck forever
+ * - Fix: prefers IPv4 when a hostname resolves to both IPv4/IPv6 (common cause of UDP timeouts)
+ * - Adds: optional "Bedrock Version" field in Settings (use this if your server blocks ping/version detection)
+ * - Adds: better error messages for Ping timed out / UDP connectivity issues
  *
  * IMPORTANT:
- * - Set env vars: DISCORD_TOKEN, (optional) WEBHOOK_URL, (optional) FLY_VOLUME_PATH
- * - Node.js must be compatible with your discord.js + bedrock-protocol versions.
+ * - Env vars: DISCORD_TOKEN, (optional) WEBHOOK_URL, (optional) FLY_VOLUME_PATH
+ * - This bot uses RakNet/UDP to connect to Bedrock servers. If your host blocks outbound UDP, it cannot connect.
  */
 
 "use strict";
@@ -60,7 +57,81 @@ const fsSync = require("fs");
 const path = require("path");
 const os = require("os");
 const https = require("https");
+const dns = require("dns").promises;
 const { URL } = require("url");
+
+// ==================== RUNTIME PATCHES (NO node_modules EDITS) ====================
+// Patch #1: jsp-raknet sometimes emits 'disconnect' without an argument.
+// Some bedrock-protocol versions destructure { reason } from the event argument and crash if it's undefined.
+// We patch jsp-raknet's Client.emit to always pass an object for 'disconnect'/'close' if missing.
+function patchJspRaknetEmitSafety() {
+  const candidates = [
+    () => require("jsp-raknet"), // usually exports { Client, Server, ... }
+    () => require("jsp-raknet/js/Client"), // fallback (depends on build)
+    () => require("jsp-raknet/js/Client.js"),
+  ];
+
+  for (const load of candidates) {
+    try {
+      const mod = load();
+      const ClientClass = mod?.Client || mod?.default || mod;
+      if (!ClientClass?.prototype) continue;
+
+      if (ClientClass.prototype.__immortalEmitPatched) {
+        return true;
+      }
+
+      const originalEmit = ClientClass.prototype.emit;
+      if (typeof originalEmit !== "function") continue;
+
+      ClientClass.prototype.emit = function (event, ...args) {
+        try {
+          if ((event === "disconnect" || event === "close") && (args.length === 0 || args[0] === undefined)) {
+            return originalEmit.call(this, event, { reason: event });
+          }
+        } catch {}
+        return originalEmit.call(this, event, ...args);
+      };
+
+      ClientClass.prototype.__immortalEmitPatched = true;
+      console.log("[Immortal] Patched jsp-raknet Client.emit (disconnect/close payload safety)");
+      return true;
+    } catch (e) {
+      // keep trying candidates
+    }
+  }
+
+  console.warn("[Immortal] Warning: could not patch jsp-raknet emit (module shape/path may differ)");
+  return false;
+}
+
+// Patch #2: bedrock-protocol rak ping default timeout is 1000ms.
+// That is often too aggressive and produces "Ping timed out" even when the server is reachable.
+// We patch RakClient.prototype.ping default behavior to use a higher timeout unless explicitly provided.
+function patchBedrockPingDefaultTimeout(defaultTimeoutMs) {
+  try {
+    const rakFactory = require("bedrock-protocol/src/rak");
+    const { RakClient } = rakFactory("jsp-raknet"); // this should exist if jsp-raknet is installed
+    if (!RakClient?.prototype?.ping || RakClient.prototype.__immortalPingPatched) return true;
+
+    const originalPing = RakClient.prototype.ping;
+    RakClient.prototype.ping = function (timeout) {
+      const t = Number.isFinite(timeout) && timeout > 0 ? timeout : defaultTimeoutMs;
+      return originalPing.call(this, t);
+    };
+
+    RakClient.prototype.__immortalPingPatched = true;
+    console.log(`[Immortal] Patched bedrock-protocol RakClient.ping default timeout -> ${defaultTimeoutMs}ms`);
+    return true;
+  } catch (e) {
+    console.warn("[Immortal] Warning: could not patch bedrock-protocol ping timeout:", e?.message);
+    return false;
+  }
+}
+
+// Apply patches early
+patchJspRaknetEmitSafety();
+patchBedrockPingDefaultTimeout(parseInt(process.env.BEDROCK_PING_TIMEOUT_MS || "5000", 10));
 
 // ==================== CONFIGURATION ====================
 // Optimized for low-end devices
@@ -70,17 +141,21 @@ const CONFIG = {
   LOG_CHANNEL_ID: "146461503011173173",
 
   // File I/O
-  SAVE_DEBOUNCE_MS: 750, // slightly higher debounce = fewer writes
-  AUTO_SAVE_INTERVAL_MS: 60000, // save less often
+  SAVE_DEBOUNCE_MS: 750,
+  AUTO_SAVE_INTERVAL_MS: 60000,
 
   // Connection settings
   MAX_RECONNECT_ATTEMPTS: 5,
   RECONNECT_BASE_DELAY_MS: 15000,
   RECONNECT_MAX_DELAY_MS: 300000,
-  CONNECTION_TIMEOUT_MS: 20000, // socket/handshake timeout
-  JOIN_TIMEOUT_MS: 60000, // NEW: how long we wait to see "join" before declaring stuck
+  CONNECTION_TIMEOUT_MS: 20000,
   KEEPALIVE_INTERVAL_MS: 30000,
   STALE_CONNECTION_TIMEOUT_MS: 120000,
+
+  // Extra connection tuning
+  JOIN_WATCHDOG_EXTRA_MS: 15000,  // extra time beyond connectTimeout to reach 'join'
+  SPAWN_WATCHDOG_MS: 120000,      // time after 'join' to reach 'spawn' (chunks)
+  DNS_CACHE_MS: 10 * 60 * 1000,
 
   // Memory settings
   MEMORY_CHECK_INTERVAL_MS: 120000,
@@ -117,14 +192,17 @@ let client = null;
 let isShuttingDown = false;
 let shutdownInProgress = false;
 
-const sessions = new Map(); // uid -> session
-const pendingLink = new Map(); // uid -> {startTime}
-const lastMsa = new Map(); // uid -> {uri, code, at}
-const interactionCooldowns = new Map(); // uid -> lastTime
-const cleanupLocks = new Set(); // uid -> bool
-const pendingOperations = new Map(); // uid -> {time, type}
+const sessions = new Map();                 // uid -> session
+const pendingLink = new Map();              // uid -> {startTime}
+const lastMsa = new Map();                  // uid -> {uri, code, at}
+const interactionCooldowns = new Map();     // uid -> lastTime
+const cleanupLocks = new Set();             // uid -> bool
+const pendingOperations = new Map();        // uid -> {time, type}
 
 let discordReady = false;
+
+// DNS cache (RAM friendly)
+const dnsCache = new Map(); // host -> {addr, family, at}
 
 // Error tracking (RAM friendly): keep only timestamps for the last minute
 const errorTimes = [];
@@ -132,18 +210,14 @@ function trackError(context, error) {
   const now = Date.now();
   errorTimes.push(now);
 
-  // Remove old
   const cutoff = now - CONFIG.ERROR_WINDOW_MS;
   while (errorTimes.length && errorTimes[0] < cutoff) errorTimes.shift();
 
   if (errorTimes.length > CONFIG.MAX_ERRORS_PER_MINUTE) {
-    console.error(
-      `[ERROR TRACKER] Too many errors (${errorTimes.length}) in last minute. Throttling context=${context}`
-    );
+    console.error(`[ERROR TRACKER] Too many errors (${errorTimes.length}) in last minute. Throttling context=${context}`);
     return false;
   }
 
-  // Log minimal info
   const msg = error?.message || String(error);
   console.error(`[Error] ${context}: ${msg}`);
   return true;
@@ -169,7 +243,6 @@ process.on("uncaughtException", (err, origin) => {
     const logEntry =
       `[${new Date().toISOString()}] FATAL ERROR #${fatalErrorCount}\n` +
       `${err?.stack || err?.message || String(err)}\nOrigin: ${origin}\n\n`;
-    // sync write is OK here (this is already a fatal path)
     fsSync.appendFileSync(CRASH_LOG, logEntry);
   } catch {}
 
@@ -312,7 +385,6 @@ class ImmortalStore {
   set(key, value) {
     try {
       if (!this.data) this.data = {};
-      // RAM friendly clone: structuredClone if available, else minimal fallback
       const cloned = typeof structuredClone === "function" ? structuredClone(value) : deepClone(value);
       this.data[key] = cloned;
       this.debouncedSave();
@@ -344,12 +416,14 @@ class ImmortalStore {
     this.isSaving = true;
 
     try {
-      // no indentation = smaller files + less memory
-      const jsonString = JSON.stringify(this.data, (k, v) => {
-        if (typeof v === "bigint") return v.toString();
-        if (v === undefined) return null;
-        return v;
-      });
+      const jsonString = JSON.stringify(
+        this.data,
+        (k, v) => {
+          if (typeof v === "bigint") return v.toString();
+          if (v === undefined) return null;
+          return v;
+        }
+      );
 
       await safeWriteFile(this.filePath, jsonString);
     } catch (e) {
@@ -385,9 +459,7 @@ async function initializeStores() {
   activeSessionsStore = await sessionStore.load({});
 
   storesInitialized = true;
-  console.log(
-    `[Immortal] Loaded ${Object.keys(users).length} users and ${Object.keys(activeSessionsStore).length} active sessions`
-  );
+  console.log(`[Immortal] Loaded ${Object.keys(users).length} users and ${Object.keys(activeSessionsStore).length} active sessions`);
 }
 
 async function safeSaveAllData() {
@@ -401,7 +473,6 @@ function postJson(url, payload, timeoutMs = 5000) {
   return new Promise((resolve) => {
     if (!url) return resolve(false);
 
-    // Use fetch if available
     if (typeof fetch === "function") {
       const controller = new AbortController();
       const t = setTimeout(() => controller.abort(), timeoutMs);
@@ -418,7 +489,6 @@ function postJson(url, payload, timeoutMs = 5000) {
       return;
     }
 
-    // Fallback to https
     try {
       const u = new URL(url);
       const body = Buffer.from(JSON.stringify(payload), "utf8");
@@ -441,9 +511,7 @@ function postJson(url, payload, timeoutMs = 5000) {
       );
       req.on("error", () => resolve(false));
       req.on("timeout", () => {
-        try {
-          req.destroy();
-        } catch {}
+        try { req.destroy(); } catch {}
         resolve(false);
       });
       req.write(body);
@@ -485,7 +553,6 @@ async function safeReply(interaction, content, ephemeral = true) {
     const payload = typeof content === "string" ? { content } : { ...content };
     if (ephemeral) payload.ephemeral = true;
 
-    // If we've already acknowledged the interaction, follow up
     if (interaction.deferred || interaction.replied) {
       await interaction.followUp(payload).catch((err) => {
         console.error("[Discord] followUp failed:", err?.message);
@@ -513,6 +580,20 @@ async function safeDefer(interaction, ephemeral = true) {
   }
 }
 
+async function safeDM(uid, contentOrPayload) {
+  try {
+    if (!client || !uid) return false;
+    const user = await client.users.fetch(uid).catch(() => null);
+    if (!user) return false;
+
+    const payload = typeof contentOrPayload === "string" ? { content: contentOrPayload } : { ...contentOrPayload };
+    await user.send(payload).catch(() => null);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 // ==================== USER MANAGEMENT ====================
 function getUser(uid) {
   if (!uid || typeof uid !== "string" || !/^\d+$/.test(uid)) {
@@ -526,6 +607,7 @@ function getUser(uid) {
       createdAt: Date.now(),
       lastActive: Date.now(),
       linked: false,
+      lastKnownGoodVersion: null,
     };
     userStore.set(uid, users[uid]);
   }
@@ -552,7 +634,6 @@ async function unlinkMicrosoft(uid) {
   if (!uid) return false;
 
   try {
-    // Stop any active session first (more intuitive for users)
     if (sessions.has(uid)) {
       await stopSession(uid);
     }
@@ -585,7 +666,8 @@ function isValidIP(ip) {
   const ipv4Regex =
     /^(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$/;
   const ipv6Regex = /^(?:[0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}$/;
-  const hostnameRegex = /^[a-zA-Z0-9][a-zA-Z0-9-]{0,63}(?:\.[a-zA-Z0-9][a-zA-Z0-9-]{0,63})*$/;
+  const hostnameRegex =
+    /^[a-zA-Z0-9][a-zA-Z0-9-]{0,63}(?:\.[a-zA-Z0-9][a-zA-Z0-9-]{0,63})*$/;
 
   return ipv4Regex.test(ip) || ipv6Regex.test(ip) || hostnameRegex.test(ip);
 }
@@ -595,40 +677,60 @@ function isValidPort(port) {
   return Number.isFinite(num) && num > 0 && num <= 65535;
 }
 
-// ==================== AUTH CODE (DEVICE FLOW) NOTIFIER ====================
-async function notifyMsaCode(uid, data, interaction = null) {
+function normalizeBedrockVersion(v) {
+  const s = String(v || "").trim();
+  if (!s) return "auto";
+  const lower = s.toLowerCase();
+  if (lower === "auto") return "auto";
+  // Accept x.y.z or x.y.z.w (some builds)
+  if (!/^\d+\.\d+\.\d+(?:\.\d+)?$/.test(s)) return null;
+  return s;
+}
+
+function normalizeClientVersion(maybeVersion) {
+  if (!maybeVersion) return null;
+  if (typeof maybeVersion === "string") return maybeVersion;
+  if (typeof maybeVersion === "object") {
+    if (typeof maybeVersion.version === "string") return maybeVersion.version;
+    if (typeof maybeVersion.minecraftVersion === "string") return maybeVersion.minecraftVersion;
+    if (typeof maybeVersion.toString === "function") {
+      const s = maybeVersion.toString();
+      if (typeof s === "string" && s.includes(".")) return s;
+    }
+  }
+  return null;
+}
+
+// Prefer IPv4 when resolving hostnames (common issue on some hosts)
+async function resolveHostPreferIpv4(host) {
   try {
-    const uri = data?.verification_uri_complete || data?.verification_uri || "https://www.microsoft.com/link";
-    const code = data?.user_code || "(no code)";
-
-    lastMsa.set(uid, { uri, code, at: Date.now() });
-
-    const msg =
-      `**Microsoft sign-in required**\n\n` +
-      `1) Open: ${uri}\n` +
-      `2) Enter Code: \`${code}\`\n\n` +
-      `After you finish, press **Start** again.\n` +
-      `*(Tokens are stored locally and never shared.)*`;
-
-    const row = new ActionRowBuilder().addComponents(
-      new ButtonBuilder().setLabel("Open Microsoft").setStyle(ButtonStyle.Link).setURL(uri)
-    );
-
-    // Prefer the interaction if we have one (ephemeral)
-    if (interaction) {
-      await safeReply(interaction, { content: msg, components: [row] }, true);
-      return;
+    if (!host || typeof host !== "string") return { host, family: 0, resolved: false };
+    const cached = dnsCache.get(host);
+    const now = Date.now();
+    if (cached && now - cached.at < CONFIG.DNS_CACHE_MS) {
+      return { host: cached.addr, family: cached.family, resolved: true, original: host, cached: true };
     }
 
-    // Otherwise try DM (useful for auto-reconnect / restore)
-    if (client && client.isReady()) {
-      const user = await client.users.fetch(uid).catch(() => null);
-      if (user) {
-        await user.send({ content: msg, components: [row] }).catch(() => {});
-      }
+    // If already an IP, return as-is
+    const isIpv4 = /^(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$/.test(host);
+    const isIpv6 = /^(?:[0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}$/.test(host);
+    if (isIpv4) return { host, family: 4, resolved: true, original: host };
+    if (isIpv6) return { host, family: 6, resolved: true, original: host };
+
+    const addrs = await dns.lookup(host, { all: true, verbatim: true }).catch(() => []);
+    if (!Array.isArray(addrs) || addrs.length === 0) return { host, family: 0, resolved: false, original: host };
+
+    const ipv4 = addrs.find((a) => a && a.family === 4);
+    const chosen = ipv4 || addrs[0];
+
+    if (chosen?.address) {
+      dnsCache.set(host, { addr: chosen.address, family: chosen.family || 0, at: now });
+      return { host: chosen.address, family: chosen.family || 0, resolved: true, original: host };
     }
-  } catch (e) {
-    console.error(`[Auth ${uid}] notifyMsaCode error:`, e?.message);
+
+    return { host, family: 0, resolved: false, original: host };
+  } catch {
+    return { host, family: 0, resolved: false, original: host };
   }
 }
 
@@ -639,37 +741,31 @@ class ImmortalBedrockClient {
     this.options = options;
 
     this.client = null;
-    this.isConnected = false; // NOW means: joined & handshake complete (not just spawned)
+    this.isConnected = false;   // "joined"
     this.isConnecting = false;
     this.isCleaningUp = false;
 
     this.listeners = new Map();
     this.lastActivity = Date.now();
-
     this.entityId = null;
 
     this.manualStop = false;
     this.disconnectHandled = false;
 
-    this.hasLoggedIn = false;
-    this.hasJoined = false;
+    this.joinReady = false;
     this.spawnReady = false;
-
-    this.status = "init";
-    this.lastStatusAt = Date.now();
 
     this.authTick = 0;
     this.position = { x: 0, y: 0, z: 0 };
     this.rotation = { pitch: 0, yaw: 0, headYaw: 0 };
 
-    // RAM friendly: keep only one anti-AFK timer handle
     this.antiAfkTimer = null;
-    this.antiAfkStarted = false;
 
-    // callbacks (set by session)
-    this.onConnected = null; // fired on "join"
-    this.onSpawned = null; // fired on "spawn"
+    // callbacks
+    this.onJoined = null;
+    this.onSpawned = null;
     this.onDisconnected = null;
+    this.onStatus = null;
   }
 
   async create() {
@@ -707,46 +803,46 @@ class ImmortalBedrockClient {
       this.listeners.set(event, wrapped);
     };
 
-    safeOn("status", (status) => {
-      this.status = String(status || "unknown");
-      this.lastStatusAt = Date.now();
-      // This is very useful to see where it "hangs"
-      console.log(`[Bedrock ${this.uid}] Status: ${this.status}`);
-    });
+    const handleDisconnectOnce = (reason) => {
+      if (this.disconnectHandled) return;
+      this.disconnectHandled = true;
+
+      this.joinReady = false;
+      this.spawnReady = false;
+
+      this.isConnected = false;
+      this.isConnecting = false;
+
+      if (typeof this.onDisconnected === "function") this.onDisconnected(reason);
+    };
 
     safeOn("connect", () => {
-      console.log(`[Bedrock ${this.uid}] Socket connected (handshaking...)`);
+      console.log(`[Bedrock ${this.uid}] Connected (handshaking)`);
       this.isConnecting = true;
       this.disconnectHandled = false;
-      this.lastActivity = Date.now();
     });
 
-    safeOn("login", () => {
-      console.log(`[Bedrock ${this.uid}] Logged in`);
-      this.hasLoggedIn = true;
-      this.lastActivity = Date.now();
+    safeOn("status", (st) => {
+      if (typeof this.onStatus === "function") this.onStatus(st);
     });
 
-    // IMPORTANT: "join" means authentication+encryption complete and the client can receive game packets.
+    // IMPORTANT: 'join' happens after authentication/encryption and indicates a "real" connection
     safeOn("join", () => {
-      console.log(`[Bedrock ${this.uid}] Joined server`);
-      this.hasJoined = true;
+      console.log(`[Bedrock ${this.uid}] Joined (authenticated)`);
+      this.joinReady = true;
       this.isConnected = true;
       this.isConnecting = false;
-      this.lastActivity = Date.now();
-
-      if (typeof this.onConnected === "function") this.onConnected();
-      this.maybeStartAntiAfk();
+      if (typeof this.onJoined === "function") this.onJoined();
     });
 
     safeOn("spawn", () => {
       console.log(`[Bedrock ${this.uid}] Spawned`);
-      this.lastActivity = Date.now();
+      logToDiscord(`Bot of <@${this.uid}> spawned`);
 
       if (!this.spawnReady) {
         this.spawnReady = true;
         if (typeof this.onSpawned === "function") this.onSpawned();
-        this.maybeStartAntiAfk();
+        this.startAntiAfk();
       }
     });
 
@@ -754,8 +850,6 @@ class ImmortalBedrockClient {
       if (packet && packet.runtime_entity_id !== undefined) {
         this.entityId = packet.runtime_entity_id;
         this.position = packet.player_position || this.position;
-        this.lastActivity = Date.now();
-        this.maybeStartAntiAfk();
       }
     });
 
@@ -770,33 +864,18 @@ class ImmortalBedrockClient {
       }
     });
 
-    const handleDisconnectOnce = (reason) => {
-      if (this.disconnectHandled) return;
-      this.disconnectHandled = true;
-
-      this.spawnReady = false;
-      this.hasJoined = false;
-      this.hasLoggedIn = false;
-
-      this.isConnected = false;
-      this.isConnecting = false;
-
-      if (typeof this.onDisconnected === "function") this.onDisconnected(reason);
-    };
-
-    // Some servers kick during login; bedrock-protocol emits "kick"
     safeOn("kick", (packet) => {
       const reason = packet?.message || packet?.reason || "kicked";
       console.log(`[Bedrock ${this.uid}] Kicked: ${reason}`);
-      logToDiscord(`Bot of <@${this.uid}> kicked: ${String(reason).slice(0, 2000)}`);
-      handleDisconnectOnce(reason);
+      logToDiscord(`Bot of <@${this.uid}> kicked: ${reason}`);
+
+      handleDisconnectOnce(`kick: ${reason}`);
     });
 
-    // "disconnect" can also exist as a packet event, but we keep this for compatibility with older code
     safeOn("disconnect", (packet) => {
       const reason = packet?.reason || packet?.message || "disconnect";
       console.log(`[Bedrock ${this.uid}] Disconnected: ${reason}`);
-      logToDiscord(`Bot of <@${this.uid}> disconnected: ${String(reason).slice(0, 2000)}`);
+      logToDiscord(`Bot of <@${this.uid}> disconnected: ${reason}`);
 
       if (typeof reason === "string" && (reason.includes("wait") || reason.includes("before"))) {
         this.manualStop = true;
@@ -806,35 +885,26 @@ class ImmortalBedrockClient {
     });
 
     safeOn("error", (e) => {
-      console.error(`[Bedrock ${this.uid}] Error:`, e?.message);
+      const msg = e?.message || String(e || "unknown error");
+      console.error(`[Bedrock ${this.uid}] Error:`, msg);
       trackError("bedrock_client", e);
 
-      if (e?.message?.includes("jwt not active")) {
-        // Often caused by wrong system time on the host
-        console.warn(`[Bedrock ${this.uid}] Hint: "jwt not active" usually means the server/host clock is wrong.`);
+      // Common failure: ping/version detection timeout
+      if (msg.toLowerCase().includes("ping timed out")) {
+        // Mark as disconnected quickly so reconnect logic can happen
+        handleDisconnectOnce("Ping timed out (UDP)");
       }
 
-      if (e?.message?.includes("auth") || e?.message?.includes("token")) {
+      if (msg.includes("auth") || msg.includes("token") || msg.includes("jwt")) {
         this.manualStop = true;
       }
     });
 
-    safeOn("close", () => {
+    safeOn("close", (arg) => {
+      const reason = arg?.reason || "close";
       console.log(`[Bedrock ${this.uid}] Connection closed`);
-      handleDisconnectOnce("close");
+      handleDisconnectOnce(reason);
     });
-  }
-
-  maybeStartAntiAfk() {
-    // Start anti-AFK only when:
-    // - join happened (handshake complete)
-    // - start_game gave us an entity id
-    if (this.antiAfkStarted) return;
-    if (!this.client || this.isCleaningUp) return;
-    if (!this.hasJoined || !this.entityId) return;
-
-    this.antiAfkStarted = true;
-    this.startAntiAfk();
   }
 
   startAntiAfk() {
@@ -850,8 +920,7 @@ class ImmortalBedrockClient {
       };
 
       const sendPlayerAction = (action) => {
-        // "action" can be a string enum in minecraft-data (bedrock-protocol supports enums)
-        this.client.queue("player_action", {
+        this.client.write("player_action", {
           runtime_entity_id: this.entityId,
           action,
           position: currentPosition,
@@ -873,7 +942,7 @@ class ImmortalBedrockClient {
           if (action_id === 128 || action_id === 129) {
             payload.boat_rowing_time = Math.random();
           }
-          this.client.queue("animate", payload);
+          this.client.write("animate", payload);
         } else if (action < 0.6) {
           sendPlayerAction("start_sneak");
           setTimeout(() => {
@@ -918,17 +987,15 @@ class ImmortalBedrockClient {
           };
 
           try {
-            this.client.queue("player_auth_input", authInputPayload);
+            this.client.write("player_auth_input", authInputPayload);
             this.position = {
               x: currentPosition.x + delta.x,
               y: currentPosition.y,
               z: currentPosition.z + delta.z,
             };
           } catch (e) {
-            console.warn(
-              `[Bedrock ${this.uid}] player_auth_input failed, using move_player fallback: ${e?.message || "unknown"}`
-            );
-            this.client.queue("move_player", {
+            console.warn(`[Bedrock ${this.uid}] player_auth_input failed, using move_player fallback: ${e?.message || "unknown"}`);
+            this.client.write("move_player", {
               runtime_id: Number(this.entityId) || 0,
               position: {
                 x: currentPosition.x + delta.x,
@@ -970,13 +1037,11 @@ class ImmortalBedrockClient {
       clearTimeout(this.antiAfkTimer);
       this.antiAfkTimer = null;
     }
-    this.antiAfkStarted = false;
 
     await new Promise((r) => setTimeout(r, 100));
 
     if (this.client) {
       try {
-        // Remove listeners first
         for (const [event, handler] of this.listeners) {
           try {
             this.client.removeListener(event, handler);
@@ -984,7 +1049,6 @@ class ImmortalBedrockClient {
         }
         this.listeners.clear();
 
-        // Only close if we were connected or connecting
         if (this.isConnected || this.isConnecting) {
           await Promise.race([
             new Promise((resolve) => {
@@ -1007,10 +1071,6 @@ class ImmortalBedrockClient {
 
     this.isConnected = false;
     this.isConnecting = false;
-    this.hasJoined = false;
-    this.hasLoggedIn = false;
-    this.spawnReady = false;
-
     this.isCleaningUp = false;
     this.entityId = null;
 
@@ -1045,21 +1105,15 @@ async function safeCleanupSession(uid, isReconnect = false) {
 
     session.manualStop = !isReconnect;
 
-    // Cancel any scheduled reconnect timer
     if (session.reconnectTimer) {
       clearTimeout(session.reconnectTimer);
       session.reconnectTimer = null;
     }
 
-    // Clear timers
     if (Array.isArray(session.timers)) {
       for (const t of session.timers) {
-        try {
-          clearTimeout(t);
-        } catch {}
-        try {
-          clearInterval(t);
-        } catch {}
+        try { clearTimeout(t); } catch {}
+        try { clearInterval(t); } catch {}
       }
       session.timers.length = 0;
     }
@@ -1072,9 +1126,7 @@ async function safeCleanupSession(uid, isReconnect = false) {
     sessions.delete(uid);
 
     if (global.gc && sessions.size === 0) {
-      try {
-        global.gc();
-      } catch {}
+      try { global.gc(); } catch {}
     }
 
     console.log(`[Session ${uid}] Cleanup completed`);
@@ -1116,8 +1168,6 @@ async function saveSessionData(uid) {
 async function clearSessionData(uid) {
   if (!uid) return;
   if (activeSessionsStore[uid]) delete activeSessionsStore[uid];
-
-  // IMPORTANT FIX: delete key instead of setting null (prevents rejoin.json from growing forever)
   sessionStore.delete(uid);
 }
 
@@ -1151,12 +1201,13 @@ function scheduleAutoReconnect(uid, reason = "unknown") {
     return;
   }
 
-  const baseDelay = Math.min(CONFIG.RECONNECT_BASE_DELAY_MS * Math.pow(1.5, attempt - 1), CONFIG.RECONNECT_MAX_DELAY_MS);
+  const baseDelay = Math.min(
+    CONFIG.RECONNECT_BASE_DELAY_MS * Math.pow(1.5, attempt - 1),
+    CONFIG.RECONNECT_MAX_DELAY_MS
+  );
   const delay = baseDelay + Math.random() * 3000;
 
-  logToDiscord(
-    `Bot of <@${uid}> reconnecting in ${Math.round(delay / 1000)}s (attempt ${attempt}, reason: ${reason})`
-  );
+  logToDiscord(`Bot of <@${uid}> reconnecting in ${Math.round(delay / 1000)}s (attempt ${attempt}, reason: ${reason})`);
 
   if (session.reconnectTimer) clearTimeout(session.reconnectTimer);
   session.reconnectScheduled = true;
@@ -1179,25 +1230,20 @@ function scheduleAutoReconnect(uid, reason = "unknown") {
 async function startSession(uid, interaction = null, isReconnect = false, reconnectAttempt = 0) {
   if (!uid || isShuttingDown) return;
 
-  // Capacity check
   if (!isReconnect && sessions.size >= CONFIG.MAX_CONCURRENT_SESSIONS) {
     if (interaction) await safeReply(interaction, "Server at capacity. Please try again later.");
     return;
   }
 
-  // Stores must be ready
   if (!storesInitialized) {
     if (interaction) await safeReply(interaction, "System initializing, try again in a moment.");
     return;
   }
 
-  // Ensure we ACK quickly if this call is from an interaction
   if (interaction) {
-    // Do not defer if it's already deferred/replied
     await safeDefer(interaction, true);
   }
 
-  // Wait for cleanup locks
   if (cleanupLocks.has(uid)) {
     let tries = 0;
     while (cleanupLocks.has(uid) && tries < 20) {
@@ -1209,11 +1255,6 @@ async function startSession(uid, interaction = null, isReconnect = false, reconn
   const u = getUser(uid);
   if (!u) {
     if (interaction) await safeReply(interaction, "User data error.");
-    return;
-  }
-
-  if (!u.linked) {
-    if (interaction) await safeReply(interaction, "Please link your Microsoft account first.");
     return;
   }
 
@@ -1244,53 +1285,77 @@ async function startSession(uid, interaction = null, isReconnect = false, reconn
     return;
   }
 
-  // IMPORTANT: keep authTitle consistent with prismarine-auth default to avoid silent kicks on some servers.
-  const authTitle = Titles?.MinecraftNintendoSwitch || "MinecraftNintendoSwitch";
+  // Resolve host (prefer IPv4)
+  const resolved = await resolveHostPreferIpv4(ip);
+  const connectHost = resolved?.host || ip;
+
+  // Decide version strategy:
+  // - If user set a version (or we have lastKnownGoodVersion), set opts.version and skip ping
+  // - Otherwise allow ping to auto-match (but we globally patched ping default timeout)
+  const normalizedVersion = normalizeBedrockVersion(u.bedrockVersion || "auto");
+  const lastGood = normalizeBedrockVersion(u.lastKnownGoodVersion || "auto");
+  const desiredVersion = normalizedVersion && normalizedVersion !== "auto"
+    ? normalizedVersion
+    : (lastGood && lastGood !== "auto" ? lastGood : null);
 
   const opts = {
-    host: ip,
+    host: connectHost,
     port: parseInt(port, 10),
     connectTimeout: CONFIG.CONNECTION_TIMEOUT_MS,
     keepAlive: true,
-    viewDistance: 1, // low-end optimization
+    viewDistance: 1,            // low-end optimization
     profilesFolder: authDir,
     username: uid,
     offline: false,
-
-    // IMPORTANT FIX:
-    // If version is "auto", don't skip ping. bedrock-protocol uses ping to auto-detect server version.
-    // If a user later sets a specific version, we can safely skip ping.
-    skipPing: false,
-    followPort: true,
+    // If we know the version, skip ping/version detection (helps when ping is blocked)
+    skipPing: !!desiredVersion,
     autoInitPlayer: true,
+    raknetBackend: "jsp-raknet", // JS backend (avoid native deps)
+    onMsaCode: async (data) => {
+      // If tokens are missing/expired, bedrock-protocol can request device-code auth
+      const uri = data?.verification_uri_complete || data?.verification_uri || "https://www.microsoft.com/link";
+      const code = data?.user_code || "(no code)";
+      lastMsa.set(uid, { uri, code, at: Date.now() });
 
-    // Auth parameters (supported by prismarine-auth/bedrock-protocol even if not listed in API.md everywhere)
-    flow: "live",
-    authTitle,
-    deviceType: "Nintendo",
+      const msg =
+        `**Microsoft Authentication Required**\n\n` +
+        `1) Open: ${uri}\n` +
+        `2) Enter Code: \`${code}\`\n\n` +
+        `If your DMs are closed, use /panel and press Link Microsoft.`;
 
-    // If tokens are missing/expired, bedrock-protocol may request device-code auth.
-    // We forward that to Discord so the user can complete sign-in.
-    onMsaCode: (data) => notifyMsaCode(uid, data, interaction),
-
-    // JS backend (avoid native deps). If your host supports it, 'raknet-node' can also work.
-    raknetBackend: "jsp-raknet",
-
-    // Cleaner per-user connection log
-    conLog: (msg) => console.log(`[Bedrock ${uid}] ${msg}`),
+      // Try interaction followUp first, otherwise DM
+      if (interaction) {
+        const row = new ActionRowBuilder().addComponents(
+          new ButtonBuilder().setLabel("Open Microsoft").setStyle(ButtonStyle.Link).setURL(uri)
+        );
+        await safeReply(interaction, { content: msg, components: [row] }, true);
+      } else {
+        const row = new ActionRowBuilder().addComponents(
+          new ButtonBuilder().setLabel("Open Microsoft").setStyle(ButtonStyle.Link).setURL(uri)
+        );
+        await safeDM(uid, { content: msg, components: [row] });
+      }
+    },
   };
 
-  // Respect stored bedrockVersion if you ever add it to your settings UI.
-  const versionSetting = String(u.bedrockVersion || "auto").trim();
-  if (versionSetting && versionSetting.toLowerCase() !== "auto") {
-    opts.version = versionSetting;
-    opts.skipPing = true;
+  if (desiredVersion) {
+    opts.version = desiredVersion;
   }
 
   if (u.connectionType === "offline") {
     opts.username = u.offlineUsername || `AFK_${uid.slice(-4)}`;
     opts.offline = true;
-    // Offline mode doesn't need authTitle/deviceType, but leaving them doesn't hurt.
+  } else {
+    // If user hasn't linked yet, we still allow connect (onMsaCode will trigger),
+    // but we keep your original UX requiring link by default:
+    if (!u.linked) {
+      if (interaction) await safeReply(interaction, "Please link your Microsoft account first (Link Microsoft).");
+      return;
+    }
+    // Some servers can require authTitle; use Nintendo Switch title by default when available.
+    if (Titles?.MinecraftNintendoSwitch) {
+      opts.authTitle = Titles.MinecraftNintendoSwitch;
+    }
   }
 
   const session = {
@@ -1303,17 +1368,15 @@ async function startSession(uid, interaction = null, isReconnect = false, reconn
     reconnectTimer: null,
     timers: [],
     bedrockClient: null,
-
-    // For better user feedback
-    startInteraction: interaction || null,
+    notifiedJoin: false,
+    notifiedSpawn: false,
+    lastConnectMsgAt: 0,
+    lastErrorMsgAt: 0,
   };
 
   sessions.set(uid, session);
 
-  const bedrockClient = new ImmortalBedrockClient(uid, opts);
-  session.bedrockClient = bedrockClient;
-
-  // If we never reach "join", kill & reconnect (prevents "connecting forever" stuck sessions)
+  // Join watchdog: if we never reach 'join', reconnect (prevents "connecting forever")
   const joinWatchdog = setTimeout(async () => {
     const s = sessions.get(uid);
     if (!s || isShuttingDown || s.manualStop) return;
@@ -1321,34 +1384,43 @@ async function startSession(uid, interaction = null, isReconnect = false, reconn
     const bc = s.bedrockClient;
     if (!bc) return;
 
-    if (!bc.hasJoined) {
-      const hint =
-        `❌ Could not join \`${ip}:${port}\` within ${Math.round(CONFIG.JOIN_TIMEOUT_MS / 1000)}s.\n\n` +
-        `Possible causes:\n` +
-        `• Wrong IP/port\n` +
-        `• UDP blocked by your host (common on some free hosts)\n` +
-        `• Version mismatch (try setting a specific Bedrock version)\n` +
-        `• Microsoft token expired (you will receive a sign-in link/code)\n`;
-
-      if (interaction) safeReply(interaction, hint, true).catch(() => {});
+    if (!bc.isConnected) {
       console.warn(`[Session ${uid}] Join watchdog timeout -> reconnect`);
       bc.close().catch(() => {});
       scheduleAutoReconnect(uid, "join_watchdog_timeout");
     }
-  }, CONFIG.JOIN_TIMEOUT_MS);
+  }, CONFIG.CONNECTION_TIMEOUT_MS + CONFIG.JOIN_WATCHDOG_EXTRA_MS);
 
   session.timers.push(joinWatchdog);
 
-  const connectInteraction = interaction;
+  // Spawn watchdog: if we joined but never spawned (chunks), reconnect (optional safety)
+  const spawnWatchdog = setTimeout(async () => {
+    const s = sessions.get(uid);
+    if (!s || isShuttingDown || s.manualStop) return;
 
-  bedrockClient.onConnected = async () => {
+    const bc = s.bedrockClient;
+    if (!bc) return;
+
+    if (bc.isConnected && !bc.spawnReady) {
+      console.warn(`[Session ${uid}] Spawn watchdog timeout -> reconnect`);
+      bc.close().catch(() => {});
+      scheduleAutoReconnect(uid, "spawn_watchdog_timeout");
+    }
+  }, CONFIG.SPAWN_WATCHDOG_MS);
+
+  session.timers.push(spawnWatchdog);
+
+  const bedrockClient = new ImmortalBedrockClient(uid, opts);
+  session.bedrockClient = bedrockClient;
+
+  // Notify about resolved host/version
+  const prettyTarget = resolved?.resolved && resolved?.original && resolved?.original !== connectHost
+    ? `${resolved.original} → ${connectHost}:${port}`
+    : `${ip}:${port}`;
+
+  bedrockClient.onJoined = async () => {
     const s = sessions.get(uid);
     if (!s) return;
-
-    // Stop join watchdog
-    try {
-      clearTimeout(joinWatchdog);
-    } catch {}
 
     s.reconnectAttempt = 0;
     s.reconnectScheduled = false;
@@ -1357,27 +1429,50 @@ async function startSession(uid, interaction = null, isReconnect = false, reconn
       s.reconnectTimer = null;
     }
 
-    // Save only after real join (auth+encryption OK)
+    // Save session as active once joined
     await saveSessionData(uid);
 
-    if (connectInteraction) {
-      safeReply(connectInteraction, `✅ Joined \`${ip}:${port}\`! Waiting for spawn...`).catch(() => {});
+    // Cache last known good version if we can infer it
+    try {
+      const v =
+        normalizeClientVersion(bedrockClient.client?.options?.version) ||
+        normalizeClientVersion(bedrockClient.client?.version) ||
+        normalizeClientVersion(opts.version);
+      if (v && /^\d+\.\d+\.\d+/.test(v)) {
+        const u2 = getUser(uid);
+        if (u2 && u2.lastKnownGoodVersion !== v) {
+          u2.lastKnownGoodVersion = v;
+          userStore.set(uid, u2);
+        }
+      }
+    } catch {}
+
+    if (!s.notifiedJoin) {
+      s.notifiedJoin = true;
+      if (interaction) {
+        safeReply(interaction, `✅ Joined **${prettyTarget}**. Waiting for spawn/chunks...`).catch(() => {});
+      } else {
+        logToDiscord(`Bot of <@${uid}> joined ${prettyTarget}`);
+      }
     }
   };
 
   bedrockClient.onSpawned = async () => {
     const s = sessions.get(uid);
     if (!s) return;
+    if (s.notifiedSpawn) return;
+    s.notifiedSpawn = true;
 
-    if (connectInteraction) {
-      safeReply(connectInteraction, "✅ Spawned! Anti‑AFK + movement active.").catch(() => {});
+    if (interaction) {
+      safeReply(interaction, "✅ Spawned! Anti‑AFK + movement active.").catch(() => {});
     }
   };
 
-  bedrockClient.onDisconnected = (reason) => {
+  bedrockClient.onDisconnected = async (reason) => {
     const s = sessions.get(uid);
     if (!s || s.manualStop || isShuttingDown) return;
 
+    // If the underlying client marked manualStop, do not reconnect
     if (s.bedrockClient?.manualStop) {
       console.warn(`[Session ${uid}] manualStop=true, not reconnecting (${reason})`);
       clearSessionData(uid).catch(() => {});
@@ -1385,19 +1480,31 @@ async function startSession(uid, interaction = null, isReconnect = false, reconn
       return;
     }
 
-    // Trigger reconnect shortly after disconnect
-    scheduleAutoReconnect(uid, String(reason || "disconnect"));
+    // If ping timed out, provide a more useful hint once
+    const msg = String(reason || "");
+    if (interaction && msg.toLowerCase().includes("ping timed out")) {
+      const now = Date.now();
+      if (now - s.lastErrorMsgAt > 15000) {
+        s.lastErrorMsgAt = now;
+        safeReply(
+          interaction,
+          "⚠️ **Ping timed out.** This usually means UDP to the server is blocked/unreachable (wrong IP/port, firewall, host blocks UDP, or IPv6/hostname issues).\n" +
+            "If your server blocks ping/version detection, set **Bedrock Version** in Settings (e.g. `1.21.0`) and try again."
+        ).catch(() => {});
+      }
+    }
+
+    scheduleAutoReconnect(uid, msg || "disconnect");
   };
 
-  // Stale watchdog
-  const watchdog = setInterval(() => {
+  // Stale connection watchdog
+  const staleWatchdog = setInterval(() => {
     const s = sessions.get(uid);
-    if (!s) return clearInterval(watchdog);
+    if (!s) return clearInterval(staleWatchdog);
 
     const bc = s.bedrockClient;
     if (!bc) return;
 
-    // Stale activity check
     const stale = Date.now() - bc.lastActivity > CONFIG.STALE_CONNECTION_TIMEOUT_MS;
     if (stale && bc.isConnected && !bc.isCleaningUp) {
       console.warn(`[Session ${uid}] Stale connection detected, forcing reconnect...`);
@@ -1405,20 +1512,24 @@ async function startSession(uid, interaction = null, isReconnect = false, reconn
     }
   }, 30000);
 
-  session.timers.push(watchdog);
+  session.timers.push(staleWatchdog);
 
   try {
     const ok = await bedrockClient.create();
     if (!ok) throw new Error("Failed to create bedrock client");
 
     if (interaction) {
-      await safeReply(interaction, `🔄 Connecting to \`${ip}:${port}\`...`);
+      await safeReply(
+        interaction,
+        `🔄 Connecting to \`${prettyTarget}\`...\n` +
+          (desiredVersion ? `• Using version: \`${desiredVersion}\` (skip ping)\n` : "• Using auto version detect (ping)\n") +
+          (resolved?.resolved && resolved?.original && resolved?.original !== connectHost ? "• IPv4 preferred for hostname\n" : "")
+      );
     }
   } catch (e) {
     console.error(`[Session ${uid}] Start error:`, e?.message);
     if (interaction) await safeReply(interaction, `❌ Connection failed: ${e?.message || "Unknown error"}`);
 
-    // If it was a reconnect attempt, schedule another reconnect
     if (isReconnect) {
       scheduleAutoReconnect(uid, "start_error");
     } else {
@@ -1482,9 +1593,10 @@ async function linkMicrosoft(uid, interaction) {
       }
     );
 
-    // Race token acquisition with timeout
     const tokenPromise = flow.getMsaToken();
-    const timeoutPromise = new Promise((_, reject) => setTimeout(() => reject(new Error("Token acquisition timeout")), 240000));
+    const timeoutPromise = new Promise((_, reject) =>
+      setTimeout(() => reject(new Error("Token acquisition timeout")), 240000)
+    );
 
     await Promise.race([tokenPromise, timeoutPromise]);
 
@@ -1529,7 +1641,11 @@ function panelRow(isJava = false) {
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
 
 client = new Client({
-  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.DirectMessages, GatewayIntentBits.GuildMessages],
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.DirectMessages,
+    GatewayIntentBits.GuildMessages,
+  ],
   failIfNotExists: false,
   allowedMentions: {
     parse: ["users", "roles"],
@@ -1559,7 +1675,6 @@ client.on("shardError", (error, shardId) => {
   trackError("discord_shard", error);
 });
 
-// NOTE: discord.js v14 uses shard events, not "disconnect/reconnecting/resume"
 client.on("shardDisconnect", (closeEvent, shardId) => {
   console.log(`[Discord] Shard ${shardId} disconnected`, closeEvent?.code);
   discordReady = false;
@@ -1592,7 +1707,6 @@ client.once("ready", async () => {
     console.error("[Discord] Command registration failed:", e?.message);
   }
 
-  // Memory monitoring
   setInterval(() => {
     const mem = process.memoryUsage();
     const mb = mem.rss / 1024 / 1024;
@@ -1613,7 +1727,6 @@ client.once("ready", async () => {
     }
   }, CONFIG.MEMORY_CHECK_INTERVAL_MS);
 
-  // Periodic cleanup
   setInterval(() => {
     const cutoff = Date.now() - 60000;
 
@@ -1625,14 +1738,18 @@ client.once("ready", async () => {
       if (data?.time < cutoff) pendingOperations.delete(uid);
     }
 
-    // Cleanup old msa links (RAM friendly)
     const msaCutoff = Date.now() - 10 * 60 * 1000;
     for (const [uid, data] of lastMsa) {
       if (data?.at < msaCutoff) lastMsa.delete(uid);
     }
+
+    // DNS cache cleanup
+    const dnsCutoff = Date.now() - CONFIG.DNS_CACHE_MS;
+    for (const [host, data] of dnsCache) {
+      if (data?.at < dnsCutoff) dnsCache.delete(host);
+    }
   }, CONFIG.CLEANUP_INTERVAL_MS);
 
-  // Restore sessions after delay
   setTimeout(() => {
     if (discordReady && !isShuttingDown) restoreSessions().catch(() => {});
   }, 10000);
@@ -1650,13 +1767,12 @@ async function restoreSessions() {
     const sessionData = activeSessionsStore[uid];
     if (!sessionData) continue;
 
-    // Restore user config in memory (no heavy disk writes)
     if (!users[uid]) users[uid] = {};
     if (sessionData.server) users[uid].server = sessionData.server;
     if (sessionData.connectionType) users[uid].connectionType = sessionData.connectionType;
+    if (sessionData.bedrockVersion) users[uid].bedrockVersion = sessionData.bedrockVersion;
     if (sessionData.linked !== undefined) users[uid].linked = sessionData.linked;
     if (sessionData.offlineUsername) users[uid].offlineUsername = sessionData.offlineUsername;
-    if (sessionData.bedrockVersion) users[uid].bedrockVersion = sessionData.bedrockVersion;
 
     setTimeout(() => {
       if (!isShuttingDown && sessions.size < CONFIG.MAX_CONCURRENT_SESSIONS) {
@@ -1677,11 +1793,9 @@ client.on(Events.InteractionCreate, async (i) => {
     if (!i || isShuttingDown) return;
     if (!uid) return;
 
-    // Don't block modal submits with cooldown (user already typed data)
     const applyCooldown = !i.isModalSubmit();
 
     if (applyCooldown && isOnCooldown(uid)) {
-      // Always reply (fixes "This interaction failed")
       return safeReply(i, "⏳ Please wait a moment before trying again.");
     }
 
@@ -1712,7 +1826,6 @@ client.on(Events.InteractionCreate, async (i) => {
           await new Promise((r) => setTimeout(r, 1000));
           await client.login(DISCORD_TOKEN);
 
-          // Wait for ready
           let tries = 0;
           while (!client.isReady() && tries < 20) {
             await new Promise((r) => setTimeout(r, 500));
@@ -1766,7 +1879,6 @@ client.on(Events.InteractionCreate, async (i) => {
         await safeDefer(i, true);
         await safeReply(i, "🔄 Connecting...");
 
-        // Start session (will send followUps)
         startSession(uid, i, false, 0).catch(() => {});
         return;
       }
@@ -1792,10 +1904,11 @@ client.on(Events.InteractionCreate, async (i) => {
       }
 
       if (i.customId === "settings") {
-        // showModal MUST be the first acknowledgement (do not defer/reply before)
         const u = getUser(uid);
 
-        const modal = new ModalBuilder().setCustomId("settings_modal").setTitle("⚙️ Server Settings");
+        const modal = new ModalBuilder()
+          .setCustomId("settings_modal")
+          .setTitle("⚙️ Server Settings");
 
         const ipInput = new TextInputBuilder()
           .setCustomId("ip")
@@ -1813,7 +1926,19 @@ client.on(Events.InteractionCreate, async (i) => {
           .setValue(String(u.server?.port || 19132))
           .setMaxLength(5);
 
-        modal.addComponents(new ActionRowBuilder().addComponents(ipInput), new ActionRowBuilder().addComponents(portInput));
+        const versionInput = new TextInputBuilder()
+          .setCustomId("version")
+          .setLabel("Bedrock Version (e.g. 1.21.0 or auto)")
+          .setStyle(TextInputStyle.Short)
+          .setRequired(true)
+          .setValue(String(u.bedrockVersion || "auto").slice(0, 16))
+          .setMaxLength(16);
+
+        modal.addComponents(
+          new ActionRowBuilder().addComponents(ipInput),
+          new ActionRowBuilder().addComponents(portInput),
+          new ActionRowBuilder().addComponents(versionInput)
+        );
 
         return i.showModal(modal).catch((err) => {
           console.error("[Modal] Show error:", err?.message);
@@ -1824,9 +1949,10 @@ client.on(Events.InteractionCreate, async (i) => {
 
     // ===== MODAL SUBMIT =====
     if (i.isModalSubmit() && i.customId === "settings_modal") {
-      // This must reply quickly
       const ip = i.fields?.getTextInputValue("ip")?.trim();
       const portStr = i.fields?.getTextInputValue("port")?.trim();
+      const versionStr = i.fields?.getTextInputValue("version")?.trim();
+
       const port = parseInt(portStr, 10);
 
       if (!ip || !portStr) return safeReply(i, "❌ IP and Port are required.");
@@ -1834,17 +1960,21 @@ client.on(Events.InteractionCreate, async (i) => {
       if (!isValidIP(ip)) return safeReply(i, "❌ Invalid IP/hostname.");
       if (!isValidPort(port)) return safeReply(i, "❌ Invalid port (1-65535).");
 
+      const normV = normalizeBedrockVersion(versionStr);
+      if (!normV) return safeReply(i, "❌ Invalid version. Use `auto` or a version like `1.21.0`.");
+
       const u = getUser(uid);
       u.server = { ip, port };
+      u.bedrockVersion = normV;
       userStore.set(uid, u);
 
-      return safeReply(i, `✅ Saved: **${ip}:${port}**`);
+      return safeReply(i, `✅ Saved: **${ip}:${port}** | Version: **${normV}**`);
     }
+
   } catch (e) {
     console.error("[Interaction] Handler error:", e?.message);
     trackError("interaction", e);
 
-    // Best effort: avoid "interaction failed"
     try {
       await safeReply(i, "❌ An error occurred. Try again.");
     } catch {}
@@ -1879,12 +2009,10 @@ async function main() {
 
   await initializeStores();
 
-  // Periodic background save
   setInterval(() => {
     safeSaveAllData().catch(() => {});
   }, CONFIG.AUTO_SAVE_INTERVAL_MS);
 
-  // Discord login with retries
   let attempts = 0;
   const maxAttempts = 5;
 
