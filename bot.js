@@ -605,6 +605,11 @@ class ImmortalBedrockClient {
     this.entityId = null;
 
     this.manualStop = false;
+    this.disconnectHandled = false;
+    this.spawnReady = false;
+    this.authTick = 0;
+    this.position = { x: 0, y: 0, z: 0 };
+    this.rotation = { pitch: 0, yaw: 0, headYaw: 0 };
 
     // RAM friendly: keep only one anti-AFK timer handle
     this.antiAfkTimer = null;
@@ -651,30 +656,49 @@ class ImmortalBedrockClient {
 
     safeOn("connect", () => {
       console.log(`[Bedrock ${this.uid}] Connected`);
-      this.isConnected = true;
-      this.isConnecting = false;
-      if (typeof this.onConnected === "function") this.onConnected();
+      this.isConnecting = true;
+      this.disconnectHandled = false;
     });
 
     safeOn("spawn", () => {
       console.log(`[Bedrock ${this.uid}] Spawned`);
       logToDiscord(`Bot of <@${this.uid}> spawned`);
+
+      if (!this.spawnReady) {
+        this.spawnReady = true;
+        this.isConnected = true;
+        this.isConnecting = false;
+        if (typeof this.onConnected === "function") this.onConnected();
+        this.startAntiAfk();
+      }
     });
 
     safeOn("start_game", (packet) => {
       if (packet && packet.runtime_entity_id !== undefined) {
         this.entityId = packet.runtime_entity_id;
-        this.isConnected = true;
-        this.isConnecting = false;
-        if (typeof this.onConnected === "function") this.onConnected();
-
-        this.startAntiAfk();
+        this.position = packet.player_position || this.position;
       }
     });
 
-    safeOn("packet", () => {
+    safeOn("packet", (packet) => {
       this.lastActivity = Date.now();
+
+      if (packet?.name === "move_player" && packet.params?.position) {
+        this.position = packet.params.position;
+        this.rotation.pitch = packet.params.pitch ?? this.rotation.pitch;
+        this.rotation.yaw = packet.params.yaw ?? this.rotation.yaw;
+        this.rotation.headYaw = packet.params.head_yaw ?? this.rotation.headYaw;
+      }
     });
+
+    const handleDisconnectOnce = (reason) => {
+      if (this.disconnectHandled) return;
+      this.disconnectHandled = true;
+      this.spawnReady = false;
+      this.isConnected = false;
+      this.isConnecting = false;
+      if (typeof this.onDisconnected === "function") this.onDisconnected(reason);
+    };
 
     safeOn("disconnect", (packet) => {
       const reason = packet?.reason || "Unknown";
@@ -685,8 +709,7 @@ class ImmortalBedrockClient {
         this.manualStop = true;
       }
 
-      this.isConnected = false;
-      if (typeof this.onDisconnected === "function") this.onDisconnected(reason);
+      handleDisconnectOnce(reason);
     });
 
     safeOn("error", (e) => {
@@ -700,9 +723,7 @@ class ImmortalBedrockClient {
 
     safeOn("close", () => {
       console.log(`[Bedrock ${this.uid}] Connection closed`);
-      this.isConnected = false;
-      this.isConnecting = false;
-      if (typeof this.onDisconnected === "function") this.onDisconnected("close");
+      handleDisconnectOnce("close");
     });
   }
 
@@ -712,36 +733,109 @@ class ImmortalBedrockClient {
     const doAction = () => {
       if (!this.isConnected || !this.client || this.isCleaningUp) return;
 
+      const currentPosition = {
+        x: Number(this.position?.x || 0),
+        y: Number(this.position?.y || 0),
+        z: Number(this.position?.z || 0),
+      };
+
+      const sendPlayerAction = (action) => {
+        this.client.write("player_action", {
+          runtime_entity_id: this.entityId,
+          action,
+          position: currentPosition,
+          result_position: currentPosition,
+          face: 0,
+        });
+      };
+
       try {
         const action = Math.random();
 
-        if (action < 0.6) {
-          this.client.write("animate", {
-            action_id: 1,
+        if (action < 0.4) {
+          const animateActions = [1, 3, 4, 5, 128, 129];
+          const action_id = animateActions[Math.floor(Math.random() * animateActions.length)];
+          const payload = {
+            action_id,
             runtime_entity_id: this.entityId,
-          });
-        } else if (action < 0.8) {
-          this.client.write("player_action", {
-            runtime_entity_id: this.entityId,
-            action: 11,
-            position: { x: 0, y: 0, z: 0 },
-            result_code: 0,
-            face: 0,
-          });
-
+          };
+          if (action_id === 128 || action_id === 129) {
+            payload.boat_rowing_time = Math.random();
+          }
+          this.client.write("animate", payload);
+        } else if (action < 0.6) {
+          sendPlayerAction("start_sneak");
           setTimeout(() => {
             if (this.isConnected && this.client && !this.isCleaningUp) {
               try {
-                this.client.write("player_action", {
-                  runtime_entity_id: this.entityId,
-                  action: 12,
-                  position: { x: 0, y: 0, z: 0 },
-                  result_code: 0,
-                  face: 0,
-                });
+                sendPlayerAction("stop_sneak");
               } catch {}
             }
-          }, 2000 + Math.random() * 2000);
+          }, 1200 + Math.random() * 1200);
+        } else if (action < 0.8) {
+          const toggleActions = ["jump", "start_sprint", "stop_sprint"];
+          sendPlayerAction(toggleActions[Math.floor(Math.random() * toggleActions.length)]);
+        } else {
+          this.authTick += 1;
+          const moveX = (Math.random() - 0.5) * 0.6;
+          const moveZ = 0.2 + Math.random() * 0.8;
+          const delta = { x: moveX * 0.25, y: 0, z: moveZ * 0.25 };
+
+          const authInputPayload = {
+            pitch: this.rotation.pitch,
+            yaw: this.rotation.yaw,
+            position: currentPosition,
+            move_vector: { x: moveX, y: moveZ },
+            head_yaw: this.rotation.headYaw,
+            input_data: {
+              up: true,
+              down: false,
+              left: moveX < 0,
+              right: moveX > 0,
+              start_sprinting: Math.random() > 0.6,
+              stop_sprinting: false,
+              jumping: false,
+              start_jumping: false,
+              stop_sneaking: true,
+            },
+            input_mode: "mouse",
+            play_mode: "normal",
+            interaction_model: "crosshair",
+            interact_rotation: { x: this.rotation.yaw, y: this.rotation.pitch },
+            tick: this.authTick,
+            delta,
+          };
+
+          try {
+            this.client.write("player_auth_input", authInputPayload);
+            this.position = {
+              x: currentPosition.x + delta.x,
+              y: currentPosition.y,
+              z: currentPosition.z + delta.z,
+            };
+          } catch (e) {
+            console.warn(`[Bedrock ${this.uid}] player_auth_input failed, using move_player fallback: ${e?.message || "unknown"}`);
+            this.client.write("move_player", {
+              runtime_id: Number(this.entityId) || 0,
+              position: {
+                x: currentPosition.x + delta.x,
+                y: currentPosition.y,
+                z: currentPosition.z + delta.z,
+              },
+              pitch: this.rotation.pitch,
+              yaw: this.rotation.yaw,
+              head_yaw: this.rotation.headYaw,
+              mode: "normal",
+              on_ground: true,
+              ridden_runtime_id: 0,
+              tick: this.authTick,
+            });
+            this.position = {
+              x: currentPosition.x + delta.x,
+              y: currentPosition.y,
+              z: currentPosition.z + delta.z,
+            };
+          }
         }
       } catch {}
 
@@ -921,6 +1015,8 @@ function scheduleAutoReconnect(uid, reason = "unknown") {
   const session = sessions.get(uid);
   if (!session || session.manualStop) return;
 
+  if (session.reconnectScheduled) return;
+
   session.reconnectAttempt = (session.reconnectAttempt || 0) + 1;
   const attempt = session.reconnectAttempt;
 
@@ -940,9 +1036,12 @@ function scheduleAutoReconnect(uid, reason = "unknown") {
   logToDiscord(`Bot of <@${uid}> reconnecting in ${Math.round(delay / 1000)}s (attempt ${attempt}, reason: ${reason})`);
 
   if (session.reconnectTimer) clearTimeout(session.reconnectTimer);
+  session.reconnectScheduled = true;
   session.reconnectTimer = setTimeout(async () => {
     const s = sessions.get(uid);
     if (!s || isShuttingDown || s.manualStop) return;
+
+    s.reconnectScheduled = false;
 
     await safeCleanupSession(uid, true);
     await new Promise((r) => setTimeout(r, CONFIG.NATIVE_CLEANUP_DELAY_MS));
@@ -1048,6 +1147,7 @@ async function startSession(uid, interaction = null, isReconnect = false, reconn
     manualStop: false,
     isReconnecting: isReconnect,
     reconnectAttempt: reconnectAttempt || 0,
+    reconnectScheduled: false,
     reconnectTimer: null,
     timers: [],
     bedrockClient: null,
@@ -1055,22 +1155,57 @@ async function startSession(uid, interaction = null, isReconnect = false, reconn
 
   sessions.set(uid, session);
 
+  // If we never reach spawn, kill & reconnect (prevents "connecting forever" stuck sessions)
+  const connectWatchdog = setTimeout(async () => {
+    const s = sessions.get(uid);
+    if (!s || isShuttingDown || s.manualStop) return;
+
+    const bc = s.bedrockClient;
+    if (!bc) return;
+
+    if (!bc.isConnected) {
+      console.warn(`[Session ${uid}] Connect watchdog timeout -> reconnect`);
+      bc.close().catch(() => {});
+      scheduleAutoReconnect(uid, "connect_watchdog_timeout");
+    }
+  }, CONFIG.CONNECTION_TIMEOUT_MS + 10000);
+
+  session.timers.push(connectWatchdog);
+
   const bedrockClient = new ImmortalBedrockClient(uid, opts);
   session.bedrockClient = bedrockClient;
 
-  bedrockClient.onConnected = () => {
+  const connectInteraction = interaction;
+
+  bedrockClient.onConnected = async () => {
     const s = sessions.get(uid);
     if (!s) return;
+
     s.reconnectAttempt = 0;
+    s.reconnectScheduled = false;
     if (s.reconnectTimer) {
       clearTimeout(s.reconnectTimer);
       s.reconnectTimer = null;
+    }
+
+    // Save only after real spawn/start_game readiness
+    await saveSessionData(uid);
+
+    if (connectInteraction) {
+      safeReply(connectInteraction, "✅ Spawnattu! Anti‑AFK + liikkuminen aktiivinen.").catch(() => {});
     }
   };
 
   bedrockClient.onDisconnected = (reason) => {
     const s = sessions.get(uid);
     if (!s || s.manualStop || isShuttingDown) return;
+
+    if (s.bedrockClient?.manualStop) {
+      console.warn(`[Session ${uid}] manualStop=true, not reconnecting (${reason})`);
+      clearSessionData(uid).catch(() => {});
+      safeCleanupSession(uid).catch(() => {});
+      return;
+    }
 
     // Trigger reconnect shortly after disconnect
     scheduleAutoReconnect(uid, String(reason || "disconnect"));
@@ -1097,8 +1232,6 @@ async function startSession(uid, interaction = null, isReconnect = false, reconn
   try {
     const ok = await bedrockClient.create();
     if (!ok) throw new Error("Failed to create bedrock client");
-
-    await saveSessionData(uid);
 
     if (interaction) {
       await safeReply(interaction, `🔄 Connecting to \`${ip}:${port}\`...`);
