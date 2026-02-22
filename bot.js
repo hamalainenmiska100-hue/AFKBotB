@@ -1,17 +1,20 @@
 /**
  * HYPER-IMMORTAL DISCORD BEDROCK BOT (FIXED + RAM FRIENDLY)
  * ========================================================
- * - Fixes "This interaction failed"
- * - Fixes button + modal flow issues
- * - Fixes anti-AFK timer memory leak
- * - Fixes infinite reconnect attempts
- * - Fixes sessionStore null-leak (rejoin.json growing forever)
- * - Keeps the same core features: multi-layer error handling, safe file IO,
- *   auto reconnection, low-end optimizations, graceful shutdown, session restore.
+ * Major fixes in this version:
+ * - Actually detects a successful server join via the bedrock-protocol "join" event
+ *   (spawn can be slow on many servers; waiting only for "spawn" can look like a hang).
+ * - Adds bedrock-protocol onMsaCode handler so if tokens expire or are missing, you
+ *   get the Microsoft device-code link/code inside Discord (or via DM fallback).
+ * - Sets authTitle/deviceType/flow consistently with prismarine-auth to avoid
+ *   silent kicks during login on some servers.
+ * - Uses ping (skipPing=false) when version is "auto" so bedrock-protocol can
+ *   detect the correct server version automatically.
+ * - Improves watchdog logic so it times out on "join", not on "spawn".
  *
  * IMPORTANT:
- * - Use a supported Node.js version for your discord.js version.
  * - Set env vars: DISCORD_TOKEN, (optional) WEBHOOK_URL, (optional) FLY_VOLUME_PATH
+ * - Node.js must be compatible with your discord.js + bedrock-protocol versions.
  */
 
 "use strict";
@@ -67,14 +70,15 @@ const CONFIG = {
   LOG_CHANNEL_ID: "146461503011173173",
 
   // File I/O
-  SAVE_DEBOUNCE_MS: 750,            // slightly higher debounce = fewer writes
-  AUTO_SAVE_INTERVAL_MS: 60000,     // save less often
+  SAVE_DEBOUNCE_MS: 750, // slightly higher debounce = fewer writes
+  AUTO_SAVE_INTERVAL_MS: 60000, // save less often
 
   // Connection settings
   MAX_RECONNECT_ATTEMPTS: 5,
   RECONNECT_BASE_DELAY_MS: 15000,
   RECONNECT_MAX_DELAY_MS: 300000,
-  CONNECTION_TIMEOUT_MS: 20000,
+  CONNECTION_TIMEOUT_MS: 20000, // socket/handshake timeout
+  JOIN_TIMEOUT_MS: 60000, // NEW: how long we wait to see "join" before declaring stuck
   KEEPALIVE_INTERVAL_MS: 30000,
   STALE_CONNECTION_TIMEOUT_MS: 120000,
 
@@ -113,12 +117,12 @@ let client = null;
 let isShuttingDown = false;
 let shutdownInProgress = false;
 
-const sessions = new Map();                 // uid -> session
-const pendingLink = new Map();              // uid -> {startTime}
-const lastMsa = new Map();                  // uid -> {uri, code, at}
-const interactionCooldowns = new Map();     // uid -> lastTime
-const cleanupLocks = new Set();             // uid -> bool
-const pendingOperations = new Map();        // uid -> {time, type}
+const sessions = new Map(); // uid -> session
+const pendingLink = new Map(); // uid -> {startTime}
+const lastMsa = new Map(); // uid -> {uri, code, at}
+const interactionCooldowns = new Map(); // uid -> lastTime
+const cleanupLocks = new Set(); // uid -> bool
+const pendingOperations = new Map(); // uid -> {time, type}
 
 let discordReady = false;
 
@@ -133,7 +137,9 @@ function trackError(context, error) {
   while (errorTimes.length && errorTimes[0] < cutoff) errorTimes.shift();
 
   if (errorTimes.length > CONFIG.MAX_ERRORS_PER_MINUTE) {
-    console.error(`[ERROR TRACKER] Too many errors (${errorTimes.length}) in last minute. Throttling context=${context}`);
+    console.error(
+      `[ERROR TRACKER] Too many errors (${errorTimes.length}) in last minute. Throttling context=${context}`
+    );
     return false;
   }
 
@@ -339,14 +345,11 @@ class ImmortalStore {
 
     try {
       // no indentation = smaller files + less memory
-      const jsonString = JSON.stringify(
-        this.data,
-        (k, v) => {
-          if (typeof v === "bigint") return v.toString();
-          if (v === undefined) return null;
-          return v;
-        }
-      );
+      const jsonString = JSON.stringify(this.data, (k, v) => {
+        if (typeof v === "bigint") return v.toString();
+        if (v === undefined) return null;
+        return v;
+      });
 
       await safeWriteFile(this.filePath, jsonString);
     } catch (e) {
@@ -382,7 +385,9 @@ async function initializeStores() {
   activeSessionsStore = await sessionStore.load({});
 
   storesInitialized = true;
-  console.log(`[Immortal] Loaded ${Object.keys(users).length} users and ${Object.keys(activeSessionsStore).length} active sessions`);
+  console.log(
+    `[Immortal] Loaded ${Object.keys(users).length} users and ${Object.keys(activeSessionsStore).length} active sessions`
+  );
 }
 
 async function safeSaveAllData() {
@@ -436,7 +441,9 @@ function postJson(url, payload, timeoutMs = 5000) {
       );
       req.on("error", () => resolve(false));
       req.on("timeout", () => {
-        try { req.destroy(); } catch {}
+        try {
+          req.destroy();
+        } catch {}
         resolve(false);
       });
       req.write(body);
@@ -578,8 +585,7 @@ function isValidIP(ip) {
   const ipv4Regex =
     /^(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$/;
   const ipv6Regex = /^(?:[0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}$/;
-  const hostnameRegex =
-    /^[a-zA-Z0-9][a-zA-Z0-9-]{0,63}(?:\.[a-zA-Z0-9][a-zA-Z0-9-]{0,63})*$/;
+  const hostnameRegex = /^[a-zA-Z0-9][a-zA-Z0-9-]{0,63}(?:\.[a-zA-Z0-9][a-zA-Z0-9-]{0,63})*$/;
 
   return ipv4Regex.test(ip) || ipv6Regex.test(ip) || hostnameRegex.test(ip);
 }
@@ -589,6 +595,43 @@ function isValidPort(port) {
   return Number.isFinite(num) && num > 0 && num <= 65535;
 }
 
+// ==================== AUTH CODE (DEVICE FLOW) NOTIFIER ====================
+async function notifyMsaCode(uid, data, interaction = null) {
+  try {
+    const uri = data?.verification_uri_complete || data?.verification_uri || "https://www.microsoft.com/link";
+    const code = data?.user_code || "(no code)";
+
+    lastMsa.set(uid, { uri, code, at: Date.now() });
+
+    const msg =
+      `**Microsoft sign-in required**\n\n` +
+      `1) Open: ${uri}\n` +
+      `2) Enter Code: \`${code}\`\n\n` +
+      `After you finish, press **Start** again.\n` +
+      `*(Tokens are stored locally and never shared.)*`;
+
+    const row = new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setLabel("Open Microsoft").setStyle(ButtonStyle.Link).setURL(uri)
+    );
+
+    // Prefer the interaction if we have one (ephemeral)
+    if (interaction) {
+      await safeReply(interaction, { content: msg, components: [row] }, true);
+      return;
+    }
+
+    // Otherwise try DM (useful for auto-reconnect / restore)
+    if (client && client.isReady()) {
+      const user = await client.users.fetch(uid).catch(() => null);
+      if (user) {
+        await user.send({ content: msg, components: [row] }).catch(() => {});
+      }
+    }
+  } catch (e) {
+    console.error(`[Auth ${uid}] notifyMsaCode error:`, e?.message);
+  }
+}
+
 // ==================== BEDROCK CLIENT (IMMORTAL) ====================
 class ImmortalBedrockClient {
   constructor(uid, options) {
@@ -596,26 +639,36 @@ class ImmortalBedrockClient {
     this.options = options;
 
     this.client = null;
-    this.isConnected = false;
+    this.isConnected = false; // NOW means: joined & handshake complete (not just spawned)
     this.isConnecting = false;
     this.isCleaningUp = false;
 
     this.listeners = new Map();
     this.lastActivity = Date.now();
+
     this.entityId = null;
 
     this.manualStop = false;
     this.disconnectHandled = false;
+
+    this.hasLoggedIn = false;
+    this.hasJoined = false;
     this.spawnReady = false;
+
+    this.status = "init";
+    this.lastStatusAt = Date.now();
+
     this.authTick = 0;
     this.position = { x: 0, y: 0, z: 0 };
     this.rotation = { pitch: 0, yaw: 0, headYaw: 0 };
 
     // RAM friendly: keep only one anti-AFK timer handle
     this.antiAfkTimer = null;
+    this.antiAfkStarted = false;
 
     // callbacks (set by session)
-    this.onConnected = null;
+    this.onConnected = null; // fired on "join"
+    this.onSpawned = null; // fired on "spawn"
     this.onDisconnected = null;
   }
 
@@ -654,22 +707,46 @@ class ImmortalBedrockClient {
       this.listeners.set(event, wrapped);
     };
 
+    safeOn("status", (status) => {
+      this.status = String(status || "unknown");
+      this.lastStatusAt = Date.now();
+      // This is very useful to see where it "hangs"
+      console.log(`[Bedrock ${this.uid}] Status: ${this.status}`);
+    });
+
     safeOn("connect", () => {
-      console.log(`[Bedrock ${this.uid}] Connected`);
+      console.log(`[Bedrock ${this.uid}] Socket connected (handshaking...)`);
       this.isConnecting = true;
       this.disconnectHandled = false;
+      this.lastActivity = Date.now();
+    });
+
+    safeOn("login", () => {
+      console.log(`[Bedrock ${this.uid}] Logged in`);
+      this.hasLoggedIn = true;
+      this.lastActivity = Date.now();
+    });
+
+    // IMPORTANT: "join" means authentication+encryption complete and the client can receive game packets.
+    safeOn("join", () => {
+      console.log(`[Bedrock ${this.uid}] Joined server`);
+      this.hasJoined = true;
+      this.isConnected = true;
+      this.isConnecting = false;
+      this.lastActivity = Date.now();
+
+      if (typeof this.onConnected === "function") this.onConnected();
+      this.maybeStartAntiAfk();
     });
 
     safeOn("spawn", () => {
       console.log(`[Bedrock ${this.uid}] Spawned`);
-      logToDiscord(`Bot of <@${this.uid}> spawned`);
+      this.lastActivity = Date.now();
 
       if (!this.spawnReady) {
         this.spawnReady = true;
-        this.isConnected = true;
-        this.isConnecting = false;
-        if (typeof this.onConnected === "function") this.onConnected();
-        this.startAntiAfk();
+        if (typeof this.onSpawned === "function") this.onSpawned();
+        this.maybeStartAntiAfk();
       }
     });
 
@@ -677,6 +754,8 @@ class ImmortalBedrockClient {
       if (packet && packet.runtime_entity_id !== undefined) {
         this.entityId = packet.runtime_entity_id;
         this.position = packet.player_position || this.position;
+        this.lastActivity = Date.now();
+        this.maybeStartAntiAfk();
       }
     });
 
@@ -694,16 +773,30 @@ class ImmortalBedrockClient {
     const handleDisconnectOnce = (reason) => {
       if (this.disconnectHandled) return;
       this.disconnectHandled = true;
+
       this.spawnReady = false;
+      this.hasJoined = false;
+      this.hasLoggedIn = false;
+
       this.isConnected = false;
       this.isConnecting = false;
+
       if (typeof this.onDisconnected === "function") this.onDisconnected(reason);
     };
 
+    // Some servers kick during login; bedrock-protocol emits "kick"
+    safeOn("kick", (packet) => {
+      const reason = packet?.message || packet?.reason || "kicked";
+      console.log(`[Bedrock ${this.uid}] Kicked: ${reason}`);
+      logToDiscord(`Bot of <@${this.uid}> kicked: ${String(reason).slice(0, 2000)}`);
+      handleDisconnectOnce(reason);
+    });
+
+    // "disconnect" can also exist as a packet event, but we keep this for compatibility with older code
     safeOn("disconnect", (packet) => {
-      const reason = packet?.reason || "Unknown";
+      const reason = packet?.reason || packet?.message || "disconnect";
       console.log(`[Bedrock ${this.uid}] Disconnected: ${reason}`);
-      logToDiscord(`Bot of <@${this.uid}> kicked: ${reason}`);
+      logToDiscord(`Bot of <@${this.uid}> disconnected: ${String(reason).slice(0, 2000)}`);
 
       if (typeof reason === "string" && (reason.includes("wait") || reason.includes("before"))) {
         this.manualStop = true;
@@ -716,6 +809,11 @@ class ImmortalBedrockClient {
       console.error(`[Bedrock ${this.uid}] Error:`, e?.message);
       trackError("bedrock_client", e);
 
+      if (e?.message?.includes("jwt not active")) {
+        // Often caused by wrong system time on the host
+        console.warn(`[Bedrock ${this.uid}] Hint: "jwt not active" usually means the server/host clock is wrong.`);
+      }
+
       if (e?.message?.includes("auth") || e?.message?.includes("token")) {
         this.manualStop = true;
       }
@@ -725,6 +823,18 @@ class ImmortalBedrockClient {
       console.log(`[Bedrock ${this.uid}] Connection closed`);
       handleDisconnectOnce("close");
     });
+  }
+
+  maybeStartAntiAfk() {
+    // Start anti-AFK only when:
+    // - join happened (handshake complete)
+    // - start_game gave us an entity id
+    if (this.antiAfkStarted) return;
+    if (!this.client || this.isCleaningUp) return;
+    if (!this.hasJoined || !this.entityId) return;
+
+    this.antiAfkStarted = true;
+    this.startAntiAfk();
   }
 
   startAntiAfk() {
@@ -740,7 +850,8 @@ class ImmortalBedrockClient {
       };
 
       const sendPlayerAction = (action) => {
-        this.client.write("player_action", {
+        // "action" can be a string enum in minecraft-data (bedrock-protocol supports enums)
+        this.client.queue("player_action", {
           runtime_entity_id: this.entityId,
           action,
           position: currentPosition,
@@ -762,7 +873,7 @@ class ImmortalBedrockClient {
           if (action_id === 128 || action_id === 129) {
             payload.boat_rowing_time = Math.random();
           }
-          this.client.write("animate", payload);
+          this.client.queue("animate", payload);
         } else if (action < 0.6) {
           sendPlayerAction("start_sneak");
           setTimeout(() => {
@@ -807,15 +918,17 @@ class ImmortalBedrockClient {
           };
 
           try {
-            this.client.write("player_auth_input", authInputPayload);
+            this.client.queue("player_auth_input", authInputPayload);
             this.position = {
               x: currentPosition.x + delta.x,
               y: currentPosition.y,
               z: currentPosition.z + delta.z,
             };
           } catch (e) {
-            console.warn(`[Bedrock ${this.uid}] player_auth_input failed, using move_player fallback: ${e?.message || "unknown"}`);
-            this.client.write("move_player", {
+            console.warn(
+              `[Bedrock ${this.uid}] player_auth_input failed, using move_player fallback: ${e?.message || "unknown"}`
+            );
+            this.client.queue("move_player", {
               runtime_id: Number(this.entityId) || 0,
               position: {
                 x: currentPosition.x + delta.x,
@@ -857,6 +970,7 @@ class ImmortalBedrockClient {
       clearTimeout(this.antiAfkTimer);
       this.antiAfkTimer = null;
     }
+    this.antiAfkStarted = false;
 
     await new Promise((r) => setTimeout(r, 100));
 
@@ -893,6 +1007,10 @@ class ImmortalBedrockClient {
 
     this.isConnected = false;
     this.isConnecting = false;
+    this.hasJoined = false;
+    this.hasLoggedIn = false;
+    this.spawnReady = false;
+
     this.isCleaningUp = false;
     this.entityId = null;
 
@@ -936,8 +1054,12 @@ async function safeCleanupSession(uid, isReconnect = false) {
     // Clear timers
     if (Array.isArray(session.timers)) {
       for (const t of session.timers) {
-        try { clearTimeout(t); } catch {}
-        try { clearInterval(t); } catch {}
+        try {
+          clearTimeout(t);
+        } catch {}
+        try {
+          clearInterval(t);
+        } catch {}
       }
       session.timers.length = 0;
     }
@@ -950,7 +1072,9 @@ async function safeCleanupSession(uid, isReconnect = false) {
     sessions.delete(uid);
 
     if (global.gc && sessions.size === 0) {
-      try { global.gc(); } catch {}
+      try {
+        global.gc();
+      } catch {}
     }
 
     console.log(`[Session ${uid}] Cleanup completed`);
@@ -1027,13 +1151,12 @@ function scheduleAutoReconnect(uid, reason = "unknown") {
     return;
   }
 
-  const baseDelay = Math.min(
-    CONFIG.RECONNECT_BASE_DELAY_MS * Math.pow(1.5, attempt - 1),
-    CONFIG.RECONNECT_MAX_DELAY_MS
-  );
+  const baseDelay = Math.min(CONFIG.RECONNECT_BASE_DELAY_MS * Math.pow(1.5, attempt - 1), CONFIG.RECONNECT_MAX_DELAY_MS);
   const delay = baseDelay + Math.random() * 3000;
 
-  logToDiscord(`Bot of <@${uid}> reconnecting in ${Math.round(delay / 1000)}s (attempt ${attempt}, reason: ${reason})`);
+  logToDiscord(
+    `Bot of <@${uid}> reconnecting in ${Math.round(delay / 1000)}s (attempt ${attempt}, reason: ${reason})`
+  );
 
   if (session.reconnectTimer) clearTimeout(session.reconnectTimer);
   session.reconnectScheduled = true;
@@ -1121,24 +1244,53 @@ async function startSession(uid, interaction = null, isReconnect = false, reconn
     return;
   }
 
+  // IMPORTANT: keep authTitle consistent with prismarine-auth default to avoid silent kicks on some servers.
+  const authTitle = Titles?.MinecraftNintendoSwitch || "MinecraftNintendoSwitch";
+
   const opts = {
     host: ip,
     port: parseInt(port, 10),
     connectTimeout: CONFIG.CONNECTION_TIMEOUT_MS,
     keepAlive: true,
-    viewDistance: 1,            // low-end optimization
+    viewDistance: 1, // low-end optimization
     profilesFolder: authDir,
     username: uid,
     offline: false,
-    skipPing: true,
+
+    // IMPORTANT FIX:
+    // If version is "auto", don't skip ping. bedrock-protocol uses ping to auto-detect server version.
+    // If a user later sets a specific version, we can safely skip ping.
+    skipPing: false,
+    followPort: true,
     autoInitPlayer: true,
-    useTimeout: true,
-    raknetBackend: "jsp-raknet", // JS backend (avoid native deps)
+
+    // Auth parameters (supported by prismarine-auth/bedrock-protocol even if not listed in API.md everywhere)
+    flow: "live",
+    authTitle,
+    deviceType: "Nintendo",
+
+    // If tokens are missing/expired, bedrock-protocol may request device-code auth.
+    // We forward that to Discord so the user can complete sign-in.
+    onMsaCode: (data) => notifyMsaCode(uid, data, interaction),
+
+    // JS backend (avoid native deps). If your host supports it, 'raknet-node' can also work.
+    raknetBackend: "jsp-raknet",
+
+    // Cleaner per-user connection log
+    conLog: (msg) => console.log(`[Bedrock ${uid}] ${msg}`),
   };
+
+  // Respect stored bedrockVersion if you ever add it to your settings UI.
+  const versionSetting = String(u.bedrockVersion || "auto").trim();
+  if (versionSetting && versionSetting.toLowerCase() !== "auto") {
+    opts.version = versionSetting;
+    opts.skipPing = true;
+  }
 
   if (u.connectionType === "offline") {
     opts.username = u.offlineUsername || `AFK_${uid.slice(-4)}`;
     opts.offline = true;
+    // Offline mode doesn't need authTitle/deviceType, but leaving them doesn't hurt.
   }
 
   const session = {
@@ -1151,35 +1303,52 @@ async function startSession(uid, interaction = null, isReconnect = false, reconn
     reconnectTimer: null,
     timers: [],
     bedrockClient: null,
+
+    // For better user feedback
+    startInteraction: interaction || null,
   };
 
   sessions.set(uid, session);
 
-  // If we never reach spawn, kill & reconnect (prevents "connecting forever" stuck sessions)
-  const connectWatchdog = setTimeout(async () => {
+  const bedrockClient = new ImmortalBedrockClient(uid, opts);
+  session.bedrockClient = bedrockClient;
+
+  // If we never reach "join", kill & reconnect (prevents "connecting forever" stuck sessions)
+  const joinWatchdog = setTimeout(async () => {
     const s = sessions.get(uid);
     if (!s || isShuttingDown || s.manualStop) return;
 
     const bc = s.bedrockClient;
     if (!bc) return;
 
-    if (!bc.isConnected) {
-      console.warn(`[Session ${uid}] Connect watchdog timeout -> reconnect`);
+    if (!bc.hasJoined) {
+      const hint =
+        `❌ Could not join \`${ip}:${port}\` within ${Math.round(CONFIG.JOIN_TIMEOUT_MS / 1000)}s.\n\n` +
+        `Possible causes:\n` +
+        `• Wrong IP/port\n` +
+        `• UDP blocked by your host (common on some free hosts)\n` +
+        `• Version mismatch (try setting a specific Bedrock version)\n` +
+        `• Microsoft token expired (you will receive a sign-in link/code)\n`;
+
+      if (interaction) safeReply(interaction, hint, true).catch(() => {});
+      console.warn(`[Session ${uid}] Join watchdog timeout -> reconnect`);
       bc.close().catch(() => {});
-      scheduleAutoReconnect(uid, "connect_watchdog_timeout");
+      scheduleAutoReconnect(uid, "join_watchdog_timeout");
     }
-  }, CONFIG.CONNECTION_TIMEOUT_MS + 10000);
+  }, CONFIG.JOIN_TIMEOUT_MS);
 
-  session.timers.push(connectWatchdog);
-
-  const bedrockClient = new ImmortalBedrockClient(uid, opts);
-  session.bedrockClient = bedrockClient;
+  session.timers.push(joinWatchdog);
 
   const connectInteraction = interaction;
 
   bedrockClient.onConnected = async () => {
     const s = sessions.get(uid);
     if (!s) return;
+
+    // Stop join watchdog
+    try {
+      clearTimeout(joinWatchdog);
+    } catch {}
 
     s.reconnectAttempt = 0;
     s.reconnectScheduled = false;
@@ -1188,11 +1357,20 @@ async function startSession(uid, interaction = null, isReconnect = false, reconn
       s.reconnectTimer = null;
     }
 
-    // Save only after real spawn/start_game readiness
+    // Save only after real join (auth+encryption OK)
     await saveSessionData(uid);
 
     if (connectInteraction) {
-      safeReply(connectInteraction, "✅ Spawnattu! Anti‑AFK + liikkuminen aktiivinen.").catch(() => {});
+      safeReply(connectInteraction, `✅ Joined \`${ip}:${port}\`! Waiting for spawn...`).catch(() => {});
+    }
+  };
+
+  bedrockClient.onSpawned = async () => {
+    const s = sessions.get(uid);
+    if (!s) return;
+
+    if (connectInteraction) {
+      safeReply(connectInteraction, "✅ Spawned! Anti‑AFK + movement active.").catch(() => {});
     }
   };
 
@@ -1211,7 +1389,7 @@ async function startSession(uid, interaction = null, isReconnect = false, reconn
     scheduleAutoReconnect(uid, String(reason || "disconnect"));
   };
 
-  // Connection watchdog
+  // Stale watchdog
   const watchdog = setInterval(() => {
     const s = sessions.get(uid);
     if (!s) return clearInterval(watchdog);
@@ -1219,7 +1397,7 @@ async function startSession(uid, interaction = null, isReconnect = false, reconn
     const bc = s.bedrockClient;
     if (!bc) return;
 
-    // Stale activity check (optional)
+    // Stale activity check
     const stale = Date.now() - bc.lastActivity > CONFIG.STALE_CONNECTION_TIMEOUT_MS;
     if (stale && bc.isConnected && !bc.isCleaningUp) {
       console.warn(`[Session ${uid}] Stale connection detected, forcing reconnect...`);
@@ -1236,7 +1414,6 @@ async function startSession(uid, interaction = null, isReconnect = false, reconn
     if (interaction) {
       await safeReply(interaction, `🔄 Connecting to \`${ip}:${port}\`...`);
     }
-
   } catch (e) {
     console.error(`[Session ${uid}] Start error:`, e?.message);
     if (interaction) await safeReply(interaction, `❌ Connection failed: ${e?.message || "Unknown error"}`);
@@ -1307,9 +1484,7 @@ async function linkMicrosoft(uid, interaction) {
 
     // Race token acquisition with timeout
     const tokenPromise = flow.getMsaToken();
-    const timeoutPromise = new Promise((_, reject) =>
-      setTimeout(() => reject(new Error("Token acquisition timeout")), 240000)
-    );
+    const timeoutPromise = new Promise((_, reject) => setTimeout(() => reject(new Error("Token acquisition timeout")), 240000));
 
     await Promise.race([tokenPromise, timeoutPromise]);
 
@@ -1354,11 +1529,7 @@ function panelRow(isJava = false) {
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
 
 client = new Client({
-  intents: [
-    GatewayIntentBits.Guilds,
-    GatewayIntentBits.DirectMessages,
-    GatewayIntentBits.GuildMessages,
-  ],
+  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.DirectMessages, GatewayIntentBits.GuildMessages],
   failIfNotExists: false,
   allowedMentions: {
     parse: ["users", "roles"],
@@ -1485,6 +1656,7 @@ async function restoreSessions() {
     if (sessionData.connectionType) users[uid].connectionType = sessionData.connectionType;
     if (sessionData.linked !== undefined) users[uid].linked = sessionData.linked;
     if (sessionData.offlineUsername) users[uid].offlineUsername = sessionData.offlineUsername;
+    if (sessionData.bedrockVersion) users[uid].bedrockVersion = sessionData.bedrockVersion;
 
     setTimeout(() => {
       if (!isShuttingDown && sessions.size < CONFIG.MAX_CONCURRENT_SESSIONS) {
@@ -1623,9 +1795,7 @@ client.on(Events.InteractionCreate, async (i) => {
         // showModal MUST be the first acknowledgement (do not defer/reply before)
         const u = getUser(uid);
 
-        const modal = new ModalBuilder()
-          .setCustomId("settings_modal")
-          .setTitle("⚙️ Server Settings");
+        const modal = new ModalBuilder().setCustomId("settings_modal").setTitle("⚙️ Server Settings");
 
         const ipInput = new TextInputBuilder()
           .setCustomId("ip")
@@ -1643,10 +1813,7 @@ client.on(Events.InteractionCreate, async (i) => {
           .setValue(String(u.server?.port || 19132))
           .setMaxLength(5);
 
-        modal.addComponents(
-          new ActionRowBuilder().addComponents(ipInput),
-          new ActionRowBuilder().addComponents(portInput)
-        );
+        modal.addComponents(new ActionRowBuilder().addComponents(ipInput), new ActionRowBuilder().addComponents(portInput));
 
         return i.showModal(modal).catch((err) => {
           console.error("[Modal] Show error:", err?.message);
@@ -1673,7 +1840,6 @@ client.on(Events.InteractionCreate, async (i) => {
 
       return safeReply(i, `✅ Saved: **${ip}:${port}**`);
     }
-
   } catch (e) {
     console.error("[Interaction] Handler error:", e?.message);
     trackError("interaction", e);
