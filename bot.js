@@ -225,60 +225,20 @@ let discordReady = false;
 let discordReconnectAttempts = 0;
 const cleanupLocks = new Set();
 
-// ==================== SAFETY HELPERS (PREVENT NATIVE CRASHES) ====================
+// ==================== DISCORD FLAGS HELPERS (v15 compatible) ====================
 
-/**
- * `bedrock-protocol` uses native/network internals that can segfault if writes
- * happen while the client is closing/being GC'd. These helpers make all timed
- * operations cancellable and gate packet writes.
- */
-function isClientUsable(session) {
-    if (!session) return false;
-    if (session.isCleaningUp) return false;
-    if (!session.client) return false;
-    if (!session.connected) return false;
-    // Some versions expose `closed`/`ended`; keep checks defensive.
-    if (session.client.closed === true) return false;
-    if (session.client.ended === true) return false;
-    return true;
-}
+// discord.js v15 deprecates `ephemeral: true` in favor of interaction response `flags`.
+const EPHEMERAL_FLAGS = MessageFlags?.Ephemeral ?? (1 << 6);
 
-function safeClientWrite(session, method, name, data) {
-    if (!isClientUsable(session)) return false;
-    try {
-        if (method === 'write') session.client.write(name, data);
-        else session.client.queue(name, data);
-        return true;
-    } catch (e) {
-        // Prevent crashes and let health monitor/reconnect handle recovery.
-        console.error(`Safe ${method} failed for ${name}:`, e?.message);
-        return false;
+function withEphemeralFlags(payload, ephemeral) {
+    if (!payload || typeof payload !== 'object') return payload;
+    if (!ephemeral) {
+        if ('ephemeral' in payload) delete payload.ephemeral;
+        return payload;
     }
-}
-
-function setSessionTimeout(session, fn, ms) {
-    if (!session) return null;
-    if (!session.extraTimeouts) session.extraTimeouts = new Set();
-    const id = setTimeout(() => {
-        try {
-            session.extraTimeouts?.delete(id);
-            fn();
-        } catch (e) {
-            // swallow
-        }
-    }, ms);
-    session.extraTimeouts.add(id);
-    return id;
-}
-
-function clearSessionTimeouts(session) {
-    try {
-        if (!session?.extraTimeouts) return;
-        for (const id of session.extraTimeouts) clearTimeout(id);
-        session.extraTimeouts.clear();
-    } catch (e) {
-        // swallow
-    }
+    if (payload.flags === undefined) payload.flags = EPHEMERAL_FLAGS;
+    if ('ephemeral' in payload) delete payload.ephemeral;
+    return payload;
 }
 
 // ==================== ENHANCED DISCORD CLIENT ====================
@@ -415,6 +375,51 @@ async function clearSessionData(uid) {
     }
 }
 
+// ==================== SAFE CLIENT CLOSE (prevents native double-free) ====================
+
+async function safeCloseBedrockClient(uid, s, waitMs = 2000) {
+    if (!s || !s.client) return;
+    const client = s.client;
+    if (s.clientClosing) return;
+    s.clientClosing = true;
+
+    try {
+        // Remove listeners early to prevent late packet handlers writing back.
+        try { client.removeAllListeners(); } catch (e) {}
+
+        await new Promise((resolve) => {
+            let done = false;
+            const finish = () => {
+                if (done) return;
+                done = true;
+                resolve();
+            };
+
+            const timeout = setTimeout(() => {
+                console.log(`Force closing client for ${uid}`);
+                finish();
+            }, waitMs);
+
+            try {
+                client.once?.('close', () => {
+                    clearTimeout(timeout);
+                    finish();
+                });
+            } catch (e) {}
+
+            try {
+                // Some bedrock-protocol states can throw here; swallow to avoid process crash.
+                client.close();
+            } catch (e) {
+                clearTimeout(timeout);
+                finish();
+            }
+        });
+    } finally {
+        s.client = null;
+    }
+}
+
 // ==================== SESSION MANAGEMENT ====================
 
 async function cleanupSession(uid) {
@@ -429,7 +434,6 @@ async function cleanupSession(uid) {
         if (!s) return;
         s.isCleaningUp = true;
         s.manualStop = true;
-        s.connected = false;
         const timers = ['reconnectTimer', 'afkTimeout', 'keepaliveTimer', 'staleCheckTimer', 'tokenRefreshTimer'];
         timers.forEach(timer => {
             if (s[timer]) {
@@ -438,39 +442,22 @@ async function cleanupSession(uid) {
                 s[timer] = null;
             }
         });
-        // Clear any nested / delayed timeouts scheduled from anti-AFK or other callbacks.
-        clearSessionTimeouts(s);
+
+        // Cancel any nested anti-AFK timeouts (jump landing / sneak stop etc.)
+        try {
+            if (s.pendingTimeouts && s.pendingTimeouts.size) {
+                for (const t of s.pendingTimeouts) clearTimeout(t);
+                s.pendingTimeouts.clear();
+            }
+        } catch (e) {}
+
         await new Promise(resolve => setTimeout(resolve, 100));
+
         if (s.client) {
             try {
-                s.client.removeAllListeners('packet');
-                s.client.removeAllListeners('spawn');
-                s.client.removeAllListeners('start_game');
-                await new Promise((resolve) => {
-                    const client = s.client;
-                    if (!client) {
-                        resolve();
-                        return;
-                    }
-                    const timeout = setTimeout(() => {
-                        console.log(`Force closing client for ${uid}`);
-                        resolve();
-                    }, 2000);
-                    try {
-                        client.once('close', () => {
-                            clearTimeout(timeout);
-                            resolve();
-                        });
-                        client.close();
-                    } catch (e) {
-                        clearTimeout(timeout);
-                        resolve();
-                    }
-                });
+                await safeCloseBedrockClient(uid, s, 2000);
             } catch (e) {
                 console.error(`Error closing client for ${uid}:`, e);
-            } finally {
-                s.client = null;
             }
         }
         sessions.delete(uid);
@@ -545,8 +532,8 @@ function startHealthMonitoring(uid) {
     if (!s) return;
     s.keepaliveTimer = setInterval(() => {
         try {
-            if (!isClientUsable(s)) return;
-            safeClientWrite(s, 'queue', 'client_cache_status', { enabled: false });
+            if (!s.connected || !s.client || s.isCleaningUp) return;
+            s.client.queue('client_cache_status', { enabled: false });
             s.lastKeepalive = Date.now();
         } catch (e) {
             if (!s.isReconnecting && !s.isCleaningUp && !s.manualStop) {
@@ -554,14 +541,14 @@ function startHealthMonitoring(uid) {
             }
         }
     }, CONFIG.KEEPALIVE_INTERVAL_MS);
-    s.staleCheckTimer = setInterval(() => {
+    s.staleCheckTimer = setInterval(async () => {
         try {
             if (!s.connected || s.isCleaningUp) return;
             const lastActivity = Math.max(s.lastPacketTime || 0, s.lastKeepalive || 0);
             if (Date.now() - lastActivity > CONFIG.STALE_CONNECTION_TIMEOUT_MS) {
                 if (s.client && !s.isCleaningUp) {
                     try {
-                        s.client.close();
+                        await safeCloseBedrockClient(uid, s, 1500);
                     } catch (e) {}
                 }
                 if (!s.isReconnecting && !s.isCleaningUp && !s.manualStop) {
@@ -654,19 +641,40 @@ async function logToDiscord(message) {
 async function safeReply(interaction, content, ephemeral = true) {
     try {
         if (!interaction) return;
-        const payload = typeof content === 'string' ? { content } : content;
-        if (ephemeral && payload.ephemeral === undefined) {
-            payload.ephemeral = true;
-        }
-        if (interaction.replied || interaction.deferred) {
+        const payload = typeof content === 'string' ? { content } : { ...content };
+        withEphemeralFlags(payload, ephemeral);
+
+        // If we haven't acknowledged the interaction yet, prefer deferring first.
+        // This prevents "Unknown interaction" errors when processing is slow.
+        if (!interaction.replied && !interaction.deferred) {
             try {
-                await interaction.followUp(payload);
-            } catch (err) {
-                console.error("Failed to send followUp:", err);
+                await interaction.deferReply(withEphemeralFlags({}, ephemeral));
+            } catch (e) {
+                // If the interaction already expired, do not crash the process.
+                const code = e?.code;
+                if (code === 10062) return; // Unknown interaction
             }
-        } else {
-            await interaction.reply(payload);
         }
+
+        if (interaction.deferred && !interaction.replied) {
+            await interaction.editReply(payload).catch((e) => {
+                if (e?.code !== 10062) console.error("Failed to editReply:", e);
+            });
+            return;
+        }
+
+        // Already replied, send follow-up.
+        if (interaction.replied) {
+            await interaction.followUp(payload).catch((e) => {
+                if (e?.code !== 10062) console.error("Failed to followUp:", e);
+            });
+            return;
+        }
+
+        // Fallback.
+        await interaction.reply(payload).catch((e) => {
+            if (e?.code !== 10062) console.error("Failed to reply:", e);
+        });
     } catch (e) {
         console.error("SafeReply error:", e);
     }
@@ -695,18 +703,18 @@ function panelRow(isJava = false) {
 
 async function linkMicrosoft(uid, interaction) {
     if (!uid || !interaction) return;
-    await interaction.deferReply({ ephemeral: true }).catch(() => {});
+    await interaction.deferReply(withEphemeralFlags({}, true)).catch(() => {});
     if (pendingLink.has(uid)) {
-        return interaction.followUp({ content: "Login already in progress. Check your DMs or use the last code.", ephemeral: true }).catch(() => {});
+        return interaction.followUp(withEphemeralFlags({ content: "Login already in progress. Check your DMs or use the last code." }, true)).catch(() => {});
     }
     const authDir = await getUserAuthDir(uid);
     if (!authDir) {
-        return interaction.followUp({ content: "System error: Cannot create auth directory.", ephemeral: true }).catch(() => {});
+        return interaction.followUp(withEphemeralFlags({ content: "System error: Cannot create auth directory." }, true)).catch(() => {});
     }
     const u = getUser(uid);
     const timeoutId = setTimeout(() => {
         pendingLink.delete(uid);
-        interaction.followUp({ content: "Login timed out after 5 minutes.", ephemeral: true }).catch(() => {});
+        interaction.followUp(withEphemeralFlags({ content: "Login timed out after 5 minutes." }, true)).catch(() => {});
     }, 300000);
     try {
         const flow = new Authflow(
@@ -725,7 +733,7 @@ async function linkMicrosoft(uid, interaction) {
                 const row = new ActionRowBuilder().addComponents(
                     new ButtonBuilder().setLabel("Open link").setStyle(ButtonStyle.Link).setURL(uri)
                 );
-                await interaction.followUp({ content: msg, components: [row], ephemeral: true }).catch(() => {});
+                await interaction.followUp(withEphemeralFlags({ content: msg, components: [row] }, true)).catch(() => {});
             }
         );
         flow.getMsaToken().then(async () => {
@@ -733,19 +741,19 @@ async function linkMicrosoft(uid, interaction) {
             u.linked = true;
             u.tokenAcquiredAt = Date.now();
             await userStore.save();
-            await interaction.followUp({ content: "Microsoft account linked!", ephemeral: true }).catch(() => {});
+            await interaction.followUp(withEphemeralFlags({ content: "Microsoft account linked!" }, true)).catch(() => {});
             pendingLink.delete(uid);
         }).catch(async (e) => {
             clearTimeout(timeoutId);
             const errorMsg = e?.message || "Unknown error";
-            await interaction.followUp({ content: `Login failed: ${errorMsg}`, ephemeral: true }).catch(() => {});
+            await interaction.followUp(withEphemeralFlags({ content: `Login failed: ${errorMsg}` }, true)).catch(() => {});
             pendingLink.delete(uid);
         });
         pendingLink.set(uid, true);
     } catch (e) {
         clearTimeout(timeoutId);
         pendingLink.delete(uid);
-        await interaction.followUp({ content: "Authentication system error.", ephemeral: true }).catch(() => {});
+        await interaction.followUp(withEphemeralFlags({ content: "Authentication system error." }, true)).catch(() => {});
     }
 }
 
@@ -764,7 +772,7 @@ async function startSession(uid, interaction, isReconnect = false, reconnectAtte
     }
 
     if (interaction && !interaction.deferred && !interaction.replied) {
-        await interaction.deferReply({ ephemeral: true }).catch(() => {});
+        await interaction.deferReply(withEphemeralFlags({}, true)).catch(() => {});
     }
 
     if (cleanupLocks.has(uid)) {
@@ -853,8 +861,9 @@ async function startSession(uid, interaction, isReconnect = false, reconnectAtte
 
     const currentSession = {
         client: null,
-        runId: `${Date.now()}_${Math.random().toString(16).slice(2)}`,
+        clientClosing: false,
         startedAt: Date.now(),
+        runId: `${Date.now()}_${Math.random().toString(16).slice(2)}`,
         manualStop: false,
         connected: false,
         isReconnecting: false,
@@ -863,6 +872,7 @@ async function startSession(uid, interaction, isReconnect = false, reconnectAtte
         entityId: null,
         reconnectTimer: null,
         afkTimeout: null,
+        pendingTimeouts: new Set(),
         keepaliveTimer: null,
         staleCheckTimer: null,
         lastPacketTime: Date.now(),
@@ -871,8 +881,7 @@ async function startSession(uid, interaction, isReconnect = false, reconnectAtte
         position: { x: 0, y: 0, z: 0 },
         yaw: 0,
         pitch: 0,
-        tick: 0,
-        extraTimeouts: new Set()
+        tick: 0
     };
 
     sessions.set(uid, currentSession);
@@ -897,12 +906,6 @@ async function startSession(uid, interaction, isReconnect = false, reconnectAtte
 
     mc.on('disconnect', (packet) => {
         if (currentSession.isCleaningUp) return;
-        currentSession.connected = false;
-        if (currentSession.afkTimeout) {
-            clearTimeout(currentSession.afkTimeout);
-            currentSession.afkTimeout = null;
-        }
-        clearSessionTimeouts(currentSession);
         const reason = packet?.reason || "Unknown reason";
         logToDiscord(`Bot of <@${uid}> was kicked: ${reason}`);
         if (reason.includes("wait") || reason.includes("etwas") || reason.includes("before")) {
@@ -911,26 +914,35 @@ async function startSession(uid, interaction, isReconnect = false, reconnectAtte
         }
     });
 
-    const initialRunId = currentSession.runId;
-    const performAntiAfk = () => {
-        if (isShuttingDown) return;
+    const scheduleSessionTimeout = (ms, fn) => {
         const s = sessions.get(uid);
-        if (!s) return;
-        // If session was recreated, ignore stale timeouts from the old run.
-        if (s.runId !== initialRunId) return;
-        if (!isClientUsable(s)) return;
+        if (!s) return null;
+        const runId = s.runId;
+        const t = setTimeout(() => {
+            const cur = sessions.get(uid);
+            if (!cur || cur.runId !== runId || cur.isCleaningUp) return;
+            try { fn(); } catch (e) {}
+        }, ms);
+        try { s.pendingTimeouts.add(t); } catch (e) {}
+        return t;
+    };
+
+    const performAntiAfk = () => {
+        if (!sessions.has(uid) || isShuttingDown) return;
+        const s = sessions.get(uid);
+        if (!s || !s.connected || s.isCleaningUp) return;
 
         try {
-            if (s.entityId) {
+            if (s.entityId && s.client && !s.isCleaningUp) {
                 const r = Math.random();
 
                 // Hand swing
                 if (r < 0.4) {
-                    safeClientWrite(s, 'write', 'animate', { action_id: 1, runtime_entity_id: s.entityId });
+                    s.client.write('animate', { action_id: 1, runtime_entity_id: s.entityId });
 
                 // Crouch: start sneak = 11, stop sneak = 12
                 } else if (r < 0.6) {
-                    safeClientWrite(s, 'write', 'player_action', {
+                    s.client.write('player_action', {
                         runtime_entity_id: s.entityId,
                         action: 11,
                         position: s.position,
@@ -938,23 +950,24 @@ async function startSession(uid, interaction, isReconnect = false, reconnectAtte
                         face: 0
                     });
                     const stopDelay = 2000 + Math.random() * 2000;
-                    setSessionTimeout(s, () => {
+                    scheduleSessionTimeout(stopDelay, () => {
                         const cur = sessions.get(uid);
-                        if (!cur) return;
-                        if (cur.runId !== initialRunId) return;
-                        if (!isClientUsable(cur) || !cur.entityId) return;
-                        safeClientWrite(cur, 'write', 'player_action', {
-                            runtime_entity_id: cur.entityId,
-                            action: 12,
-                            position: cur.position,
-                            result_position: cur.position,
-                            face: 0
-                        });
-                    }, stopDelay);
+                        if (cur?.connected && cur?.client && cur?.entityId && !cur.isCleaningUp) {
+                            try {
+                                cur.client.write('player_action', {
+                                    runtime_entity_id: cur.entityId,
+                                    action: 12,
+                                    position: cur.position,
+                                    result_position: cur.position,
+                                    face: 0
+                                });
+                            } catch (e) {}
+                        }
+                    });
 
                 // Jump: action = 8 + small vertical move
                 } else if (r < 0.8) {
-                    safeClientWrite(s, 'write', 'player_action', {
+                    s.client.write('player_action', {
                         runtime_entity_id: s.entityId,
                         action: 8,
                         position: s.position,
@@ -966,7 +979,7 @@ async function startSession(uid, interaction, isReconnect = false, reconnectAtte
                     const jumpPos = { x: original.x, y: original.y + 0.5, z: original.z };
 
                     s.tick = (s.tick || 0) + 1;
-                    safeClientWrite(s, 'queue', 'move_player', {
+                    s.client.queue('move_player', {
                         runtime_entity_id: s.entityId,
                         position: jumpPos,
                         pitch: s.pitch || 0,
@@ -977,24 +990,25 @@ async function startSession(uid, interaction, isReconnect = false, reconnectAtte
                         tick: s.tick
                     });
 
-                    setSessionTimeout(s, () => {
+                    scheduleSessionTimeout(400 + Math.random() * 200, () => {
                         const cur = sessions.get(uid);
-                        if (!cur) return;
-                        if (cur.runId !== initialRunId) return;
-                        if (!isClientUsable(cur) || !cur.entityId) return;
-                        cur.tick = (cur.tick || 0) + 1;
-                        safeClientWrite(cur, 'queue', 'move_player', {
-                            runtime_entity_id: cur.entityId,
-                            position: original,
-                            pitch: cur.pitch || 0,
-                            yaw: cur.yaw || 0,
-                            head_yaw: cur.yaw || 0,
-                            on_ground: true,
-                            mode: 0,
-                            tick: cur.tick
-                        });
-                        cur.position = { x: original.x, y: original.y, z: original.z };
-                    }, 400 + Math.random() * 200);
+                        if (cur?.connected && cur?.client && cur?.entityId && !cur.isCleaningUp) {
+                            try {
+                                cur.tick = (cur.tick || 0) + 1;
+                                cur.client.queue('move_player', {
+                                    runtime_entity_id: cur.entityId,
+                                    position: original,
+                                    pitch: cur.pitch || 0,
+                                    yaw: cur.yaw || 0,
+                                    head_yaw: cur.yaw || 0,
+                                    on_ground: true,
+                                    mode: 0,
+                                    tick: cur.tick
+                                });
+                                cur.position = { x: original.x, y: original.y, z: original.z };
+                            } catch (e) {}
+                        }
+                    });
 
                 // Walk: small random step
                 } else {
@@ -1004,7 +1018,7 @@ async function startSession(uid, interaction, isReconnect = false, reconnectAtte
                     s.position.z += dz;
 
                     s.tick = (s.tick || 0) + 1;
-                    safeClientWrite(s, 'queue', 'move_player', {
+                    s.client.queue('move_player', {
                         runtime_entity_id: s.entityId,
                         position: { x: s.position.x, y: s.position.y, z: s.position.z },
                         pitch: s.pitch || 0,
@@ -1016,12 +1030,12 @@ async function startSession(uid, interaction, isReconnect = false, reconnectAtte
                     });
                 }
             }
-        } catch (e) {
-            // swallow to avoid cascading failures
-        }
+        } catch (e) {}
 
         const nextDelay = Math.random() * 12000 + 8000;
-        s.afkTimeout = setSessionTimeout(s, performAntiAfk, nextDelay);
+        // Track this timeout so it is always cancelled during cleanup/reconnect.
+        if (s.afkTimeout) clearTimeout(s.afkTimeout);
+        s.afkTimeout = scheduleSessionTimeout(nextDelay, performAntiAfk);
     };
 
     mc.on("spawn", () => {
@@ -1056,11 +1070,9 @@ async function startSession(uid, interaction, isReconnect = false, reconnectAtte
 
         startHealthMonitoring(uid);
 
-        setSessionTimeout(currentSession, () => {
+        setTimeout(() => {
             const s = sessions.get(uid);
-            if (!s) return;
-            if (s.runId !== currentSession.runId) return;
-            if (s.connected && !s.isCleaningUp) performAntiAfk();
+            if (s && s.connected && !s.isCleaningUp) performAntiAfk();
         }, 5000);
     });
     // Track packets for connection health and server-provided move_player updates for position sync
@@ -1088,12 +1100,6 @@ async function startSession(uid, interaction, isReconnect = false, reconnectAtte
 
     mc.on("close", () => {
         if (currentSession.isCleaningUp) return;
-        currentSession.connected = false;
-        if (currentSession.afkTimeout) {
-            clearTimeout(currentSession.afkTimeout);
-            currentSession.afkTimeout = null;
-        }
-        clearSessionTimeouts(currentSession);
         if (!currentSession.manualStop && !currentSession.isReconnecting) {
             handleAutoReconnect(uid, (currentSession.reconnectAttempt || 0) + 1);
         } else {
@@ -1104,7 +1110,7 @@ async function startSession(uid, interaction, isReconnect = false, reconnectAtte
 
 // ==================== DISCORD EVENTS ====================
 
-client.once("ready", async () => {
+client.once(Events.ClientReady, async () => {
     discordReady = true;
     console.log("Discord client ready");
 
@@ -1196,7 +1202,7 @@ client.on(Events.InteractionCreate, async (i) => {
         if (i.isButton()) {
             if (i.customId === "start_bedrock" || i.customId === "start_java") {
                 if (sessions.has(uid)) return safeReply(i, "**Session Conflict**: Active session exists.");
-                await i.deferReply({ ephemeral: true });
+                await i.deferReply(withEphemeralFlags({}, true));
 
                 const embed = i.customId === "start_java"
                     ? new EmbedBuilder()
@@ -1214,11 +1220,11 @@ client.on(Events.InteractionCreate, async (i) => {
                     new ButtonBuilder().setCustomId("cancel").setLabel("Cancel").setStyle(ButtonStyle.Secondary)
                 );
 
-                return i.followUp({ embeds: [embed], components: [row], ephemeral: true }).catch(() => {});
+                return i.followUp(withEphemeralFlags({ embeds: [embed], components: [row] }, true)).catch(() => {});
             }
 
             if (i.customId === "confirm_start") {
-                await i.deferReply({ ephemeral: true }).catch(() => {});
+                await i.deferReply(withEphemeralFlags({}, true)).catch(() => {});
                 safeReply(i, "**Connecting...**", true);
                 startSession(uid, i, false);
                 return;
@@ -1227,7 +1233,7 @@ client.on(Events.InteractionCreate, async (i) => {
             if (i.customId === "cancel") return safeReply(i, "Cancelled.");
 
             if (i.customId === "stop") {
-                await i.deferReply({ ephemeral: true });
+                await i.deferReply(withEphemeralFlags({}, true));
                 const ok = await stopSession(uid);
                 return safeReply(i, ok ? "**Session Terminated.**" : "No active sessions.");
             }
@@ -1235,7 +1241,7 @@ client.on(Events.InteractionCreate, async (i) => {
             if (i.customId === "link") return linkMicrosoft(uid, i);
 
             if (i.customId === "unlink") {
-                await i.deferReply({ ephemeral: true });
+                await i.deferReply(withEphemeralFlags({}, true));
                 await unlinkMicrosoft(uid);
                 return safeReply(i, "Unlinked Microsoft account.");
             }
