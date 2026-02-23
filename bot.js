@@ -225,6 +225,62 @@ let discordReady = false;
 let discordReconnectAttempts = 0;
 const cleanupLocks = new Set();
 
+// ==================== SAFETY HELPERS (PREVENT NATIVE CRASHES) ====================
+
+/**
+ * `bedrock-protocol` uses native/network internals that can segfault if writes
+ * happen while the client is closing/being GC'd. These helpers make all timed
+ * operations cancellable and gate packet writes.
+ */
+function isClientUsable(session) {
+    if (!session) return false;
+    if (session.isCleaningUp) return false;
+    if (!session.client) return false;
+    if (!session.connected) return false;
+    // Some versions expose `closed`/`ended`; keep checks defensive.
+    if (session.client.closed === true) return false;
+    if (session.client.ended === true) return false;
+    return true;
+}
+
+function safeClientWrite(session, method, name, data) {
+    if (!isClientUsable(session)) return false;
+    try {
+        if (method === 'write') session.client.write(name, data);
+        else session.client.queue(name, data);
+        return true;
+    } catch (e) {
+        // Prevent crashes and let health monitor/reconnect handle recovery.
+        console.error(`Safe ${method} failed for ${name}:`, e?.message);
+        return false;
+    }
+}
+
+function setSessionTimeout(session, fn, ms) {
+    if (!session) return null;
+    if (!session.extraTimeouts) session.extraTimeouts = new Set();
+    const id = setTimeout(() => {
+        try {
+            session.extraTimeouts?.delete(id);
+            fn();
+        } catch (e) {
+            // swallow
+        }
+    }, ms);
+    session.extraTimeouts.add(id);
+    return id;
+}
+
+function clearSessionTimeouts(session) {
+    try {
+        if (!session?.extraTimeouts) return;
+        for (const id of session.extraTimeouts) clearTimeout(id);
+        session.extraTimeouts.clear();
+    } catch (e) {
+        // swallow
+    }
+}
+
 // ==================== ENHANCED DISCORD CLIENT ====================
 
 const client = new Client({
@@ -373,6 +429,7 @@ async function cleanupSession(uid) {
         if (!s) return;
         s.isCleaningUp = true;
         s.manualStop = true;
+        s.connected = false;
         const timers = ['reconnectTimer', 'afkTimeout', 'keepaliveTimer', 'staleCheckTimer', 'tokenRefreshTimer'];
         timers.forEach(timer => {
             if (s[timer]) {
@@ -381,6 +438,8 @@ async function cleanupSession(uid) {
                 s[timer] = null;
             }
         });
+        // Clear any nested / delayed timeouts scheduled from anti-AFK or other callbacks.
+        clearSessionTimeouts(s);
         await new Promise(resolve => setTimeout(resolve, 100));
         if (s.client) {
             try {
@@ -486,8 +545,8 @@ function startHealthMonitoring(uid) {
     if (!s) return;
     s.keepaliveTimer = setInterval(() => {
         try {
-            if (!s.connected || !s.client || s.isCleaningUp) return;
-            s.client.queue('client_cache_status', { enabled: false });
+            if (!isClientUsable(s)) return;
+            safeClientWrite(s, 'queue', 'client_cache_status', { enabled: false });
             s.lastKeepalive = Date.now();
         } catch (e) {
             if (!s.isReconnecting && !s.isCleaningUp && !s.manualStop) {
@@ -794,6 +853,7 @@ async function startSession(uid, interaction, isReconnect = false, reconnectAtte
 
     const currentSession = {
         client: null,
+        runId: `${Date.now()}_${Math.random().toString(16).slice(2)}`,
         startedAt: Date.now(),
         manualStop: false,
         connected: false,
@@ -811,7 +871,8 @@ async function startSession(uid, interaction, isReconnect = false, reconnectAtte
         position: { x: 0, y: 0, z: 0 },
         yaw: 0,
         pitch: 0,
-        tick: 0
+        tick: 0,
+        extraTimeouts: new Set()
     };
 
     sessions.set(uid, currentSession);
@@ -836,6 +897,12 @@ async function startSession(uid, interaction, isReconnect = false, reconnectAtte
 
     mc.on('disconnect', (packet) => {
         if (currentSession.isCleaningUp) return;
+        currentSession.connected = false;
+        if (currentSession.afkTimeout) {
+            clearTimeout(currentSession.afkTimeout);
+            currentSession.afkTimeout = null;
+        }
+        clearSessionTimeouts(currentSession);
         const reason = packet?.reason || "Unknown reason";
         logToDiscord(`Bot of <@${uid}> was kicked: ${reason}`);
         if (reason.includes("wait") || reason.includes("etwas") || reason.includes("before")) {
@@ -844,22 +911,26 @@ async function startSession(uid, interaction, isReconnect = false, reconnectAtte
         }
     });
 
+    const initialRunId = currentSession.runId;
     const performAntiAfk = () => {
-        if (!sessions.has(uid) || isShuttingDown) return;
+        if (isShuttingDown) return;
         const s = sessions.get(uid);
-        if (!s || !s.connected || s.isCleaningUp) return;
+        if (!s) return;
+        // If session was recreated, ignore stale timeouts from the old run.
+        if (s.runId !== initialRunId) return;
+        if (!isClientUsable(s)) return;
 
         try {
-            if (s.entityId && s.client && !s.isCleaningUp) {
+            if (s.entityId) {
                 const r = Math.random();
 
                 // Hand swing
                 if (r < 0.4) {
-                    s.client.write('animate', { action_id: 1, runtime_entity_id: s.entityId });
+                    safeClientWrite(s, 'write', 'animate', { action_id: 1, runtime_entity_id: s.entityId });
 
                 // Crouch: start sneak = 11, stop sneak = 12
                 } else if (r < 0.6) {
-                    s.client.write('player_action', {
+                    safeClientWrite(s, 'write', 'player_action', {
                         runtime_entity_id: s.entityId,
                         action: 11,
                         position: s.position,
@@ -867,22 +938,23 @@ async function startSession(uid, interaction, isReconnect = false, reconnectAtte
                         face: 0
                     });
                     const stopDelay = 2000 + Math.random() * 2000;
-                    setTimeout(() => {
+                    setSessionTimeout(s, () => {
                         const cur = sessions.get(uid);
-                        if (cur?.connected && cur?.client && cur?.entityId && !cur.isCleaningUp) {
-                            cur.client.write('player_action', {
-                                runtime_entity_id: cur.entityId,
-                                action: 12,
-                                position: cur.position,
-                                result_position: cur.position,
-                                face: 0
-                            });
-                        }
+                        if (!cur) return;
+                        if (cur.runId !== initialRunId) return;
+                        if (!isClientUsable(cur) || !cur.entityId) return;
+                        safeClientWrite(cur, 'write', 'player_action', {
+                            runtime_entity_id: cur.entityId,
+                            action: 12,
+                            position: cur.position,
+                            result_position: cur.position,
+                            face: 0
+                        });
                     }, stopDelay);
 
                 // Jump: action = 8 + small vertical move
                 } else if (r < 0.8) {
-                    s.client.write('player_action', {
+                    safeClientWrite(s, 'write', 'player_action', {
                         runtime_entity_id: s.entityId,
                         action: 8,
                         position: s.position,
@@ -894,7 +966,7 @@ async function startSession(uid, interaction, isReconnect = false, reconnectAtte
                     const jumpPos = { x: original.x, y: original.y + 0.5, z: original.z };
 
                     s.tick = (s.tick || 0) + 1;
-                    s.client.queue('move_player', {
+                    safeClientWrite(s, 'queue', 'move_player', {
                         runtime_entity_id: s.entityId,
                         position: jumpPos,
                         pitch: s.pitch || 0,
@@ -905,22 +977,23 @@ async function startSession(uid, interaction, isReconnect = false, reconnectAtte
                         tick: s.tick
                     });
 
-                    setTimeout(() => {
+                    setSessionTimeout(s, () => {
                         const cur = sessions.get(uid);
-                        if (cur?.connected && cur?.client && cur?.entityId && !cur.isCleaningUp) {
-                            cur.tick = (cur.tick || 0) + 1;
-                            cur.client.queue('move_player', {
-                                runtime_entity_id: cur.entityId,
-                                position: original,
-                                pitch: cur.pitch || 0,
-                                yaw: cur.yaw || 0,
-                                head_yaw: cur.yaw || 0,
-                                on_ground: true,
-                                mode: 0,
-                                tick: cur.tick
-                            });
-                            cur.position = { x: original.x, y: original.y, z: original.z };
-                        }
+                        if (!cur) return;
+                        if (cur.runId !== initialRunId) return;
+                        if (!isClientUsable(cur) || !cur.entityId) return;
+                        cur.tick = (cur.tick || 0) + 1;
+                        safeClientWrite(cur, 'queue', 'move_player', {
+                            runtime_entity_id: cur.entityId,
+                            position: original,
+                            pitch: cur.pitch || 0,
+                            yaw: cur.yaw || 0,
+                            head_yaw: cur.yaw || 0,
+                            on_ground: true,
+                            mode: 0,
+                            tick: cur.tick
+                        });
+                        cur.position = { x: original.x, y: original.y, z: original.z };
                     }, 400 + Math.random() * 200);
 
                 // Walk: small random step
@@ -931,7 +1004,7 @@ async function startSession(uid, interaction, isReconnect = false, reconnectAtte
                     s.position.z += dz;
 
                     s.tick = (s.tick || 0) + 1;
-                    s.client.queue('move_player', {
+                    safeClientWrite(s, 'queue', 'move_player', {
                         runtime_entity_id: s.entityId,
                         position: { x: s.position.x, y: s.position.y, z: s.position.z },
                         pitch: s.pitch || 0,
@@ -943,10 +1016,12 @@ async function startSession(uid, interaction, isReconnect = false, reconnectAtte
                     });
                 }
             }
-        } catch (e) {}
+        } catch (e) {
+            // swallow to avoid cascading failures
+        }
 
         const nextDelay = Math.random() * 12000 + 8000;
-        s.afkTimeout = setTimeout(performAntiAfk, nextDelay);
+        s.afkTimeout = setSessionTimeout(s, performAntiAfk, nextDelay);
     };
 
     mc.on("spawn", () => {
@@ -981,9 +1056,11 @@ async function startSession(uid, interaction, isReconnect = false, reconnectAtte
 
         startHealthMonitoring(uid);
 
-        setTimeout(() => {
+        setSessionTimeout(currentSession, () => {
             const s = sessions.get(uid);
-            if (s && s.connected && !s.isCleaningUp) performAntiAfk();
+            if (!s) return;
+            if (s.runId !== currentSession.runId) return;
+            if (s.connected && !s.isCleaningUp) performAntiAfk();
         }, 5000);
     });
     // Track packets for connection health and server-provided move_player updates for position sync
@@ -1011,6 +1088,12 @@ async function startSession(uid, interaction, isReconnect = false, reconnectAtte
 
     mc.on("close", () => {
         if (currentSession.isCleaningUp) return;
+        currentSession.connected = false;
+        if (currentSession.afkTimeout) {
+            clearTimeout(currentSession.afkTimeout);
+            currentSession.afkTimeout = null;
+        }
+        clearSessionTimeouts(currentSession);
         if (!currentSession.manualStop && !currentSession.isReconnecting) {
             handleAutoReconnect(uid, (currentSession.reconnectAttempt || 0) + 1);
         } else {
