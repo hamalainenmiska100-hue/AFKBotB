@@ -13,11 +13,6 @@
  * detection.  This file is intentionally self-contained so it can be run via
  * `node bot.js` after installing dependencies and setting the `DISCORD_TOKEN`
  * environment variable.
- *
- * CRASH-HARDENED PATCHES INCLUDED:
- *  - Stop all session timers immediately on disconnect/close to prevent late writes.
- *  - Guard against calling client.close() when not connected (native RakNet crash case).
- *  - Optional RakNet backend override to avoid native "free(): invalid pointer" crashes.
  */
 
 const {
@@ -70,15 +65,7 @@ const CONFIG = {
     PING_TIMEOUT_MS: 5000,
     OPERATION_TIMEOUT_MS: 30000,
     MAX_DISCORD_RECONNECT_ATTEMPTS: 5,
-    // RakNet backend selection (optional):
-    // Leave undefined to use bedrock-protocol's default (usually raknet-native).
-    // If you want to force a backend, set env RAKNET_BACKEND to:
-    //   - "raknet-native" (fastest, but can crash on some hosts)
-    //   - "jsp-raknet"    (most stable, pure JS; requires package)
-    //   - "raknet-node"   (Rust; requires package/toolchain)
-    RAKNET_BACKEND: process.env.RAKNET_BACKEND
 };
-
 
 // Determine base path for persisting user and session data. Fly.io exposes
 // FLY_VOLUME_PATH, but falls back to /data locally.
@@ -304,11 +291,6 @@ process.on("unhandledRejection", (reason) => {
     crashLogger.log("UNHANDLED REJECTION", reason);
 });
 
-// Try to log native aborts too (may not always fire depending on runtime).
-process.on("SIGABRT", () => {
-    crashLogger.log("SIGABRT", "Process aborted (likely native module heap corruption).");
-});
-
 // ==================== DISCORD CONNECTION RESILIENCE ====================
 
 client.on("error", (error) => {
@@ -393,28 +375,6 @@ async function clearSessionData(uid) {
     }
 }
 
-// ==================== TIMER STOPPER (prevents late writes after disconnect) ====================
-
-function stopSessionTimers(s) {
-    if (!s) return;
-    const timers = ['reconnectTimer', 'afkTimeout', 'keepaliveTimer', 'staleCheckTimer', 'tokenRefreshTimer'];
-    timers.forEach(timer => {
-        if (s[timer]) {
-            clearTimeout(s[timer]);
-            clearInterval(s[timer]);
-            s[timer] = null;
-        }
-    });
-
-    // Cancel any nested anti-AFK timeouts (jump landing / sneak stop etc.)
-    try {
-        if (s.pendingTimeouts && s.pendingTimeouts.size) {
-            for (const t of s.pendingTimeouts) clearTimeout(t);
-            s.pendingTimeouts.clear();
-        }
-    } catch (e) {}
-}
-
 // ==================== SAFE CLIENT CLOSE (prevents native double-free) ====================
 
 async function safeCloseBedrockClient(uid, s, waitMs = 2000) {
@@ -426,14 +386,6 @@ async function safeCloseBedrockClient(uid, s, waitMs = 2000) {
     try {
         // Remove listeners early to prevent late packet handlers writing back.
         try { client.removeAllListeners(); } catch (e) {}
-
-        // CRASH-HARDEN: if we are not connected anymore, do NOT call native close(),
-        // as some RakNet-native states can crash with "free(): invalid pointer".
-        // We'll just detach and let GC handle JS references.
-        if (!s.connected) {
-            s.client = null;
-            return;
-        }
 
         await new Promise((resolve) => {
             let done = false;
@@ -482,8 +434,22 @@ async function cleanupSession(uid) {
         if (!s) return;
         s.isCleaningUp = true;
         s.manualStop = true;
+        const timers = ['reconnectTimer', 'afkTimeout', 'keepaliveTimer', 'staleCheckTimer', 'tokenRefreshTimer'];
+        timers.forEach(timer => {
+            if (s[timer]) {
+                clearTimeout(s[timer]);
+                clearInterval(s[timer]);
+                s[timer] = null;
+            }
+        });
 
-        stopSessionTimers(s);
+        // Cancel any nested anti-AFK timeouts (jump landing / sneak stop etc.)
+        try {
+            if (s.pendingTimeouts && s.pendingTimeouts.size) {
+                for (const t of s.pendingTimeouts) clearTimeout(t);
+                s.pendingTimeouts.clear();
+            }
+        } catch (e) {}
 
         await new Promise(resolve => setTimeout(resolve, 100));
 
@@ -520,7 +486,6 @@ async function stopSession(uid) {
             clearTimeout(s.reconnectTimer);
             s.reconnectTimer = null;
         }
-        stopSessionTimers(s);
     }
     await clearSessionData(uid);
     await cleanupSession(uid);
@@ -543,10 +508,6 @@ async function handleAutoReconnect(uid, attempt = 1) {
     if (s.reconnectTimer) clearTimeout(s.reconnectTimer);
     s.isReconnecting = true;
     s.reconnectAttempt = attempt;
-
-    // Stop timers right away so we don't keep sending packets on a dying client
-    stopSessionTimers(s);
-
     const baseDelay = Math.min(CONFIG.RECONNECT_BASE_DELAY_MS * Math.pow(1.5, attempt - 1), CONFIG.RECONNECT_MAX_DELAY_MS);
     const jitter = Math.random() * 5000;
     const delay = baseDelay + jitter;
@@ -571,7 +532,7 @@ function startHealthMonitoring(uid) {
     if (!s) return;
     s.keepaliveTimer = setInterval(() => {
         try {
-            if (!s.connected || !s.client || s.isCleaningUp || s.clientClosing) return;
+            if (!s.connected || !s.client || s.isCleaningUp) return;
             s.client.queue('client_cache_status', { enabled: false });
             s.lastKeepalive = Date.now();
         } catch (e) {
@@ -582,11 +543,9 @@ function startHealthMonitoring(uid) {
     }, CONFIG.KEEPALIVE_INTERVAL_MS);
     s.staleCheckTimer = setInterval(async () => {
         try {
-            if (!s.connected || s.isCleaningUp || s.clientClosing) return;
+            if (!s.connected || s.isCleaningUp) return;
             const lastActivity = Math.max(s.lastPacketTime || 0, s.lastKeepalive || 0);
             if (Date.now() - lastActivity > CONFIG.STALE_CONNECTION_TIMEOUT_MS) {
-                // Mark disconnected first so safeClose does not call native close in bad state
-                s.connected = false;
                 if (s.client && !s.isCleaningUp) {
                     try {
                         await safeCloseBedrockClient(uid, s, 1500);
@@ -894,12 +853,6 @@ async function startSession(uid, interaction, isReconnect = false, reconnectAtte
         useTimeout: true
     };
 
-    // Optional: force a specific RakNet backend only if env RAKNET_BACKEND is set.
-    // Default behavior (recommended for compatibility): do NOT set this option.
-    if (CONFIG.RAKNET_BACKEND) {
-        opts.raknetBackend = CONFIG.RAKNET_BACKEND;
-    }
-
     if (u.connectionType === "offline") {
         opts.username = u.offlineUsername || `AFK_${uid.slice(-4)}`;
         opts.offline = true;
@@ -951,14 +904,8 @@ async function startSession(uid, interaction, isReconnect = false, reconnectAtte
         return;
     }
 
-    // On disconnect, stop timers immediately to avoid late writes, and mark disconnected.
     mc.on('disconnect', (packet) => {
         if (currentSession.isCleaningUp) return;
-
-        // CRASH-HARDEN: mark disconnected first (prevents close() in unsafe states)
-        currentSession.connected = false;
-        stopSessionTimers(currentSession);
-
         const reason = packet?.reason || "Unknown reason";
         logToDiscord(`Bot of <@${uid}> was kicked: ${reason}`);
         if (reason.includes("wait") || reason.includes("etwas") || reason.includes("before")) {
@@ -983,7 +930,7 @@ async function startSession(uid, interaction, isReconnect = false, reconnectAtte
     const performAntiAfk = () => {
         if (!sessions.has(uid) || isShuttingDown) return;
         const s = sessions.get(uid);
-        if (!s || !s.connected || s.isCleaningUp || s.clientClosing) return;
+        if (!s || !s.connected || s.isCleaningUp) return;
 
         try {
             if (s.entityId && s.client && !s.isCleaningUp) {
@@ -1005,7 +952,7 @@ async function startSession(uid, interaction, isReconnect = false, reconnectAtte
                     const stopDelay = 2000 + Math.random() * 2000;
                     scheduleSessionTimeout(stopDelay, () => {
                         const cur = sessions.get(uid);
-                        if (cur?.connected && cur?.client && cur?.entityId && !cur.isCleaningUp && !cur.clientClosing) {
+                        if (cur?.connected && cur?.client && cur?.entityId && !cur.isCleaningUp) {
                             try {
                                 cur.client.write('player_action', {
                                     runtime_entity_id: cur.entityId,
@@ -1045,7 +992,7 @@ async function startSession(uid, interaction, isReconnect = false, reconnectAtte
 
                     scheduleSessionTimeout(400 + Math.random() * 200, () => {
                         const cur = sessions.get(uid);
-                        if (cur?.connected && cur?.client && cur?.entityId && !cur.isCleaningUp && !cur.clientClosing) {
+                        if (cur?.connected && cur?.client && cur?.entityId && !cur.isCleaningUp) {
                             try {
                                 cur.tick = (cur.tick || 0) + 1;
                                 cur.client.queue('move_player', {
@@ -1125,10 +1072,9 @@ async function startSession(uid, interaction, isReconnect = false, reconnectAtte
 
         setTimeout(() => {
             const s = sessions.get(uid);
-            if (s && s.connected && !s.isCleaningUp && !s.clientClosing) performAntiAfk();
+            if (s && s.connected && !s.isCleaningUp) performAntiAfk();
         }, 5000);
     });
-
     // Track packets for connection health and server-provided move_player updates for position sync
     mc.on('packet', (data, meta) => {
         if (currentSession && !currentSession.isCleaningUp) {
@@ -1154,12 +1100,6 @@ async function startSession(uid, interaction, isReconnect = false, reconnectAtte
 
     mc.on("close", () => {
         if (currentSession.isCleaningUp) return;
-
-        // CRASH-HARDEN: mark disconnected, stop timers, and avoid further writes.
-        currentSession.connected = false;
-        currentSession.clientClosing = true;
-        stopSessionTimers(currentSession);
-
         if (!currentSession.manualStop && !currentSession.isReconnecting) {
             handleAutoReconnect(uid, (currentSession.reconnectAttempt || 0) + 1);
         } else {
