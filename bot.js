@@ -1222,7 +1222,7 @@ async function runParent() {
     session.child = spawnWorkerForSession(uid, runId, opts);
 
     if (interaction) {
-      await safeReply(interaction, `**Connecting...** (\`${ip}:${port}\`)`, true);
+      await safeReply(interaction, `**Scheduled connection... Bot should join in under a minute.** (\`${ip}:${port}\`)`, true);
     }
   }
 
