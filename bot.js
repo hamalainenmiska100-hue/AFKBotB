@@ -70,13 +70,15 @@ const CONFIG = {
     PING_TIMEOUT_MS: 5000,
     OPERATION_TIMEOUT_MS: 30000,
     MAX_DISCORD_RECONNECT_ATTEMPTS: 5,
-
-    // RakNet backend selection:
-    // - "jsp-raknet" is the most stable and avoids native heap corruption crashes.
-    // - If you know you want native for max speed, set env RAKNET_BACKEND=raknet-native.
-    // - Allowed: "jsp-raknet", "raknet-node", "raknet-native" (depends on installed deps)
-    RAKNET_BACKEND: process.env.RAKNET_BACKEND || "jsp-raknet"
+    // RakNet backend selection (optional):
+    // Leave undefined to use bedrock-protocol's default (usually raknet-native).
+    // If you want to force a backend, set env RAKNET_BACKEND to:
+    //   - "raknet-native" (fastest, but can crash on some hosts)
+    //   - "jsp-raknet"    (most stable, pure JS; requires package)
+    //   - "raknet-node"   (Rust; requires package/toolchain)
+    RAKNET_BACKEND: process.env.RAKNET_BACKEND
 };
+
 
 // Determine base path for persisting user and session data. Fly.io exposes
 // FLY_VOLUME_PATH, but falls back to /data locally.
@@ -889,12 +891,14 @@ async function startSession(uid, interaction, isReconnect = false, reconnectAtte
         offline: false,
         skipPing: true,
         autoInitPlayer: true,
-        useTimeout: true,
-
-        // CRASH-HARDEN: optionally avoid native RakNet crashes:
-        // Set env RAKNET_BACKEND=raknet-native if you explicitly want native.
-        raknetBackend: CONFIG.RAKNET_BACKEND
+        useTimeout: true
     };
+
+    // Optional: force a specific RakNet backend only if env RAKNET_BACKEND is set.
+    // Default behavior (recommended for compatibility): do NOT set this option.
+    if (CONFIG.RAKNET_BACKEND) {
+        opts.raknetBackend = CONFIG.RAKNET_BACKEND;
+    }
 
     if (u.connectionType === "offline") {
         opts.username = u.offlineUsername || `AFK_${uid.slice(-4)}`;
