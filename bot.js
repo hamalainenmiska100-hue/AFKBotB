@@ -808,6 +808,14 @@ async function runParent() {
           s.isReconnecting = false;
           s.reconnectAttempt = 0;
           logToDiscord(`Bot of <@${uid}> connected to **${s.serverLabel}**`);
+
+          if (s.interaction) {
+            try {
+              s.interaction
+                .editReply({ content: `✅ **Connected** (\`${s.serverLabel}\`)` })
+                .catch(() => {});
+            } catch (_) {}
+          }
         } else if (msg.type === 'mc_disconnect') {
           logToDiscord(`Bot of <@${uid}> was kicked: ${msg.reason || 'Unknown reason'}`);
         } else if (msg.type === 'mc_error') {
@@ -1170,6 +1178,7 @@ async function runParent() {
       reconnectAttempt: reconnectAttempt,
       reconnectTimer: null,
       serverLabel: `${ip}:${port}`,
+      interaction: interaction || null,
     };
 
     sessions.set(uid, session);
