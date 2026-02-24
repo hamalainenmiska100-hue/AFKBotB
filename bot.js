@@ -32,7 +32,10 @@ const CONFIG = {
   RECONNECT_BASE_DELAY_MS: 10_000,
   RECONNECT_MAX_DELAY_MS: 300_000,
 
-  CONNECTION_TIMEOUT_MS: 12_000,
+  // FIX: Raised to avoid false "connect guard" timeouts during slow Bedrock login
+  // sequences (resource packs, slow servers, etc). The previous 12s was often too short.
+  CONNECTION_TIMEOUT_MS: 90_000,
+
   KEEPALIVE_INTERVAL_MS: 15_000,
   STALE_CONNECTION_TIMEOUT_MS: 60_000,
   MEMORY_CHECK_INTERVAL_MS: 60_000,
@@ -96,6 +99,11 @@ async function runWorker() {
     runId: null,
     lastPacketTime: Date.now(),
     lastKeepalive: Date.now(),
+
+    // connect/login tracking
+    connectStartedAt: 0,
+    lastStatus: null,
+    lastStatusSentAt: 0,
   };
 
   function send(msg) {
@@ -303,6 +311,16 @@ async function runWorker() {
     start.unref?.();
   }
 
+  function sendStatusThrottled(status) {
+    try {
+      const now = Date.now();
+      // Avoid spamming parent: at most 1 status/sec.
+      if (now - (state.lastStatusSentAt || 0) < 1000) return;
+      state.lastStatusSentAt = now;
+      send({ type: 'mc_status', uid: state.uid, status, at: now });
+    } catch (_) {}
+  }
+
   function startClient(startMsg) {
     const { uid, runId, opts } = startMsg || {};
     if (!uid || !opts) {
@@ -313,6 +331,9 @@ async function runWorker() {
 
     state.uid = String(uid);
     state.runId = String(runId || Date.now());
+    state.connectStartedAt = Date.now();
+    state.lastStatus = null;
+    state.lastStatusSentAt = 0;
 
     try {
       const mc = bedrock.createClient(opts);
@@ -320,6 +341,13 @@ async function runWorker() {
 
       mc.on('spawn', () => {
         send({ type: 'mc_spawn', uid: state.uid });
+      });
+
+      // Track login progress (useful for debugging slow joins)
+      mc.on('status', (s) => {
+        state.lastPacketTime = Date.now();
+        state.lastStatus = s;
+        sendStatusThrottled(s);
       });
 
       mc.on('start_game', (packet) => {
@@ -379,11 +407,22 @@ async function runWorker() {
         shutdown(1, 'ERROR');
       });
 
-      // Guard: if we do not connect within timeout + small buffer, exit.
+      // Guard: if we do not fully connect (start_game) within timeout, exit.
       const guard = addTimeout(() => {
         if (state.stopping) return;
         if (!state.connected) {
-          send({ type: 'mc_error', uid: state.uid, message: 'Connect guard timeout' });
+          const elapsed = Date.now() - (state.connectStartedAt || Date.now());
+          let statusSnippet = 'none';
+          try {
+            if (state.lastStatus !== null && state.lastStatus !== undefined) {
+              statusSnippet = JSON.stringify(state.lastStatus).slice(0, 200);
+            }
+          } catch (_) {}
+          send({
+            type: 'mc_error',
+            uid: state.uid,
+            message: `Connect/login timeout after ${elapsed}ms (last status: ${statusSnippet})`,
+          });
           shutdown(1, 'CONNECT_GUARD_TIMEOUT');
         }
       }, CONFIG.CONNECTION_TIMEOUT_MS);
@@ -796,6 +835,10 @@ async function runParent() {
     const u = getUser(uid);
     const { ip, port } = u.server;
 
+    // FIX: Use ping when bedrockVersion is "auto" so the library can match server version.
+    // If the user has pinned a version, we can skip ping (optional) and set it directly.
+    const pinnedVersion = u.bedrockVersion && u.bedrockVersion !== 'auto' ? u.bedrockVersion : undefined;
+
     const opts = {
       host: ip,
       port: parseInt(port, 10),
@@ -805,13 +848,18 @@ async function runParent() {
       profilesFolder: authDir,
       username: uid,
       offline: false,
-      skipPing: true,
+      // If version is auto, allow ping so bedrock-protocol can determine the right version.
+      skipPing: !!pinnedVersion,
       autoInitPlayer: true,
       // IMPORTANT: bedrock-protocol's built-in timeout logic has been observed
       // to trigger native aborts in some environments. We disable it and rely
       // on the worker-level connect guard instead.
       useTimeout: false,
     };
+
+    if (pinnedVersion) {
+      opts.version = pinnedVersion;
+    }
 
     if (u.connectionType === 'offline') {
       opts.username = u.offlineUsername || `AFK_${uid.slice(-4)}`;
@@ -839,6 +887,12 @@ async function runParent() {
         } else if (msg.type === 'worker_log') {
           if (msg.level === 'error') console.error(`[WORKER ${uid}]`, msg.message);
           else console.log(`[WORKER ${uid}]`, msg.message);
+        } else if (msg.type === 'worker_exit') {
+          // FIX: Surface worker exit reason (very useful for diagnosing slow joins/timeouts).
+          console.warn(`Worker exit for ${uid}: code=${msg.code} reason=${msg.reason || 'unknown'}`);
+        } else if (msg.type === 'mc_status') {
+          // FIX: Store latest login status for debugging (do not spam Discord).
+          s.lastStatus = msg.status;
         } else if (msg.type === 'mc_spawn') {
           logToDiscord(`Bot of <@${uid}> spawned.`);
         } else if (msg.type === 'mc_connected') {
@@ -852,7 +906,14 @@ async function runParent() {
           logToDiscord(`Bot of <@${uid}> was kicked: ${msg.reason || 'Unknown reason'}`);
         } else if (msg.type === 'mc_error') {
           console.error(`Session error for ${uid}:`, msg.message || 'Unknown error');
-          logToDiscord(`Bot of <@${uid}> error: \`${String(msg.message || 'Unknown error').slice(0, 200)}\``);
+          // Include last known status snippet when available
+          let statusSnippet = '';
+          try {
+            if (s.lastStatus !== undefined && s.lastStatus !== null) {
+              statusSnippet = ` (status: ${JSON.stringify(s.lastStatus).slice(0, 200)})`;
+            }
+          } catch (_) {}
+          logToDiscord(`Bot of <@${uid}> error: \`${String(msg.message || 'Unknown error').slice(0, 180)}\`${statusSnippet}`);
         } else if (msg.type === 'mc_stale') {
           console.warn(`Stale connection detected for ${uid}`);
         } else if (msg.type === 'mc_close') {
@@ -1213,6 +1274,7 @@ async function runParent() {
       interaction: interaction || null,
       pendingUiUpdate: null,
       uiUpdateTimer: null,
+      lastStatus: null, // debug helper
     };
 
     sessions.set(uid, session);
