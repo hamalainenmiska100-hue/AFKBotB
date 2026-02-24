@@ -32,7 +32,7 @@ const CONFIG = {
   RECONNECT_BASE_DELAY_MS: 10_000,
   RECONNECT_MAX_DELAY_MS: 300_000,
 
-  CONNECTION_TIMEOUT_MS: 15_000,
+  CONNECTION_TIMEOUT_MS: 12_000,
   KEEPALIVE_INTERVAL_MS: 15_000,
   STALE_CONNECTION_TIMEOUT_MS: 60_000,
   MEMORY_CHECK_INTERVAL_MS: 60_000,
@@ -48,7 +48,7 @@ const CONFIG = {
   AFK_MAX_DELAY_MS: 20_000,
 
   // Misc
-  SESSION_RESTORE_DELAY_MS: 3_000,
+  SESSION_RESTORE_DELAY_MS: 2_000,
 };
 
 // Determine base path for persisting user and session data. Fly.io exposes
@@ -719,6 +719,44 @@ async function runParent() {
     }
   }
 
+  function queueUiUpdate(uid, payload) {
+    const s = sessions.get(uid);
+    if (!s || !s.interaction) return;
+
+    s.pendingUiUpdate = payload;
+
+    if (s.uiUpdateTimer) return;
+
+    const attempt = () => {
+      const ss = sessions.get(uid);
+      if (!ss || !ss.interaction || !ss.pendingUiUpdate) {
+        if (ss) ss.uiUpdateTimer = null;
+        return;
+      }
+
+      if (!discordReady) {
+        ss.uiUpdateTimer = setTimeout(attempt, 1000);
+        ss.uiUpdateTimer.unref?.();
+        return;
+      }
+
+      ss.interaction
+        .editReply(ss.pendingUiUpdate)
+        .then(() => {
+          ss.pendingUiUpdate = null;
+          ss.uiUpdateTimer = null;
+        })
+        .catch((e) => {
+          console.error('editReply failed:', e?.code, e?.message || e);
+          ss.uiUpdateTimer = setTimeout(attempt, 2000);
+          ss.uiUpdateTimer.unref?.();
+        });
+    };
+
+    s.uiUpdateTimer = setTimeout(attempt, 0);
+    s.uiUpdateTimer.unref?.();
+  }
+
   // ==================== SESSION STORE ====================
 
   async function saveSessionData(uid) {
@@ -809,13 +847,7 @@ async function runParent() {
           s.reconnectAttempt = 0;
           logToDiscord(`Bot of <@${uid}> connected to **${s.serverLabel}**`);
 
-          if (s.interaction) {
-            try {
-              s.interaction
-                .editReply({ content: `✅ **Connected** (\`${s.serverLabel}\`)` })
-                .catch(() => {});
-            } catch (_) {}
-          }
+          queueUiUpdate(uid, { content: `✅ **Connected** (\`${s.serverLabel}\`)` });
         } else if (msg.type === 'mc_disconnect') {
           logToDiscord(`Bot of <@${uid}> was kicked: ${msg.reason || 'Unknown reason'}`);
         } else if (msg.type === 'mc_error') {
@@ -1179,6 +1211,8 @@ async function runParent() {
       reconnectTimer: null,
       serverLabel: `${ip}:${port}`,
       interaction: interaction || null,
+      pendingUiUpdate: null,
+      uiUpdateTimer: null,
     };
 
     sessions.set(uid, session);
@@ -1188,7 +1222,7 @@ async function runParent() {
     session.child = spawnWorkerForSession(uid, runId, opts);
 
     if (interaction) {
-      await safeReply(interaction, `**Scheduled connection for: ** \`${ip}:${port}\`` Your bot should join in under 5 minutes..., true);
+      await safeReply(interaction, `**Connecting...** (\`${ip}:${port}\`)`, true);
     }
   }
 
@@ -1274,11 +1308,17 @@ async function runParent() {
   client.on(Events.ShardResume, (_shardId, replayed) => {
     discordReady = true;
     console.log(`Discord shard resumed. Replayed: ${replayed}`);
+    for (const [uid, s] of sessions) {
+      if (s?.pendingUiUpdate && s?.interaction) queueUiUpdate(uid, s.pendingUiUpdate);
+    }
   });
 
   client.once(Events.ClientReady, async () => {
     discordReady = true;
     console.log('Discord client ready');
+    for (const [uid, s] of sessions) {
+      if (s?.pendingUiUpdate && s?.interaction) queueUiUpdate(uid, s.pendingUiUpdate);
+    }
 
     try {
       const cmds = [
@@ -1303,7 +1343,7 @@ async function runParent() {
     // Restore sessions a bit after boot.
     setTimeout(() => {
       restoreSessions();
-    }, 3000).unref?.();
+    }, 2000).unref?.();
   });
 
   client.on(Events.InteractionCreate, async (i) => {
