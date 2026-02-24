@@ -32,7 +32,7 @@ const CONFIG = {
   RECONNECT_BASE_DELAY_MS: 10_000,
   RECONNECT_MAX_DELAY_MS: 300_000,
 
-  CONNECTION_TIMEOUT_MS: 30_000,
+  CONNECTION_TIMEOUT_MS: 15_000,
   KEEPALIVE_INTERVAL_MS: 15_000,
   STALE_CONNECTION_TIMEOUT_MS: 60_000,
   MEMORY_CHECK_INTERVAL_MS: 60_000,
@@ -48,7 +48,7 @@ const CONFIG = {
   AFK_MAX_DELAY_MS: 20_000,
 
   // Misc
-  SESSION_RESTORE_DELAY_MS: 8_000,
+  SESSION_RESTORE_DELAY_MS: 3_000,
 };
 
 // Determine base path for persisting user and session data. Fly.io exposes
@@ -386,7 +386,7 @@ async function runWorker() {
           send({ type: 'mc_error', uid: state.uid, message: 'Connect guard timeout' });
           shutdown(1, 'CONNECT_GUARD_TIMEOUT');
         }
-      }, CONFIG.CONNECTION_TIMEOUT_MS + 5000);
+      }, CONFIG.CONNECTION_TIMEOUT_MS);
       guard.unref?.();
 
       send({ type: 'worker_log', level: 'info', uid: state.uid, message: 'Worker bedrock client started' });
@@ -1294,7 +1294,7 @@ async function runParent() {
     // Restore sessions a bit after boot.
     setTimeout(() => {
       restoreSessions();
-    }, 10000).unref?.();
+    }, 3000).unref?.();
   });
 
   client.on(Events.InteractionCreate, async (i) => {
