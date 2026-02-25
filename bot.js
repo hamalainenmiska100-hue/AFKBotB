@@ -445,6 +445,8 @@ async function runParent() {
     EmbedBuilder,
     ActivityType,
     MessageFlags,
+    StringSelectMenuBuilder,
+    StringSelectMenuOptionBuilder,
   } = require('discord.js');
 
   const { Authflow, Titles } = require('prismarine-auth');
@@ -454,6 +456,14 @@ async function runParent() {
     console.error('DISCORD_TOKEN missing');
     process.exit(1);
   }
+
+  // ==================== LIMITS & MESSAGES ====================
+
+  const GLOBAL_MAX_BOTS = 20;
+
+  const ERR_NO_ACCESS = 'You do not have access to use this bot. Contact owner for more information.';
+  const ERR_MAX_BOT_LIMIT = 'You passed your maximum bot limit. Contact owner for more information.';
+  const ERR_MAX_ACCOUNT_LIMIT = 'You passed your maximum account limit. Contact owner for more information.';
 
   // ==================== PERSISTENT STORE ====================
 
@@ -530,13 +540,307 @@ async function runParent() {
     await ensureDir(AUTH_ROOT);
     users = await userStore.load({});
     activeSessionsStore = await sessionStore.load({});
+    migrateAndNormalizeAllData();
     storesInitialized = true;
     console.log(`Loaded ${Object.keys(users).length} users and ${Object.keys(activeSessionsStore).length} active sessions`);
   }
 
+  // ==================== DATA NORMALIZATION & ACCESS ====================
+
+  function isAdmin(uid) {
+    return String(uid) === String(CONFIG.ADMIN_ID);
+  }
+
+  function nowMs() {
+    return Date.now();
+  }
+
+  function isInfinity(val) {
+    return String(val).toLowerCase() === 'infinity';
+  }
+
+  function clampInt(n, min, max) {
+    const v = parseInt(String(n), 10);
+    if (!Number.isFinite(v)) return null;
+    if (v < min) return min;
+    if (v > max) return max;
+    return v;
+  }
+
+  function parseLimitValue(input) {
+    if (input === null || input === undefined) return null;
+    const s = String(input).trim().toLowerCase();
+    if (!s) return null;
+    if (s === 'infinity' || s === 'inf' || s === 'unlimited' || s === '∞') return 'infinity';
+    const n = parseInt(s, 10);
+    if (!Number.isFinite(n) || n < 0) return null;
+    return n;
+  }
+
+  function parseDurationMs(input) {
+    if (input === null || input === undefined) return null;
+    const s0 = String(input).trim().toLowerCase();
+    if (!s0) return null;
+    if (s0 === 'infinity' || s0 === 'inf' || s0 === 'unlimited' || s0 === '∞') return 'infinity';
+
+    const m = s0.match(/^([0-9]+(?:\.[0-9]+)?)(ms|s|m|h|d|w)?$/);
+    if (!m) return null;
+
+    const value = Number(m[1]);
+    if (!Number.isFinite(value) || value < 0) return null;
+
+    const unit = m[2] || 'd';
+    const mult =
+      unit === 'ms'
+        ? 1
+        : unit === 's'
+          ? 1000
+          : unit === 'm'
+            ? 60_000
+            : unit === 'h'
+              ? 3_600_000
+              : unit === 'd'
+                ? 86_400_000
+                : unit === 'w'
+                  ? 604_800_000
+                  : 86_400_000;
+
+    const ms = Math.round(value * mult);
+    if (!Number.isFinite(ms) || ms < 0) return null;
+    return ms;
+  }
+
+  function ensureUserObject(uid) {
+    if (!uid || typeof uid !== 'string' || !/^[0-9]+$/.test(uid)) {
+      return { connectionType: 'online', bedrockVersion: 'auto', _temp: true };
+    }
+
+    if (!users[uid]) {
+      users[uid] = {
+        connectionType: 'online',
+        bedrockVersion: 'auto',
+        createdAt: nowMs(),
+        lastActive: nowMs(),
+        access: { enabled: false },
+        microsoftAccounts: [],
+        servers: [],
+      };
+      userStore.save();
+    }
+
+    const u = users[uid];
+
+    u.connectionType = u.connectionType || 'online';
+    u.bedrockVersion = u.bedrockVersion || 'auto';
+    u.lastActive = nowMs();
+
+    // Ensure access object
+    if (!u.access || typeof u.access !== 'object') u.access = { enabled: false };
+    if (typeof u.access.enabled !== 'boolean') u.access.enabled = u.access.enabled === true;
+
+    // Ensure arrays
+    if (!Array.isArray(u.microsoftAccounts)) u.microsoftAccounts = [];
+    if (!Array.isArray(u.servers)) u.servers = [];
+
+    // Legacy migration: single server -> servers array
+    if (u.server && u.server.ip && u.server.port && u.servers.length === 0) {
+      u.servers.push({
+        id: 'legacy',
+        ip: u.server.ip,
+        port: u.server.port,
+        createdAt: nowMs(),
+        lastUsedAt: null,
+      });
+    }
+
+    // Legacy migration: linked flag -> microsoftAccounts
+    if (u.linked === true && u.microsoftAccounts.length === 0) {
+      u.microsoftAccounts.push({
+        id: 'legacy',
+        createdAt: u.tokenAcquiredAt || nowMs(),
+        tokenAcquiredAt: u.tokenAcquiredAt || nowMs(),
+        lastUsedAt: null,
+        legacy: true,
+      });
+    }
+
+    // Keep legacy alias fields reasonably in sync
+    u.linked = u.microsoftAccounts.length > 0;
+
+    return u;
+  }
+
+  function hasAccess(uid) {
+    if (isAdmin(uid)) return true;
+    const u = ensureUserObject(uid);
+    const a = u.access;
+    if (!a?.enabled) return false;
+
+    // Expiry enforcement based on expiresAt (preferred) or grantedAt + durationMs
+    if (a.durationMs && !isInfinity(a.durationMs)) {
+      const expiresAt =
+        typeof a.expiresAt === 'number'
+          ? a.expiresAt
+          : typeof a.grantedAt === 'number'
+            ? a.grantedAt + Number(a.durationMs)
+            : null;
+      if (expiresAt && nowMs() >= expiresAt) return false;
+    }
+
+    return true;
+  }
+
+  function getMaxBots(uid) {
+    if (isAdmin(uid)) return 'infinity';
+    const u = ensureUserObject(uid);
+    const v = u.access?.maxBots;
+    if (v === undefined || v === null) return 0;
+    if (isInfinity(v)) return 'infinity';
+    const n = parseInt(String(v), 10);
+    return Number.isFinite(n) && n >= 0 ? n : 0;
+  }
+
+  function getMaxAccounts(uid) {
+    if (isAdmin(uid)) return 'infinity';
+    const u = ensureUserObject(uid);
+    const v = u.access?.maxAccounts;
+    if (v === undefined || v === null) return 0;
+    if (isInfinity(v)) return 'infinity';
+    const n = parseInt(String(v), 10);
+    return Number.isFinite(n) && n >= 0 ? n : 0;
+  }
+
+  function getAccessExpiry(uid) {
+    const u = ensureUserObject(uid);
+    const a = u.access;
+    if (!a?.enabled) return null;
+    if (!a.durationMs || isInfinity(a.durationMs)) return null;
+    const expiresAt =
+      typeof a.expiresAt === 'number'
+        ? a.expiresAt
+        : typeof a.grantedAt === 'number'
+          ? a.grantedAt + Number(a.durationMs)
+          : null;
+    return typeof expiresAt === 'number' ? expiresAt : null;
+  }
+
+  function migrateAndNormalizeAllData() {
+    try {
+      // Normalize users
+      for (const uid of Object.keys(users || {})) {
+        if (typeof uid !== 'string' || !/^[0-9]+$/.test(uid)) continue;
+        ensureUserObject(uid);
+      }
+
+      // Migrate active session store format (legacy: keyed by uid)
+      const keys = Object.keys(activeSessionsStore || {});
+      const looksLegacy = keys.some((k) => /^[0-9]+$/.test(k));
+      if (looksLegacy) {
+        const migrated = {};
+        for (const uid of keys) {
+          const s = activeSessionsStore[uid];
+          if (!s || typeof s !== 'object') continue;
+          if (!/^[0-9]+$/.test(uid)) continue;
+          const sessionId = `legacy_${uid}`;
+          migrated[sessionId] = {
+            ownerUid: uid,
+            accountId: 'legacy',
+            startedAt: s.startedAt || nowMs(),
+            server: s.server || null,
+            connectionType: s.connectionType,
+            bedrockVersion: s.bedrockVersion,
+            offlineUsername: s.offlineUsername,
+            lastActive: s.lastActive || nowMs(),
+          };
+        }
+        activeSessionsStore = migrated;
+        sessionStore.data = activeSessionsStore;
+        sessionStore.save(true);
+      } else {
+        // If already in new format, ensure minimal shape
+        for (const sid of keys) {
+          const s = activeSessionsStore[sid];
+          if (!s || typeof s !== 'object') continue;
+          if (!s.ownerUid || !/^[0-9]+$/.test(String(s.ownerUid))) continue;
+          if (!s.accountId) s.accountId = 'legacy';
+        }
+      }
+
+      // Persist normalization best-effort
+      userStore.data = users;
+      userStore.save();
+      sessionStore.data = activeSessionsStore;
+      sessionStore.save();
+    } catch (e) {
+      console.error('Migration error:', e?.message || e);
+    }
+  }
+
+  // Access time tracker: save elapsed time every 30 minutes, enforce expiry every minute.
+  async function tickAccessAndEnforce(saveElapsed = false) {
+    try {
+      if (!storesInitialized) return;
+
+      const now = nowMs();
+      const expiredUsers = [];
+
+      for (const uid of Object.keys(users || {})) {
+        if (typeof uid !== 'string' || !/^[0-9]+$/.test(uid)) continue;
+        const u = ensureUserObject(uid);
+        const a = u.access;
+        if (!a?.enabled) continue;
+
+        // Init access timestamps
+        if (typeof a.grantedAt !== 'number') a.grantedAt = now;
+        if (typeof a.elapsedMs !== 'number') a.elapsedMs = 0;
+        if (typeof a.lastTickAt !== 'number') a.lastTickAt = now;
+
+        if (saveElapsed) {
+          const delta = Math.max(0, now - (a.lastTickAt || now));
+          a.elapsedMs = (a.elapsedMs || 0) + delta;
+          a.lastTickAt = now;
+
+          if (a.durationMs && !isInfinity(a.durationMs) && typeof a.grantedAt === 'number') {
+            a.expiresAt = a.grantedAt + Number(a.durationMs);
+          } else {
+            a.expiresAt = null;
+          }
+        }
+
+        const expiresAt = getAccessExpiry(uid);
+        if (expiresAt && now >= expiresAt) {
+          expiredUsers.push(uid);
+        }
+      }
+
+      if (expiredUsers.length > 0) {
+        for (const uid of expiredUsers) {
+          const u = ensureUserObject(uid);
+          if (u.access) {
+            u.access.enabled = false;
+            u.access.revokedAt = now;
+          }
+        }
+        await userStore.save(true);
+
+        // Stop all sessions for expired users
+        for (const uid of expiredUsers) {
+          await stopAllSessionsForUser(uid);
+        }
+      }
+
+      if (saveElapsed) {
+        await userStore.save(true);
+      }
+    } catch (e) {
+      console.error('Access tick error:', e?.message || e);
+    }
+  }
+
   // ==================== RUNTIME STATE ====================
 
-  const sessions = new Map(); // uid -> session object
+  const sessions = new Map(); // sessionId -> session object
+  const sessionsByOwner = new Map(); // ownerUid -> Set(sessionId)
   const pendingLink = new Map();
   const lastMsa = new Map();
   const lastInteractionAt = new Map();
@@ -544,6 +848,32 @@ async function runParent() {
 
   let isShuttingDown = false;
   let discordReady = false;
+
+  function addSessionIndex(ownerUid, sessionId) {
+    if (!ownerUid || !sessionId) return;
+    let set = sessionsByOwner.get(ownerUid);
+    if (!set) {
+      set = new Set();
+      sessionsByOwner.set(ownerUid, set);
+    }
+    set.add(sessionId);
+  }
+
+  function removeSessionIndex(ownerUid, sessionId) {
+    const set = sessionsByOwner.get(ownerUid);
+    if (!set) return;
+    set.delete(sessionId);
+    if (set.size === 0) sessionsByOwner.delete(ownerUid);
+  }
+
+  function getOwnerSessionIds(ownerUid) {
+    const set = sessionsByOwner.get(ownerUid);
+    return set ? Array.from(set) : [];
+  }
+
+  function getOwnerSessionCount(ownerUid) {
+    return getOwnerSessionIds(ownerUid).length;
+  }
 
   // ==================== DISCORD CLIENT ====================
 
@@ -586,48 +916,102 @@ async function runParent() {
   // ==================== HELPERS ====================
 
   function getUser(uid) {
-    if (!uid || typeof uid !== 'string' || !/^\d+$/.test(uid)) {
-      return { connectionType: 'online', bedrockVersion: 'auto', _temp: true };
-    }
-
-    if (!users[uid]) {
-      users[uid] = {
-        connectionType: 'online',
-        bedrockVersion: 'auto',
-        createdAt: Date.now(),
-        lastActive: Date.now(),
-      };
-      userStore.save();
-    }
-
-    users[uid].connectionType = users[uid].connectionType || 'online';
-    users[uid].bedrockVersion = users[uid].bedrockVersion || 'auto';
-    users[uid].lastActive = Date.now();
-    return users[uid];
+    return ensureUserObject(uid);
   }
 
-  async function getUserAuthDir(uid) {
+  function makeId(prefix = '') {
+    const rnd = Math.random().toString(16).slice(2, 10);
+    return `${prefix}${Date.now().toString(16)}${rnd}`;
+  }
+
+  function listAccounts(uid) {
+    const u = getUser(uid);
+    const accounts = Array.isArray(u.microsoftAccounts) ? u.microsoftAccounts : [];
+    return accounts.filter((a) => a && typeof a.id === 'string');
+  }
+
+  function listServers(uid) {
+    const u = getUser(uid);
+    const servers = Array.isArray(u.servers) ? u.servers : [];
+    return servers.filter((s) => s && s.ip && s.port);
+  }
+
+  function formatAccountLabel(account, idx) {
+    // Keep it simple; no extra API calls.
+    if (!account) return `Account ${idx + 1}`;
+    if (account.legacy) return 'Account 1';
+    return `Account ${idx + 1}`;
+  }
+
+  function formatServerLabel(server) {
+    if (!server) return 'Unknown server';
+    return `${server.ip}:${server.port}`;
+  }
+
+  async function getUserAuthDir(uid, accountId = 'legacy') {
     if (!uid || typeof uid !== 'string') return null;
     const safeUid = uid.replace(/[^a-zA-Z0-9]/g, '');
     if (!safeUid) return null;
-    const dir = path.join(AUTH_ROOT, safeUid);
+
+    // Legacy account stays in /auth/<uid> to keep existing tokens compatible.
+    if (!accountId || accountId === 'legacy') {
+      const dir = path.join(AUTH_ROOT, safeUid);
+      await ensureDir(dir);
+      return dir;
+    }
+
+    // New accounts: /auth/<uid>__<accountId> (keeps accounts separated without nesting)
+    const safeAcc = String(accountId).replace(/[^a-zA-Z0-9_-]/g, '');
+    if (!safeAcc) {
+      const dir = path.join(AUTH_ROOT, safeUid);
+      await ensureDir(dir);
+      return dir;
+    }
+
+    const dir = path.join(AUTH_ROOT, `${safeUid}__${safeAcc}`);
     await ensureDir(dir);
     return dir;
   }
 
-  async function unlinkMicrosoft(uid) {
-    if (!uid) return false;
-    const dir = await getUserAuthDir(uid);
+  async function unlinkMicrosoftAccount(uid, accountId) {
+    if (!uid || !accountId) return false;
+    const u = getUser(uid);
+
+    const accIndex = (u.microsoftAccounts || []).findIndex((a) => a && a.id === accountId);
+    if (accIndex === -1) return false;
+
+    const account = u.microsoftAccounts[accIndex];
+    const dir = await getUserAuthDir(uid, accountId);
+
     if (dir) {
       try {
         await fs.rm(dir, { recursive: true, force: true });
       } catch (_) {}
     }
-    const u = getUser(uid);
-    u.linked = false;
-    u.authTokenExpiry = null;
-    u.tokenAcquiredAt = null;
+
+    // Remove account from list
+    u.microsoftAccounts.splice(accIndex, 1);
+
+    // Legacy compat
+    u.linked = u.microsoftAccounts.length > 0;
+    if (!u.linked) {
+      u.authTokenExpiry = null;
+      u.tokenAcquiredAt = null;
+    }
+
     await userStore.save(true);
+
+    // Stop any active bots using this account
+    try {
+      const ids = getOwnerSessionIds(uid);
+      for (const sid of ids) {
+        const s = sessions.get(sid);
+        if (s && s.accountId === accountId) {
+          await stopSession(sid);
+        }
+      }
+    } catch (_) {}
+
     return true;
   }
 
@@ -721,42 +1105,42 @@ async function runParent() {
 
   // ==================== SESSION STORE ====================
 
-  async function saveSessionData(uid) {
-    if (!uid) return;
-    const u = getUser(uid);
-    if (!u) return;
-    activeSessionsStore[uid] = {
-      startedAt: Date.now(),
-      server: u.server,
-      connectionType: u.connectionType,
-      bedrockVersion: u.bedrockVersion,
-      offlineUsername: u.offlineUsername,
-      linked: u.linked,
-      authTokenExpiry: u.authTokenExpiry,
-      tokenAcquiredAt: u.tokenAcquiredAt,
-      lastActive: Date.now(),
+  async function saveSessionData(sessionId) {
+    if (!sessionId) return;
+    const s = sessions.get(sessionId);
+    if (!s) return;
+
+    activeSessionsStore[sessionId] = {
+      ownerUid: s.ownerUid,
+      accountId: s.accountId,
+      startedAt: s.startedAt || nowMs(),
+      server: s.server,
+      connectionType: s.connectionType,
+      bedrockVersion: s.bedrockVersion,
+      offlineUsername: s.offlineUsername,
+      lastActive: nowMs(),
     };
     await sessionStore.save();
   }
 
   async function saveAllSessionData() {
-    for (const [uid] of sessions) {
-      await saveSessionData(uid);
+    for (const [sessionId] of sessions) {
+      await saveSessionData(sessionId);
     }
   }
 
-  async function clearSessionData(uid) {
-    if (activeSessionsStore[uid]) {
-      delete activeSessionsStore[uid];
+  async function clearSessionData(sessionId) {
+    if (activeSessionsStore[sessionId]) {
+      delete activeSessionsStore[sessionId];
       await sessionStore.save();
     }
   }
 
   // ==================== WORKER PROCESS MANAGEMENT ====================
 
-  function buildWorkerOpts(uid, authDir) {
-    const u = getUser(uid);
-    const { ip, port } = u.server;
+  function buildWorkerOpts(ownerUid, authDir, server) {
+    const u = getUser(ownerUid);
+    const { ip, port } = server;
 
     const opts = {
       host: ip,
@@ -765,7 +1149,7 @@ async function runParent() {
       keepAlive: true,
       viewDistance: 1,
       profilesFolder: authDir,
-      username: uid,
+      username: ownerUid,
       offline: false,
       skipPing: true,
       autoInitPlayer: true,
@@ -776,14 +1160,14 @@ async function runParent() {
     };
 
     if (u.connectionType === 'offline') {
-      opts.username = u.offlineUsername || `AFK_${uid.slice(-4)}`;
+      opts.username = u.offlineUsername || `AFK_${ownerUid.slice(-4)}`;
       opts.offline = true;
     }
 
     return opts;
   }
 
-  function spawnWorkerForSession(uid, runId, opts) {
+  function spawnWorkerForSession(sessionId, runId, opts) {
     // Spawn this same file as a worker.
     const child = fork(__filename, [], {
       env: { ...process.env, AFKBOT_WORKER: '1' },
@@ -793,28 +1177,28 @@ async function runParent() {
     child.on('message', (msg) => {
       try {
         if (!msg || typeof msg !== 'object') return;
-        const s = sessions.get(uid);
+        const s = sessions.get(sessionId);
         if (!s) return;
 
         if (msg.type === 'worker_ready') {
           // no-op
         } else if (msg.type === 'worker_log') {
-          if (msg.level === 'error') console.error(`[WORKER ${uid}]`, msg.message);
-          else console.log(`[WORKER ${uid}]`, msg.message);
+          if (msg.level === 'error') console.error(`[WORKER ${sessionId}]`, msg.message);
+          else console.log(`[WORKER ${sessionId}]`, msg.message);
         } else if (msg.type === 'mc_spawn') {
-          logToDiscord(`Bot of <@${uid}> spawned.`);
+          logToDiscord(`Bot of <@${s.ownerUid}> spawned.`);
         } else if (msg.type === 'mc_connected') {
           s.connected = true;
           s.isReconnecting = false;
           s.reconnectAttempt = 0;
-          logToDiscord(`Bot of <@${uid}> connected to **${s.serverLabel}**`);
+          logToDiscord(`Bot of <@${s.ownerUid}> connected to **${s.serverLabel}**`);
         } else if (msg.type === 'mc_disconnect') {
-          logToDiscord(`Bot of <@${uid}> was kicked: ${msg.reason || 'Unknown reason'}`);
+          logToDiscord(`Bot of <@${s.ownerUid}> was kicked: ${msg.reason || 'Unknown reason'}`);
         } else if (msg.type === 'mc_error') {
-          console.error(`Session error for ${uid}:`, msg.message || 'Unknown error');
-          logToDiscord(`Bot of <@${uid}> error: \`${String(msg.message || 'Unknown error').slice(0, 200)}\``);
+          console.error(`Session error for ${sessionId}:`, msg.message || 'Unknown error');
+          logToDiscord(`Bot of <@${s.ownerUid}> error: \`${String(msg.message || 'Unknown error').slice(0, 200)}\``);
         } else if (msg.type === 'mc_stale') {
-          console.warn(`Stale connection detected for ${uid}`);
+          console.warn(`Stale connection detected for ${sessionId}`);
         } else if (msg.type === 'mc_close') {
           // will be handled by exit handler too
         }
@@ -822,7 +1206,7 @@ async function runParent() {
     });
 
     child.once('exit', (code, signal) => {
-      const s = sessions.get(uid);
+      const s = sessions.get(sessionId);
       if (!s) return;
 
       s.child = null;
@@ -835,16 +1219,16 @@ async function runParent() {
 
       // Worker died unexpectedly (including native crash). Reconnect logic handles it.
       const nextAttempt = Math.max(1, (s.reconnectAttempt || 0) + 1);
-      console.warn(`Worker for ${uid} exited (${signal || code}). Scheduling reconnect attempt ${nextAttempt}...`);
-      handleAutoReconnect(uid, nextAttempt);
+      console.warn(`Worker for ${sessionId} exited (${signal || code}). Scheduling reconnect attempt ${nextAttempt}...`);
+      handleAutoReconnect(sessionId, nextAttempt);
     });
 
     // Kick off worker start.
-    child.send({ type: 'start', uid, runId, opts });
+    child.send({ type: 'start', uid: sessionId, runId, opts });
     return child;
   }
 
-  async function stopWorker(uid, s) {
+  async function stopWorker(sessionId, s) {
     if (!s?.child) return;
     const child = s.child;
 
@@ -898,15 +1282,15 @@ async function runParent() {
 
   // ==================== SESSION MANAGEMENT ====================
 
-  async function cleanupSession(uid) {
-    if (!uid) return;
-    if (cleanupLocks.has(uid)) {
+  async function cleanupSession(sessionId) {
+    if (!sessionId) return;
+    if (cleanupLocks.has(sessionId)) {
       return;
     }
 
-    cleanupLocks.add(uid);
+    cleanupLocks.add(sessionId);
     try {
-      const s = sessions.get(uid);
+      const s = sessions.get(sessionId);
       if (!s) return;
 
       s.isCleaningUp = true;
@@ -918,25 +1302,26 @@ async function runParent() {
       }
 
       // Stop worker process (no bedrock-protocol close in parent).
-      await stopWorker(uid, s);
+      await stopWorker(sessionId, s);
 
-      sessions.delete(uid);
+      sessions.delete(sessionId);
+      removeSessionIndex(s.ownerUid, sessionId);
     } finally {
-      cleanupLocks.delete(uid);
+      cleanupLocks.delete(sessionId);
     }
   }
 
   async function cleanupAllSessions() {
     const promises = [];
-    for (const [uid] of sessions) {
-      promises.push(cleanupSession(uid));
+    for (const [sessionId] of sessions) {
+      promises.push(cleanupSession(sessionId));
     }
     await Promise.all(promises);
   }
 
-  async function stopSession(uid) {
-    if (!uid) return false;
-    const s = sessions.get(uid);
+  async function stopSession(sessionId) {
+    if (!sessionId) return false;
+    const s = sessions.get(sessionId);
     if (s) {
       s.manualStop = true;
       if (s.reconnectTimer) {
@@ -944,23 +1329,30 @@ async function runParent() {
         s.reconnectTimer = null;
       }
     }
-    await clearSessionData(uid);
-    await cleanupSession(uid);
+    await clearSessionData(sessionId);
+    await cleanupSession(sessionId);
     return true;
+  }
+
+  async function stopAllSessionsForUser(uid) {
+    const ids = getOwnerSessionIds(uid);
+    for (const sessionId of ids) {
+      await stopSession(sessionId);
+    }
   }
 
   // ==================== RECONNECTION SYSTEM ====================
 
-  async function handleAutoReconnect(uid, attempt = 1) {
-    if (!uid || isShuttingDown) return;
-    const s = sessions.get(uid);
+  async function handleAutoReconnect(sessionId, attempt = 1) {
+    if (!sessionId || isShuttingDown) return;
+    const s = sessions.get(sessionId);
     if (!s || s.manualStop || s.isCleaningUp) return;
 
     attempt = Math.max(1, attempt);
     if (attempt > CONFIG.MAX_RECONNECT_ATTEMPTS) {
-      logToDiscord(`Bot of <@${uid}> stopped after max failed attempts.`);
-      await cleanupSession(uid);
-      await clearSessionData(uid);
+      logToDiscord(`Bot of <@${s.ownerUid}> stopped after max failed attempts.`);
+      await cleanupSession(sessionId);
+      await clearSessionData(sessionId);
       return;
     }
 
@@ -973,17 +1365,17 @@ async function runParent() {
     const jitter = Math.random() * 5000;
     const delay = baseDelay + jitter;
 
-    logToDiscord(`Bot of <@${uid}> disconnected. Reconnecting in ${Math.round(delay / 1000)}s (Attempt ${attempt})...`);
+    logToDiscord(`Bot of <@${s.ownerUid}> disconnected. Reconnecting in ${Math.round(delay / 1000)}s (Attempt ${attempt})...`);
 
     s.reconnectTimer = setTimeout(async () => {
       if (!isShuttingDown && !s.manualStop) {
         // Kill any previous worker first (if still around)
-        await stopWorker(uid, s);
+        await stopWorker(sessionId, s);
         if (!isShuttingDown) {
-          await startSession(uid, null, true, attempt);
+          await startSession(s.ownerUid, s.accountId, s.server, null, true, attempt, sessionId);
         }
       } else {
-        await cleanupSession(uid);
+        await cleanupSession(sessionId);
       }
     }, delay);
 
@@ -1009,10 +1401,27 @@ async function runParent() {
     };
   }
 
+  function adminPanelRow() {
+    return {
+      content: '**Admin Panel**',
+      components: [
+        new ActionRowBuilder().addComponents(
+          new ButtonBuilder().setCustomId('admin_grant').setLabel('Grant / Update Access').setStyle(ButtonStyle.Success),
+          new ButtonBuilder().setCustomId('admin_remove').setLabel('Remove Access').setStyle(ButtonStyle.Danger),
+          new ButtonBuilder().setCustomId('admin_list').setLabel('List Users').setStyle(ButtonStyle.Secondary),
+        ),
+      ],
+    };
+  }
+
   // ==================== MICROSOFT AUTHENTICATION ====================
 
   async function linkMicrosoft(uid, interaction) {
     if (!uid || !interaction) return;
+
+    if (!hasAccess(uid)) {
+      return safeReply(interaction, ERR_NO_ACCESS, true);
+    }
 
     // Always defer quickly to avoid "Unknown interaction".
     try {
@@ -1025,7 +1434,15 @@ async function runParent() {
       return safeReply(interaction, 'Login already in progress. Check your DMs or use the last code.', true);
     }
 
-    const authDir = await getUserAuthDir(uid);
+    // Enforce max accounts
+    const maxAccounts = getMaxAccounts(uid);
+    const currentAccounts = listAccounts(uid).length;
+    if (maxAccounts !== 'infinity' && currentAccounts >= maxAccounts) {
+      return safeReply(interaction, ERR_MAX_ACCOUNT_LIMIT, true);
+    }
+
+    const accountId = makeId('acc_');
+    const authDir = await getUserAuthDir(uid, accountId);
     if (!authDir) {
       return safeReply(interaction, 'System error: Cannot create auth directory.', true);
     }
@@ -1049,7 +1466,7 @@ async function runParent() {
         async (data) => {
           const uri = data?.verification_uri_complete || data?.verification_uri || 'https://www.microsoft.com/link';
           const code = data?.user_code || '(no code)';
-          lastMsa.set(uid, { uri, code, at: Date.now() });
+          lastMsa.set(uid, { uri, code, at: nowMs() });
 
           const msg =
             `**Microsoft Authentication Required**\n\n` +
@@ -1068,8 +1485,20 @@ async function runParent() {
         .getMsaToken()
         .then(async () => {
           clearTimeout(timeoutId);
+
+          // Save account record
+          if (!Array.isArray(u.microsoftAccounts)) u.microsoftAccounts = [];
+          u.microsoftAccounts.push({
+            id: accountId,
+            createdAt: nowMs(),
+            tokenAcquiredAt: nowMs(),
+            lastUsedAt: null,
+          });
+
+          // Legacy alias fields
           u.linked = true;
-          u.tokenAcquiredAt = Date.now();
+          u.tokenAcquiredAt = nowMs();
+
           await userStore.save(true);
           await safeReply(interaction, 'Microsoft account linked!', true);
           pendingLink.delete(uid);
@@ -1088,12 +1517,17 @@ async function runParent() {
 
   // ==================== MAIN SESSION FUNCTION ====================
 
-  async function startSession(uid, interaction, isReconnect = false, reconnectAttempt = 1) {
-    if (!uid || isShuttingDown) return;
+  async function startSession(ownerUid, accountId, server, interaction, isReconnect = false, reconnectAttempt = 1, existingSessionId = null) {
+    if (!ownerUid || isShuttingDown) return null;
 
     if (!storesInitialized) {
       if (interaction) safeReply(interaction, 'System initializing, please try again.', true);
-      return;
+      return null;
+    }
+
+    if (!hasAccess(ownerUid)) {
+      if (interaction) safeReply(interaction, ERR_NO_ACCESS, true);
+      return null;
     }
 
     // Defer early for interactive calls to avoid Unknown interaction.
@@ -1103,84 +1537,112 @@ async function runParent() {
       } catch (_) {}
     }
 
-    // Wait for ongoing cleanup.
-    if (cleanupLocks.has(uid)) {
+    // Enforce global bot cap
+    if (!isReconnect && sessions.size >= GLOBAL_MAX_BOTS && !isAdmin(ownerUid)) {
+      if (interaction) safeReply(interaction, ERR_MAX_BOT_LIMIT, true);
+      return null;
+    }
+
+    // Enforce per-user bot limit
+    const maxBots = getMaxBots(ownerUid);
+    const currentBots = getOwnerSessionCount(ownerUid);
+    if (!isReconnect && maxBots !== 'infinity' && currentBots >= maxBots && !isAdmin(ownerUid)) {
+      if (interaction) safeReply(interaction, ERR_MAX_BOT_LIMIT, true);
+      return null;
+    }
+
+    // Wait for ongoing cleanup of this session id.
+    if (existingSessionId && cleanupLocks.has(existingSessionId)) {
       let attempts = 0;
-      while (cleanupLocks.has(uid) && attempts < 10) {
+      while (cleanupLocks.has(existingSessionId) && attempts < 10) {
         await new Promise((r) => setTimeout(r, 500));
         attempts++;
       }
     }
 
-    const u = getUser(uid);
+    const u = getUser(ownerUid);
     if (!u) {
       if (interaction) safeReply(interaction, 'User data error.', true);
-      return;
+      return null;
     }
 
-    if (!u.linked) {
+    const accounts = listAccounts(ownerUid);
+    if (!accounts.length) {
       if (interaction) safeReply(interaction, 'Please auth with Xbox to use the bot', true);
-      else await clearSessionData(uid);
-      return;
+      return null;
     }
 
-    if (!u.server?.ip) {
+    const selectedAccount = accounts.find((a) => a.id === accountId) || accounts[0];
+    const selectedAccountId = selectedAccount?.id || accounts[0].id;
+
+    if (!server?.ip) {
       if (interaction) safeReply(interaction, 'Please configure your server settings first.', true);
-      await clearSessionData(uid);
-      return;
+      return null;
     }
 
-    const { ip, port } = u.server;
+    const { ip, port } = server;
     if (!isValidIP(ip) || !isValidPort(port)) {
       if (interaction) safeReply(interaction, 'Invalid server IP or port format.', true);
-      await clearSessionData(uid);
-      return;
+      return null;
     }
 
-    // Session conflicts
-    if (sessions.has(uid) && !isReconnect) {
-      if (interaction) safeReply(interaction, '**Session Conflict**: Active session exists. Use stop first.', true);
-      return;
+    // Reconnect: cleanup old session before restarting
+    if (isReconnect && existingSessionId && sessions.has(existingSessionId)) {
+      await cleanupSession(existingSessionId);
     }
 
-    if (isReconnect && sessions.has(uid)) {
-      // Stop old session worker without touching native code here.
-      await cleanupSession(uid);
-    }
-
-    await saveSessionData(uid);
-
-    const authDir = await getUserAuthDir(uid);
+    const authDir = await getUserAuthDir(ownerUid, selectedAccountId);
     if (!authDir) {
       if (interaction) safeReply(interaction, 'Auth directory error.', true);
-      return;
+      return null;
     }
 
     const runId = `${Date.now()}_${Math.random().toString(16).slice(2)}`;
+    const sessionId = existingSessionId || makeId(`s_${ownerUid}_`);
 
     const session = {
-      uid,
+      sessionId,
+      ownerUid,
+      accountId: selectedAccountId,
       runId,
       child: null,
-      startedAt: Date.now(),
+      startedAt: nowMs(),
       manualStop: false,
       connected: false,
       isReconnecting: !!isReconnect,
       isCleaningUp: false,
       reconnectAttempt: reconnectAttempt,
       reconnectTimer: null,
+      server: { ip, port },
       serverLabel: `${ip}:${port}`,
+      connectionType: u.connectionType,
+      bedrockVersion: u.bedrockVersion,
+      offlineUsername: u.offlineUsername,
     };
 
-    sessions.set(uid, session);
+    sessions.set(sessionId, session);
+    addSessionIndex(ownerUid, sessionId);
+
+    // Save "last used" server for legacy flows
+    u.server = { ip, port };
+    if (Array.isArray(u.servers)) {
+      const srv = u.servers.find((s) => s && s.ip === ip && String(s.port) === String(port));
+      if (srv) srv.lastUsedAt = nowMs();
+    }
+    if (selectedAccount) selectedAccount.lastUsedAt = nowMs();
+    await userStore.save();
+
+    await saveSessionData(sessionId);
 
     // Spawn worker (bedrock-protocol lives there)
-    const opts = buildWorkerOpts(uid, authDir);
-    session.child = spawnWorkerForSession(uid, runId, opts);
+    const opts = buildWorkerOpts(ownerUid, authDir, server);
+    session.child = spawnWorkerForSession(sessionId, runId, opts);
 
     if (interaction) {
-      await safeReply(interaction, `**Connecting...** (\`${ip}:${port}\`)`, true);
+      await safeReply(interaction, 'Scheduled join… Should join in under 5 minutes…', true);
     }
+
+    return sessionId;
   }
 
   // ==================== SESSION RESTORATION ====================
@@ -1190,36 +1652,44 @@ async function runParent() {
     console.log(`Found ${previousSessions.length} sessions to restore`);
 
     let delay = 0;
-    for (const uid of previousSessions) {
-      if (typeof uid !== 'string' || !/^\d+$/.test(uid)) continue;
+    for (const sessionId of previousSessions) {
+      const sessionData = activeSessionsStore[sessionId];
+      if (!sessionData || typeof sessionData !== 'object') continue;
 
-      const sessionData = activeSessionsStore[uid];
-      if (!sessionData) continue;
-
-      const hasServer = !!(sessionData.server && sessionData.server.ip && sessionData.server.port);
-      const isLinked = sessionData.linked === true;
-
-      if (!hasServer || !isLinked) {
-        console.log(`Skipping restore for user ${uid}: missing server settings or not linked.`);
-        await clearSessionData(uid);
+      const ownerUid = String(sessionData.ownerUid || '');
+      if (!ownerUid || !/^[0-9]+$/.test(ownerUid)) {
+        await clearSessionData(sessionId);
         continue;
       }
 
-      if (!users[uid]) users[uid] = {};
-      if (sessionData.server) users[uid].server = sessionData.server;
-      if (sessionData.connectionType) users[uid].connectionType = sessionData.connectionType;
-      if (sessionData.bedrockVersion) users[uid].bedrockVersion = sessionData.bedrockVersion;
-      if (sessionData.offlineUsername) users[uid].offlineUsername = sessionData.offlineUsername;
-      if (sessionData.linked !== undefined) users[uid].linked = sessionData.linked;
-      if (sessionData.authTokenExpiry) users[uid].authTokenExpiry = sessionData.authTokenExpiry;
-      if (sessionData.tokenAcquiredAt) users[uid].tokenAcquiredAt = sessionData.tokenAcquiredAt;
+      if (!hasAccess(ownerUid)) {
+        console.log(`Skipping restore for user ${ownerUid}: no access.`);
+        await clearSessionData(sessionId);
+        continue;
+      }
+
+      const hasServer = !!(sessionData.server && sessionData.server.ip && sessionData.server.port);
+      if (!hasServer) {
+        console.log(`Skipping restore for session ${sessionId}: missing server settings.`);
+        await clearSessionData(sessionId);
+        continue;
+      }
+
+      // Restore into user store (legacy compatibility)
+      if (!users[ownerUid]) users[ownerUid] = {};
+      const u = getUser(ownerUid);
+
+      if (sessionData.server) u.server = sessionData.server;
+      if (sessionData.connectionType) u.connectionType = sessionData.connectionType;
+      if (sessionData.bedrockVersion) u.bedrockVersion = sessionData.bedrockVersion;
+      if (sessionData.offlineUsername) u.offlineUsername = sessionData.offlineUsername;
 
       await userStore.save(true);
 
       setTimeout(() => {
         if (!isShuttingDown) {
-          console.log(`Restoring session for user ${uid}`);
-          startSession(uid, null, true);
+          console.log(`Restoring session ${sessionId} for user ${ownerUid}`);
+          startSession(ownerUid, sessionData.accountId || 'legacy', sessionData.server, null, true, 1, sessionId);
         }
       }, delay);
 
@@ -1275,6 +1745,7 @@ async function runParent() {
       const cmds = [
         new SlashCommandBuilder().setName('panel').setDescription('Open Bedrock AFK panel'),
         new SlashCommandBuilder().setName('java').setDescription('Open Java AFKBot Panel'),
+        new SlashCommandBuilder().setName('admin').setDescription('Open admin panel'),
       ];
       await client.application?.commands?.set(cmds);
     } catch (e) {
@@ -1291,11 +1762,97 @@ async function runParent() {
       }
     }, CONFIG.MEMORY_CHECK_INTERVAL_MS).unref?.();
 
+    // Access trackers
+    setInterval(() => {
+      tickAccessAndEnforce(false);
+    }, 60_000).unref?.();
+
+    setInterval(() => {
+      tickAccessAndEnforce(true);
+    }, 30 * 60_000).unref?.();
+
     // Restore sessions a bit after boot.
     setTimeout(() => {
       restoreSessions();
     }, 10000).unref?.();
   });
+
+  // ==================== ADMIN PANEL HELPERS ====================
+
+  function buildAdminGrantModal() {
+    const modal = new ModalBuilder().setCustomId('admin_grant_modal').setTitle('Grant / Update Access');
+
+    const userIdInput = new TextInputBuilder()
+      .setCustomId('user_id')
+      .setLabel('User ID')
+      .setStyle(TextInputStyle.Short)
+      .setRequired(true)
+      .setMaxLength(32);
+
+    const maxBotsInput = new TextInputBuilder()
+      .setCustomId('max_bots')
+      .setLabel('Max Bots (number or infinity)')
+      .setStyle(TextInputStyle.Short)
+      .setRequired(true)
+      .setMaxLength(16);
+
+    const maxAccountsInput = new TextInputBuilder()
+      .setCustomId('max_accounts')
+      .setLabel('Max Accounts (number or infinity)')
+      .setStyle(TextInputStyle.Short)
+      .setRequired(true)
+      .setMaxLength(16);
+
+    const durationInput = new TextInputBuilder()
+      .setCustomId('duration')
+      .setLabel('Duration (e.g. 7d, 12h, 30m, infinity)')
+      .setStyle(TextInputStyle.Short)
+      .setRequired(true)
+      .setMaxLength(32);
+
+    modal.addComponents(
+      new ActionRowBuilder().addComponents(userIdInput),
+      new ActionRowBuilder().addComponents(maxBotsInput),
+      new ActionRowBuilder().addComponents(maxAccountsInput),
+      new ActionRowBuilder().addComponents(durationInput),
+    );
+
+    return modal;
+  }
+
+  function buildAdminRemoveModal() {
+    const modal = new ModalBuilder().setCustomId('admin_remove_modal').setTitle('Remove Access');
+
+    const userIdInput = new TextInputBuilder()
+      .setCustomId('user_id')
+      .setLabel('User ID')
+      .setStyle(TextInputStyle.Short)
+      .setRequired(true)
+      .setMaxLength(32);
+
+    modal.addComponents(new ActionRowBuilder().addComponents(userIdInput));
+    return modal;
+  }
+
+  function formatAccessSummary(uid) {
+    const u = getUser(uid);
+    const a = u.access;
+    if (!a?.enabled) return 'Disabled';
+
+    const maxBots = a.maxBots ?? 0;
+    const maxAccounts = a.maxAccounts ?? 0;
+    const duration = a.durationMs ?? null;
+
+    let expiryTxt = 'Never';
+    const expiresAt = getAccessExpiry(uid);
+    if (expiresAt) {
+      expiryTxt = new Date(expiresAt).toISOString();
+    }
+
+    return `MaxBots: ${maxBots} | MaxAccounts: ${maxAccounts} | Expires: ${expiryTxt}`;
+  }
+
+  // ==================== INTERACTIONS ====================
 
   client.on(Events.InteractionCreate, async (i) => {
     try {
@@ -1310,75 +1867,212 @@ async function runParent() {
       lastInteractionAt.set(uid, Date.now());
 
       if (i.isChatInputCommand()) {
-        if (i.commandName === 'panel') return i.reply(panelRow(false)).catch(() => {});
-        if (i.commandName === 'java') return i.reply(panelRow(true)).catch(() => {});
+        if (i.commandName === 'panel') {
+          if (!hasAccess(uid)) return safeReply(i, ERR_NO_ACCESS, true);
+          return i.reply(panelRow(false)).catch(() => {});
+        }
+        if (i.commandName === 'java') {
+          if (!hasAccess(uid)) return safeReply(i, ERR_NO_ACCESS, true);
+          return i.reply(panelRow(true)).catch(() => {});
+        }
+        if (i.commandName === 'admin') {
+          if (!isAdmin(uid)) return safeReply(i, 'You do not have permission to use this command.', true);
+          return safeReply(i, adminPanelRow(), true);
+        }
       }
 
+      // Buttons
       if (i.isButton()) {
+        // ==================== ADMIN PANEL ====================
+
+        if (i.customId === 'admin_grant') {
+          if (!isAdmin(uid)) return safeReply(i, 'You do not have permission to use this command.', true);
+          return i.showModal(buildAdminGrantModal()).catch(() => {});
+        }
+
+        if (i.customId === 'admin_remove') {
+          if (!isAdmin(uid)) return safeReply(i, 'You do not have permission to use this command.', true);
+          return i.showModal(buildAdminRemoveModal()).catch(() => {});
+        }
+
+        if (i.customId === 'admin_list') {
+          if (!isAdmin(uid)) return safeReply(i, 'You do not have permission to use this command.', true);
+
+          const enabledUsers = Object.keys(users || {})
+            .filter((id) => /^[0-9]+$/.test(id) && users[id]?.access?.enabled)
+            .slice(0, 25);
+
+          const desc =
+            enabledUsers.length === 0
+              ? 'No users with access.'
+              : enabledUsers.map((id) => `<@${id}> — ${formatAccessSummary(id)}`).join('\n').slice(0, 4096);
+
+          const embed = new EmbedBuilder().setTitle('Access List').setDescription(desc).setColor('#5865F2');
+          return safeReply(i, { embeds: [embed] }, true);
+        }
+
+        // ==================== USER PANEL GUARDS ====================
+
+        if (['link', 'unlink', 'start_bedrock', 'start_java', 'stop', 'settings'].includes(i.customId)) {
+          if (!hasAccess(uid)) return safeReply(i, ERR_NO_ACCESS, true);
+        }
+
+        // ==================== START FLOW ====================
+
         if (i.customId === 'start_bedrock' || i.customId === 'start_java') {
-          if (sessions.has(uid)) return safeReply(i, '**Session Conflict**: Active session exists.', true);
+          // Enforce bot limit early
+          const maxBots = getMaxBots(uid);
+          const currentBots = getOwnerSessionCount(uid);
+          if (maxBots !== 'infinity' && currentBots >= maxBots && !isAdmin(uid)) {
+            return safeReply(i, ERR_MAX_BOT_LIMIT, true);
+          }
+          if (sessions.size >= GLOBAL_MAX_BOTS && !isAdmin(uid)) {
+            return safeReply(i, ERR_MAX_BOT_LIMIT, true);
+          }
+
+          const accounts = listAccounts(uid);
+          if (!accounts.length) return safeReply(i, 'Please auth with Xbox to use the bot', true);
+
+          const servers = listServers(uid);
+          if (!servers.length) return safeReply(i, 'Please configure your server settings first.', true);
 
           // Defer quickly.
           try {
             await i.deferReply({ flags: MessageFlags.Ephemeral });
           } catch (_) {}
 
-          const embed =
-            i.customId === 'start_java'
-              ? new EmbedBuilder()
-                  .setTitle('Java Compatibility Check')
-                  .setDescription('For a successful connection to a Java server, ensure the following plugins are installed.')
-                  .addFields({ name: 'Required Plugins', value: 'GeyserMC\nFloodgate' })
-                  .setColor('#E67E22')
-              : new EmbedBuilder().setTitle('Bedrock Connection').setDescription('Start bot?').setColor('#2ECC71');
-
-          const row = new ActionRowBuilder().addComponents(
-            new ButtonBuilder().setCustomId('confirm_start').setLabel('Start').setStyle(ButtonStyle.Success),
-            new ButtonBuilder().setCustomId('cancel').setLabel('Cancel').setStyle(ButtonStyle.Secondary),
+          const opts = accounts.slice(0, 25).map((acc, idx) =>
+            new StringSelectMenuOptionBuilder().setLabel(formatAccountLabel(acc, idx)).setValue(String(acc.id)),
           );
 
-          return i.followUp({ embeds: [embed], components: [row], flags: MessageFlags.Ephemeral }).catch(() => {});
+          const select = new StringSelectMenuBuilder()
+            .setCustomId('start_select_account')
+            .setPlaceholder('Select an account')
+            .addOptions(opts)
+            .setMinValues(1)
+            .setMaxValues(1);
+
+          const rows = [new ActionRowBuilder().addComponents(select)];
+
+          const cancelRow = new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId('cancel').setLabel('Cancel').setStyle(ButtonStyle.Secondary));
+
+          const embeds = [];
+          if (i.customId === 'start_java') {
+            const embed = new EmbedBuilder()
+              .setTitle('Java Compatibility Check')
+              .setDescription('For a successful connection to a Java server, ensure the following plugins are installed.')
+              .addFields({ name: 'Required Plugins', value: 'GeyserMC\nFloodgate' })
+              .setColor('#E67E22');
+            embeds.push(embed);
+          }
+
+          return safeReply(i, { content: 'What account do you want to join with', embeds: embeds.length ? embeds : undefined, components: [...rows, cancelRow] }, true);
         }
 
-        if (i.customId === 'confirm_start') {
-          try {
-            await i.deferReply({ flags: MessageFlags.Ephemeral });
-          } catch (_) {}
-          safeReply(i, '**Connecting...**', true);
-          startSession(uid, i, false);
-          return;
-        }
-
-        if (i.customId === 'cancel') return safeReply(i, 'Cancelled.', true);
+        // ==================== STOP FLOW ====================
 
         if (i.customId === 'stop') {
+          const ids = getOwnerSessionIds(uid);
+          if (!ids.length) {
+            try {
+              await i.deferReply({ flags: MessageFlags.Ephemeral });
+            } catch (_) {}
+            return safeReply(i, 'No active sessions.', true);
+          }
+
+          if (ids.length === 1) {
+            try {
+              await i.deferReply({ flags: MessageFlags.Ephemeral });
+            } catch (_) {}
+            const ok = await stopSession(ids[0]);
+            return safeReply(i, ok ? '**Session Terminated.**' : 'No active sessions.', true);
+          }
+
+          // Multiple sessions -> selection
           try {
             await i.deferReply({ flags: MessageFlags.Ephemeral });
           } catch (_) {}
-          const ok = await stopSession(uid);
-          return safeReply(i, ok ? '**Session Terminated.**' : 'No active sessions.', true);
+
+          const opts = ids.slice(0, 25).map((sid, idx) => {
+            const s = sessions.get(sid);
+            const label = s ? `${idx + 1}. ${s.serverLabel}` : `${idx + 1}. Unknown`;
+            return new StringSelectMenuOptionBuilder().setLabel(label.slice(0, 100)).setValue(String(sid));
+          });
+
+          const select = new StringSelectMenuBuilder()
+            .setCustomId('stop_select_session')
+            .setPlaceholder('Select a bot to stop')
+            .addOptions(opts)
+            .setMinValues(1)
+            .setMaxValues(1);
+
+          const row = new ActionRowBuilder().addComponents(select);
+          const cancelRow = new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId('cancel').setLabel('Cancel').setStyle(ButtonStyle.Secondary));
+
+          return safeReply(i, { content: 'Select a bot to stop.', components: [row, cancelRow] }, true);
         }
+
+        // ==================== LINK / UNLINK ====================
 
         if (i.customId === 'link') return linkMicrosoft(uid, i);
 
         if (i.customId === 'unlink') {
+          const accounts = listAccounts(uid);
+          if (!accounts.length) {
+            try {
+              await i.deferReply({ flags: MessageFlags.Ephemeral });
+            } catch (_) {}
+            return safeReply(i, 'Unlinked Microsoft account.', true);
+          }
+
           try {
             await i.deferReply({ flags: MessageFlags.Ephemeral });
           } catch (_) {}
-          await unlinkMicrosoft(uid);
-          return safeReply(i, 'Unlinked Microsoft account.', true);
+
+          const opts = accounts.slice(0, 25).map((acc, idx) =>
+            new StringSelectMenuOptionBuilder().setLabel(formatAccountLabel(acc, idx)).setValue(String(acc.id)),
+          );
+
+          const select = new StringSelectMenuBuilder()
+            .setCustomId('unlink_select_account')
+            .setPlaceholder('Select an account')
+            .addOptions(opts)
+            .setMinValues(1)
+            .setMaxValues(1);
+
+          const row = new ActionRowBuilder().addComponents(select);
+          const cancelRow = new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId('cancel').setLabel('Cancel').setStyle(ButtonStyle.Secondary));
+
+          return safeReply(i, { content: 'What account would you want to unlink?', components: [row, cancelRow] }, true);
         }
 
+        // ==================== SETTINGS (SERVER MANAGEMENT) ====================
+
         if (i.customId === 'settings') {
+          try {
+            await i.deferReply({ flags: MessageFlags.Ephemeral });
+          } catch (_) {}
+
+          const row = new ActionRowBuilder().addComponents(
+            new ButtonBuilder().setCustomId('server_add').setLabel('Add Server').setStyle(ButtonStyle.Primary),
+            new ButtonBuilder().setCustomId('server_remove').setLabel('Remove Server').setStyle(ButtonStyle.Secondary),
+            new ButtonBuilder().setCustomId('cancel').setLabel('Cancel').setStyle(ButtonStyle.Secondary),
+          );
+
+          return safeReply(i, { content: 'Server settings:', components: [row] }, true);
+        }
+
+        if (i.customId === 'server_add') {
           const u = getUser(uid);
-          const modal = new ModalBuilder().setCustomId('settings_modal').setTitle('Configuration');
+
+          const modal = new ModalBuilder().setCustomId('server_add_modal').setTitle('Configuration');
 
           const ipInput = new TextInputBuilder()
             .setCustomId('ip')
             .setLabel('Server IP')
             .setStyle(TextInputStyle.Short)
             .setRequired(true)
-            .setValue(u.server?.ip || '')
+            .setValue('')
             .setMaxLength(253);
 
           const portInput = new TextInputBuilder()
@@ -1386,28 +2080,236 @@ async function runParent() {
             .setLabel('Port')
             .setStyle(TextInputStyle.Short)
             .setRequired(true)
-            .setValue(String(u.server?.port || 19132))
+            .setValue(String(19132))
             .setMaxLength(5);
 
           modal.addComponents(new ActionRowBuilder().addComponents(ipInput), new ActionRowBuilder().addComponents(portInput));
 
           return i.showModal(modal).catch(() => {});
         }
+
+        if (i.customId === 'server_remove') {
+          const servers = listServers(uid);
+          if (!servers.length) {
+            try {
+              await i.deferReply({ flags: MessageFlags.Ephemeral });
+            } catch (_) {}
+            return safeReply(i, 'Please configure your server settings first.', true);
+          }
+
+          try {
+            await i.deferReply({ flags: MessageFlags.Ephemeral });
+          } catch (_) {}
+
+          const opts = servers.slice(0, 25).map((srv) => {
+            const label = formatServerLabel(srv).slice(0, 100);
+            return new StringSelectMenuOptionBuilder().setLabel(label).setValue(String(srv.id));
+          });
+
+          const select = new StringSelectMenuBuilder()
+            .setCustomId('server_remove_select')
+            .setPlaceholder('Select a server')
+            .addOptions(opts)
+            .setMinValues(1)
+            .setMaxValues(1);
+
+          const row = new ActionRowBuilder().addComponents(select);
+          const cancelRow = new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId('cancel').setLabel('Cancel').setStyle(ButtonStyle.Secondary));
+
+          return safeReply(i, { content: 'Select a server to remove.', components: [row, cancelRow] }, true);
+        }
+
+        // Cancel button
+        if (i.customId === 'cancel') return safeReply(i, 'Cancelled.', true);
       }
 
-      if (i.isModalSubmit() && i.customId === 'settings_modal') {
-        const ip = i.fields?.getTextInputValue('ip')?.trim();
-        const portStr = i.fields?.getTextInputValue('port')?.trim();
-        const port = parseInt(portStr, 10);
+      // Select Menus (String Selects)
+      const isSelectMenu =
+        (typeof i.isStringSelectMenu === 'function' && i.isStringSelectMenu()) || (typeof i.isSelectMenu === 'function' && i.isSelectMenu());
+      if (isSelectMenu) {
+        if (!hasAccess(uid)) return safeReply(i, ERR_NO_ACCESS, true);
 
-        if (!ip || !portStr) return safeReply(i, 'IP and Port are required.', true);
-        if (!isValidIP(ip)) return safeReply(i, 'Invalid IP address format.', true);
-        if (!isValidPort(port)) return safeReply(i, 'Invalid port (must be 1-65535).', true);
+        if (i.customId === 'start_select_account') {
+          const accountId = String(i.values?.[0] || '');
+          const accounts = listAccounts(uid);
+          const selected = accounts.find((a) => a.id === accountId);
+          if (!selected) return safeReply(i, 'Please auth with Xbox to use the bot', true);
 
-        const u = getUser(uid);
-        u.server = { ip, port };
-        await userStore.save(true);
-        return safeReply(i, `Saved: **${ip}:${port}**`, true);
+          const servers = listServers(uid);
+          if (!servers.length) return safeReply(i, 'Please configure your server settings first.', true);
+
+          // Build server selection with encoded value
+          const opts = servers.slice(0, 25).map((srv) => {
+            const label = formatServerLabel(srv).slice(0, 100);
+            const value = `${accountId}|${srv.id}`;
+            return new StringSelectMenuOptionBuilder().setLabel(label).setValue(value.slice(0, 100));
+          });
+
+          const select = new StringSelectMenuBuilder()
+            .setCustomId('start_select_server')
+            .setPlaceholder('Select a server')
+            .addOptions(opts)
+            .setMinValues(1)
+            .setMaxValues(1);
+
+          const row = new ActionRowBuilder().addComponents(select);
+          const cancelRow = new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId('cancel').setLabel('Cancel').setStyle(ButtonStyle.Secondary));
+
+          return safeReply(i, { content: 'What server do you want the bot to join?', components: [row, cancelRow] }, true);
+        }
+
+        if (i.customId === 'start_select_server') {
+          const raw = String(i.values?.[0] || '');
+          const [accountId, serverId] = raw.split('|');
+
+          const servers = listServers(uid);
+          const server = servers.find((s) => String(s.id) === String(serverId));
+          if (!server) return safeReply(i, 'Please configure your server settings first.', true);
+
+          // Bot limit check again (in case changed during selection)
+          const maxBots = getMaxBots(uid);
+          const currentBots = getOwnerSessionCount(uid);
+          if (maxBots !== 'infinity' && currentBots >= maxBots && !isAdmin(uid)) {
+            return safeReply(i, ERR_MAX_BOT_LIMIT, true);
+          }
+          if (sessions.size >= GLOBAL_MAX_BOTS && !isAdmin(uid)) {
+            return safeReply(i, ERR_MAX_BOT_LIMIT, true);
+          }
+
+          return startSession(uid, accountId, { ip: server.ip, port: server.port }, i, false);
+        }
+
+        if (i.customId === 'unlink_select_account') {
+          const accountId = String(i.values?.[0] || '');
+          try {
+            await i.deferReply({ flags: MessageFlags.Ephemeral });
+          } catch (_) {}
+
+          await unlinkMicrosoftAccount(uid, accountId);
+          return safeReply(i, 'Unlinked Microsoft account.', true);
+        }
+
+        if (i.customId === 'server_remove_select') {
+          const serverId = String(i.values?.[0] || '');
+
+          try {
+            await i.deferReply({ flags: MessageFlags.Ephemeral });
+          } catch (_) {}
+
+          const u = getUser(uid);
+          const before = listServers(uid);
+          const idx = (u.servers || []).findIndex((s) => s && String(s.id) === String(serverId));
+          if (idx !== -1) {
+            const removed = u.servers[idx];
+            u.servers.splice(idx, 1);
+            await userStore.save(true);
+            return safeReply(i, `Removed: **${formatServerLabel(removed)}**`, true);
+          }
+
+          // If not found, just respond
+          return safeReply(i, 'Cancelled.', true);
+        }
+
+        if (i.customId === 'stop_select_session') {
+          const sessionId = String(i.values?.[0] || '');
+          try {
+            await i.deferReply({ flags: MessageFlags.Ephemeral });
+          } catch (_) {}
+          const ok = await stopSession(sessionId);
+          return safeReply(i, ok ? '**Session Terminated.**' : 'No active sessions.', true);
+        }
+      }
+
+      // Modals
+      if (i.isModalSubmit()) {
+        // Admin grant
+        if (i.customId === 'admin_grant_modal') {
+          if (!isAdmin(uid)) return safeReply(i, 'You do not have permission to use this command.', true);
+
+          const targetUid = i.fields?.getTextInputValue('user_id')?.trim();
+          const maxBotsStr = i.fields?.getTextInputValue('max_bots')?.trim();
+          const maxAccountsStr = i.fields?.getTextInputValue('max_accounts')?.trim();
+          const durationStr = i.fields?.getTextInputValue('duration')?.trim();
+
+          if (!targetUid || !/^[0-9]+$/.test(targetUid)) return safeReply(i, 'Invalid User ID.', true);
+
+          const maxBots = parseLimitValue(maxBotsStr);
+          const maxAccounts = parseLimitValue(maxAccountsStr);
+          const durationMs = parseDurationMs(durationStr);
+
+          if (maxBots === null) return safeReply(i, 'Invalid Max Bots.', true);
+          if (maxAccounts === null) return safeReply(i, 'Invalid Max Accounts.', true);
+          if (durationMs === null) return safeReply(i, 'Invalid Duration.', true);
+
+          const u = getUser(targetUid);
+          if (!u.access || typeof u.access !== 'object') u.access = {};
+          u.access.enabled = true;
+          u.access.maxBots = maxBots;
+          u.access.maxAccounts = maxAccounts;
+          u.access.durationMs = durationMs;
+
+          const now = nowMs();
+          u.access.grantedAt = now;
+          u.access.lastTickAt = now;
+          u.access.elapsedMs = 0;
+          u.access.expiresAt = !isInfinity(durationMs) ? now + Number(durationMs) : null;
+
+          await userStore.save(true);
+
+          const expiresAt = getAccessExpiry(targetUid);
+          const expiryTxt = expiresAt ? new Date(expiresAt).toISOString() : 'Never';
+
+          const msg = `Access updated for <@${targetUid}>\nMax Bots: ${maxBots}\nMax Accounts: ${maxAccounts}\nExpires: ${expiryTxt}`;
+          return safeReply(i, msg, true);
+        }
+
+        // Admin remove
+        if (i.customId === 'admin_remove_modal') {
+          if (!isAdmin(uid)) return safeReply(i, 'You do not have permission to use this command.', true);
+
+          const targetUid = i.fields?.getTextInputValue('user_id')?.trim();
+          if (!targetUid || !/^[0-9]+$/.test(targetUid)) return safeReply(i, 'Invalid User ID.', true);
+
+          const u = getUser(targetUid);
+          if (!u.access || typeof u.access !== 'object') u.access = {};
+          u.access.enabled = false;
+          u.access.revokedAt = nowMs();
+          await userStore.save(true);
+
+          await stopAllSessionsForUser(targetUid);
+
+          return safeReply(i, `Access removed for <@${targetUid}>`, true);
+        }
+
+        // Server add
+        if (i.customId === 'server_add_modal') {
+          const ip = i.fields?.getTextInputValue('ip')?.trim();
+          const portStr = i.fields?.getTextInputValue('port')?.trim();
+          const port = parseInt(portStr, 10);
+
+          if (!ip || !portStr) return safeReply(i, 'IP and Port are required.', true);
+          if (!isValidIP(ip)) return safeReply(i, 'Invalid IP address format.', true);
+          if (!isValidPort(port)) return safeReply(i, 'Invalid port (must be 1-65535).', true);
+
+          // Enforce server entries <= max bots
+          const maxBots = getMaxBots(uid);
+          const u = getUser(uid);
+
+          const currentServers = listServers(uid).length;
+          if (maxBots !== 'infinity' && currentServers >= maxBots && !isAdmin(uid)) {
+            return safeReply(i, ERR_MAX_BOT_LIMIT, true);
+          }
+
+          const serverId = makeId('srv_');
+          if (!Array.isArray(u.servers)) u.servers = [];
+          u.servers.push({ id: serverId, ip, port, createdAt: nowMs(), lastUsedAt: null });
+
+          // Legacy
+          u.server = { ip, port };
+
+          await userStore.save(true);
+          return safeReply(i, `Saved: **${ip}:${port}**`, true);
+        }
       }
     } catch (e) {
       console.error('Interaction error:', e?.stack || e?.message || e);
