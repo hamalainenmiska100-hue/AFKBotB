@@ -2190,25 +2190,38 @@ async function runParent() {
         }
 
         if (i.customId === 'server_remove_select') {
-          const serverId = String(i.values?.[0] || '');
+  const serverId = String(i.values?.[0] || '');
 
-          try {
-            await i.deferReply({ flags: MessageFlags.Ephemeral });
-          } catch (_) {}
+  try {
+    await i.deferReply({ flags: MessageFlags.Ephemeral });
+  } catch (_) {}
 
-          const u = getUser(uid);
-          const before = listServers(uid);
-          const idx = (u.servers || []).findIndex((s) => s && String(s.id) === String(serverId));
-          if (idx !== -1) {
-            const removed = u.servers[idx];
-            u.servers.splice(idx, 1);
-            await userStore.save(true);
-            return safeReply(i, `Removed: **${formatServerLabel(removed)}**`, true);
-          }
+  const u = getUser(uid);
+  u.servers = Array.isArray(u.servers) ? u.servers : [];
 
-          // If not found, just respond
-          return safeReply(i, 'Cancelled.', true);
-        }
+  const idx = u.servers.findIndex((s) => s && String(s.id) === String(serverId));
+  if (idx === -1) {
+    return safeReply(i, 'Server not found.', true);
+  }
+
+  const removed = u.servers[idx];
+
+  // Remove from servers list
+  u.servers.splice(idx, 1);
+
+  // ALSO remove legacy single-server field if it matches (this is the key fix)
+  if (u.server && u.server.ip === removed.ip && String(u.server.port) === String(removed.port)) {
+    delete u.server;
+  }
+
+  // If no servers left, clear legacy just in case
+  if (u.servers.length === 0 && u.server) {
+    delete u.server;
+  }
+
+  await userStore.save(true);
+  return safeReply(i, `Removed: **${formatServerLabel(removed)}**`, true);
+}
 
         if (i.customId === 'stop_select_session') {
           const sessionId = String(i.values?.[0] || '');
