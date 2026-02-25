@@ -889,7 +889,7 @@ async function runParent() {
     },
     presence: {
       status: 'online',
-      activities: [{ name: 'AFK Bot System', type: ActivityType.Watching }],
+      activities: [{ name: '🔥 24/7 AFKBot [Bedrock and Java] 🚀💻 Developer: ilovecatssm2 ', type: ActivityType.Watching }],
     },
   });
 
