@@ -28,13 +28,23 @@ const CONFIG = {
 
   SAVE_DEBOUNCE_MS: 100,
 
-  MAX_RECONNECT_ATTEMPTS: 10,
+  // Reconnect:
+  // - Set MAX_RECONNECT_ATTEMPTS <= 0 for unlimited reconnect attempts (recommended for production).
+  MAX_RECONNECT_ATTEMPTS: 0,
   RECONNECT_BASE_DELAY_MS: 10_000,
   RECONNECT_MAX_DELAY_MS: 300_000,
+  // Cap exponential growth to avoid huge Math.pow() exponents; delay is still capped by RECONNECT_MAX_DELAY_MS.
+  RECONNECT_EXPONENT_CAP: 20,
 
   CONNECTION_TIMEOUT_MS: 30_000,
   KEEPALIVE_INTERVAL_MS: 15_000,
-  STALE_CONNECTION_TIMEOUT_MS: 60_000,
+
+  // "Stale" means we didn't see any packets/keepalives for STALE_CONNECTION_TIMEOUT_MS.
+  // Increase this for production to avoid false-positives during lag/maintenance.
+  STALE_CONNECTION_TIMEOUT_MS: 300_000,
+  // How often to check for staleness (separate from the threshold above).
+  STALE_CHECK_INTERVAL_MS: 30_000,
+
   MEMORY_CHECK_INTERVAL_MS: 60_000,
   MAX_MEMORY_MB: 1536,
 
@@ -49,6 +59,8 @@ const CONFIG = {
 
   // Misc
   SESSION_RESTORE_DELAY_MS: 8_000,
+  // Periodically ensure sessions listed in rejoin.json are actually running.
+  SESSION_WATCHDOG_INTERVAL_MS: 10 * 60_000,
 };
 
 // Determine base path for persisting user and session data. Fly.io exposes
@@ -177,7 +189,7 @@ async function runWorker() {
     }, CONFIG.KEEPALIVE_INTERVAL_MS);
     keepalive.unref?.();
 
-    // stale connection detection
+    // stale connection detection (check interval decoupled from threshold)
     const stale = addInterval(() => {
       if (state.stopping || !state.client || state.runId !== runId) return;
       if (!state.connected) return;
@@ -186,7 +198,7 @@ async function runWorker() {
         send({ type: 'mc_stale', uid: state.uid });
         shutdown(0, 'STALE');
       }
-    }, CONFIG.STALE_CONNECTION_TIMEOUT_MS);
+    }, CONFIG.STALE_CHECK_INTERVAL_MS);
     stale.unref?.();
   }
 
@@ -557,14 +569,6 @@ async function runParent() {
 
   function isInfinity(val) {
     return String(val).toLowerCase() === 'infinity';
-  }
-
-  function clampInt(n, min, max) {
-    const v = parseInt(String(n), 10);
-    if (!Number.isFinite(v)) return null;
-    if (v < min) return min;
-    if (v > max) return max;
-    return v;
   }
 
   function parseLimitValue(input) {
@@ -980,7 +984,6 @@ async function runParent() {
     const accIndex = (u.microsoftAccounts || []).findIndex((a) => a && a.id === accountId);
     if (accIndex === -1) return false;
 
-    const account = u.microsoftAccounts[accIndex];
     const dir = await getUserAuthDir(uid, accountId);
 
     if (dir) {
@@ -1101,6 +1104,19 @@ async function runParent() {
       if (e?.code === 10062) return;
       console.error('SafeReply error:', e);
     }
+  }
+
+  function isUnlimitedReconnects() {
+    return !Number.isFinite(CONFIG.MAX_RECONNECT_ATTEMPTS) || CONFIG.MAX_RECONNECT_ATTEMPTS <= 0;
+  }
+
+  function computeReconnectDelayMs(attempt) {
+    const expCap = Number.isFinite(CONFIG.RECONNECT_EXPONENT_CAP) ? CONFIG.RECONNECT_EXPONENT_CAP : 20;
+    const exp = Math.min(Math.max(0, attempt - 1), expCap);
+    const baseDelay = CONFIG.RECONNECT_BASE_DELAY_MS * Math.pow(1.5, exp);
+    const capped = Math.min(baseDelay, CONFIG.RECONNECT_MAX_DELAY_MS);
+    const jitter = Math.random() * 5000;
+    return capped + jitter;
   }
 
   // ==================== SESSION STORE ====================
@@ -1349,11 +1365,12 @@ async function runParent() {
     if (!s || s.manualStop || s.isCleaningUp) return;
 
     attempt = Math.max(1, attempt);
-    if (attempt > CONFIG.MAX_RECONNECT_ATTEMPTS) {
-      logToDiscord(`Bot of <@${s.ownerUid}> stopped after max failed attempts.`);
-      await cleanupSession(sessionId);
-      await clearSessionData(sessionId);
-      return;
+
+    // IMPORTANT: Do not delete session data on repeated reconnect failures.
+    // Production servers can be down for maintenance; the bot should keep trying.
+    if (!isUnlimitedReconnects() && attempt > CONFIG.MAX_RECONNECT_ATTEMPTS) {
+      logToDiscord(`Bot of <@${s.ownerUid}> reached max reconnect attempts. Cooling down and continuing...`);
+      attempt = 1;
     }
 
     if (s.reconnectTimer) clearTimeout(s.reconnectTimer);
@@ -1361,9 +1378,7 @@ async function runParent() {
     s.isReconnecting = true;
     s.reconnectAttempt = attempt;
 
-    const baseDelay = Math.min(CONFIG.RECONNECT_BASE_DELAY_MS * Math.pow(1.5, attempt - 1), CONFIG.RECONNECT_MAX_DELAY_MS);
-    const jitter = Math.random() * 5000;
-    const delay = baseDelay + jitter;
+    const delay = computeReconnectDelayMs(attempt);
 
     logToDiscord(`Bot of <@${s.ownerUid}> disconnected. Reconnecting in ${Math.round(delay / 1000)}s (Attempt ${attempt})...`);
 
@@ -1697,6 +1712,46 @@ async function runParent() {
     }
   }
 
+  // Watchdog: if a session exists in storage but not in memory, restore it.
+  async function watchdogRestoreMissingSessions() {
+    try {
+      if (!storesInitialized || isShuttingDown) return;
+      const storedIds = Object.keys(activeSessionsStore || {});
+      if (!storedIds.length) return;
+
+      let delay = 0;
+      for (const sessionId of storedIds) {
+        if (sessions.has(sessionId)) continue;
+
+        const sessionData = activeSessionsStore[sessionId];
+        if (!sessionData || typeof sessionData !== 'object') continue;
+
+        const ownerUid = String(sessionData.ownerUid || '');
+        if (!ownerUid || !/^[0-9]+$/.test(ownerUid)) {
+          await clearSessionData(sessionId);
+          continue;
+        }
+
+        if (!hasAccess(ownerUid)) continue;
+
+        const hasServer = !!(sessionData.server && sessionData.server.ip && sessionData.server.port);
+        if (!hasServer) continue;
+
+        setTimeout(() => {
+          if (isShuttingDown) return;
+          if (sessions.has(sessionId)) return;
+
+          console.log(`Watchdog restoring missing session ${sessionId} for user ${ownerUid}`);
+          startSession(ownerUid, sessionData.accountId || 'legacy', sessionData.server, null, true, 1, sessionId);
+        }, delay);
+
+        delay += 2000;
+      }
+    } catch (e) {
+      console.error('Watchdog error:', e?.message || e);
+    }
+  }
+
   // ==================== GRACEFUL SHUTDOWN ====================
 
   async function gracefulShutdown(signal) {
@@ -1775,6 +1830,11 @@ async function runParent() {
     setTimeout(() => {
       restoreSessions();
     }, 10000).unref?.();
+
+    // Periodic watchdog: if a session exists in storage but not running, restore it.
+    setInterval(() => {
+      watchdogRestoreMissingSessions();
+    }, CONFIG.SESSION_WATCHDOG_INTERVAL_MS).unref?.();
   });
 
   // ==================== ADMIN PANEL HELPERS ====================
@@ -1841,7 +1901,6 @@ async function runParent() {
 
     const maxBots = a.maxBots ?? 0;
     const maxAccounts = a.maxAccounts ?? 0;
-    const duration = a.durationMs ?? null;
 
     let expiryTxt = 'Never';
     const expiresAt = getAccessExpiry(uid);
@@ -2063,8 +2122,6 @@ async function runParent() {
         }
 
         if (i.customId === 'server_add') {
-          const u = getUser(uid);
-
           const modal = new ModalBuilder().setCustomId('server_add_modal').setTitle('Configuration');
 
           const ipInput = new TextInputBuilder()
@@ -2190,38 +2247,38 @@ async function runParent() {
         }
 
         if (i.customId === 'server_remove_select') {
-  const serverId = String(i.values?.[0] || '');
+          const serverId = String(i.values?.[0] || '');
 
-  try {
-    await i.deferReply({ flags: MessageFlags.Ephemeral });
-  } catch (_) {}
+          try {
+            await i.deferReply({ flags: MessageFlags.Ephemeral });
+          } catch (_) {}
 
-  const u = getUser(uid);
-  u.servers = Array.isArray(u.servers) ? u.servers : [];
+          const u = getUser(uid);
+          u.servers = Array.isArray(u.servers) ? u.servers : [];
 
-  const idx = u.servers.findIndex((s) => s && String(s.id) === String(serverId));
-  if (idx === -1) {
-    return safeReply(i, 'Server not found.', true);
-  }
+          const idx = u.servers.findIndex((s) => s && String(s.id) === String(serverId));
+          if (idx === -1) {
+            return safeReply(i, 'Server not found.', true);
+          }
 
-  const removed = u.servers[idx];
+          const removed = u.servers[idx];
 
-  // Remove from servers list
-  u.servers.splice(idx, 1);
+          // Remove from servers list
+          u.servers.splice(idx, 1);
 
-  // ALSO remove legacy single-server field if it matches (this is the key fix)
-  if (u.server && u.server.ip === removed.ip && String(u.server.port) === String(removed.port)) {
-    delete u.server;
-  }
+          // ALSO remove legacy single-server field if it matches (this is the key fix)
+          if (u.server && u.server.ip === removed.ip && String(u.server.port) === String(removed.port)) {
+            delete u.server;
+          }
 
-  // If no servers left, clear legacy just in case
-  if (u.servers.length === 0 && u.server) {
-    delete u.server;
-  }
+          // If no servers left, clear legacy just in case
+          if (u.servers.length === 0 && u.server) {
+            delete u.server;
+          }
 
-  await userStore.save(true);
-  return safeReply(i, `Removed: **${formatServerLabel(removed)}**`, true);
-}
+          await userStore.save(true);
+          return safeReply(i, `Removed: **${formatServerLabel(removed)}**`, true);
+        }
 
         if (i.customId === 'stop_select_session') {
           const sessionId = String(i.values?.[0] || '');
