@@ -477,6 +477,36 @@ async function runParent() {
   const ERR_MAX_BOT_LIMIT = 'You passed your maximum bot limit. Contact owner for more information.';
   const ERR_MAX_ACCOUNT_LIMIT = 'You passed your maximum account limit. Contact owner for more information.';
 
+  // Public announcement system (admin-only)
+  const ANNOUNCEMENT_DM_DELAY_MS = 1100; // keep a steady pace to reduce rate-limit pressure
+  let announcementQueue = Promise.resolve();
+
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+  const EASTER_EGGS = [
+    'You have discovered the bot’s secret stash of virtual cookies. 🍪',
+    'Pro tip: If you can’t find the bug… it might be hiding behind a semicolon.',
+    'This bot runs on caffeine, duct tape, and reconnect attempts.',
+    'Achievement unlocked: **Curiosity**.',
+    'RakNet crashes can’t hurt the parent process. Nice try. 😄',
+    'Beep boop. Definitely not a robot. 🤖',
+    'The AFK gods are pleased with your idleness.',
+  ];
+
+  const EASTER_EGGS_RARE = [
+    'The cake is a lie. 🎂',
+    'You rolled a natural 20. 🎲',
+    'Congratulations. You are now the proud owner of a useless secret. 🗝️',
+  ];
+
+  function getRandomEasterEgg() {
+    const rareChance = 0.03;
+    if (Math.random() < rareChance) {
+      return EASTER_EGGS_RARE[Math.floor(Math.random() * EASTER_EGGS_RARE.length)];
+    }
+    return EASTER_EGGS[Math.floor(Math.random() * EASTER_EGGS.length)];
+  }
+
   // ==================== PERSISTENT STORE ====================
 
   class PersistentStore {
@@ -1424,6 +1454,8 @@ async function runParent() {
           new ButtonBuilder().setCustomId('admin_grant').setLabel('Grant / Update Access').setStyle(ButtonStyle.Success),
           new ButtonBuilder().setCustomId('admin_remove').setLabel('Remove Access').setStyle(ButtonStyle.Danger),
           new ButtonBuilder().setCustomId('admin_list').setLabel('List Users').setStyle(ButtonStyle.Secondary),
+          new ButtonBuilder().setCustomId('admin_announce').setLabel('Public Announcement').setStyle(ButtonStyle.Primary),
+          new ButtonBuilder().setCustomId('admin_announce_test').setLabel('Test Announcement').setStyle(ButtonStyle.Secondary),
         ),
       ],
     };
@@ -1801,6 +1833,7 @@ async function runParent() {
         new SlashCommandBuilder().setName('panel').setDescription('Open Bedrock AFK panel'),
         new SlashCommandBuilder().setName('java').setDescription('Open Java AFKBot Panel'),
         new SlashCommandBuilder().setName('admin').setDescription('Open admin panel'),
+        new SlashCommandBuilder().setName('easteregg').setDescription('Get a random easter egg'),
       ];
       await client.application?.commands?.set(cmds);
     } catch (e) {
@@ -1894,6 +1927,139 @@ async function runParent() {
     return modal;
   }
 
+  function buildAdminAnnouncementModal(customId, title) {
+    const modal = new ModalBuilder().setCustomId(customId).setTitle(title);
+
+    const titleInput = new TextInputBuilder()
+      .setCustomId('ann_title')
+      .setLabel('Title (optional)')
+      .setStyle(TextInputStyle.Short)
+      .setRequired(false)
+      .setMaxLength(256);
+
+    const msgInput = new TextInputBuilder()
+      .setCustomId('ann_message')
+      .setLabel('Announcement Message')
+      .setStyle(TextInputStyle.Paragraph)
+      .setRequired(true)
+      .setMaxLength(3800);
+
+    const urlInput = new TextInputBuilder()
+      .setCustomId('ann_url')
+      .setLabel('URL (optional, must start with https://)')
+      .setStyle(TextInputStyle.Short)
+      .setRequired(false)
+      .setMaxLength(512);
+
+    const footerInput = new TextInputBuilder()
+      .setCustomId('ann_footer')
+      .setLabel('Footer (optional)')
+      .setStyle(TextInputStyle.Short)
+      .setRequired(false)
+      .setMaxLength(128);
+
+    modal.addComponents(
+      new ActionRowBuilder().addComponents(titleInput),
+      new ActionRowBuilder().addComponents(msgInput),
+      new ActionRowBuilder().addComponents(urlInput),
+      new ActionRowBuilder().addComponents(footerInput),
+    );
+
+    return modal;
+  }
+
+  function normalizeHttpsUrl(input) {
+    const s = String(input || '').trim();
+    if (!s) return null;
+    // Only allow https:// links for safety and to avoid accidental mentions like "example.com".
+    if (!/^https:\/\/[^\s]+$/i.test(s)) return null;
+    return s.slice(0, 512);
+  }
+
+  async function sendDmToUser(userId, payload) {
+    try {
+      const u = await client.users.fetch(String(userId));
+      if (!u) return false;
+      await u.send(payload);
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  function queueAnnouncementJob(jobFn) {
+    announcementQueue = announcementQueue
+      .then(() => jobFn())
+      .catch((e) => {
+        console.error('Announcement job error:', e?.message || e);
+      });
+    return announcementQueue;
+  }
+
+  async function runAnnouncementJob({ adminUid, payload, isTest = false }) {
+    const startedAt = nowMs();
+
+    const targetIds = isTest
+      ? [String(adminUid)]
+      : Object.keys(users || {}).filter((id) => /^[0-9]+$/.test(id) && users[id]?.access?.enabled && hasAccess(id));
+
+    const total = targetIds.length;
+    let sent = 0;
+    let failed = 0;
+    let skipped = 0;
+
+    // Notify log channel (best effort).
+    try {
+      const t = payload?.embeds?.[0]?.data?.title || '(no title)';
+      const d = payload?.embeds?.[0]?.data?.description || '';
+      const preview = String(d).replace(/\s+/g, ' ').slice(0, 180);
+      await logToDiscord(`📣 Announcement queued by <@${adminUid}> | Title: **${t}** | Preview: ${preview}${d.length > 180 ? '…' : ''}`);
+    } catch (_) {}
+
+    for (let i = 0; i < targetIds.length; i++) {
+      const id = String(targetIds[i]);
+
+      if (!isTest) {
+        // Double-check access at send time.
+        if (!users[id]?.access?.enabled || !hasAccess(id)) {
+          skipped++;
+          continue;
+        }
+      }
+
+      const ok = await sendDmToUser(id, payload);
+      if (ok) sent++;
+      else failed++;
+
+      // Delay between DMs to reduce rate-limit pressure.
+      await sleep(ANNOUNCEMENT_DM_DELAY_MS);
+    }
+
+    const elapsedMs = Math.max(0, nowMs() - startedAt);
+    const seconds = Math.round(elapsedMs / 1000);
+
+    const summary =
+      `📣 Announcement complete.\n` +
+      `Mode: ${isTest ? 'TEST (DM to admin)' : 'PUBLIC (DM to all users with access)'}\n` +
+      `Total targets: ${total}\n` +
+      `Sent: ${sent}\n` +
+      `Failed: ${failed}\n` +
+      `Skipped: ${skipped}\n` +
+      `Duration: ~${seconds}s`;
+
+    // DM admin with the report (best effort).
+    try {
+      await sendDmToUser(adminUid, { content: summary });
+    } catch (_) {}
+
+    // Also log to log channel.
+    try {
+      await logToDiscord(summary.replace(/\n/g, ' | '));
+    } catch (_) {}
+
+    return { total, sent, failed, skipped, seconds };
+  }
+
   function formatAccessSummary(uid) {
     const u = getUser(uid);
     const a = u.access;
@@ -1938,6 +2104,12 @@ async function runParent() {
           if (!isAdmin(uid)) return safeReply(i, 'You do not have permission to use this command.', true);
           return safeReply(i, adminPanelRow(), true);
         }
+        if (i.commandName === 'easteregg') {
+          if (!hasAccess(uid)) return safeReply(i, ERR_NO_ACCESS, true);
+          const egg = getRandomEasterEgg();
+          const embed = new EmbedBuilder().setTitle('🥚 Easter Egg').setDescription(egg).setColor('#F1C40F').setTimestamp();
+          return safeReply(i, { embeds: [embed] }, true);
+        }
       }
 
       // Buttons
@@ -1968,6 +2140,16 @@ async function runParent() {
 
           const embed = new EmbedBuilder().setTitle('Access List').setDescription(desc).setColor('#5865F2');
           return safeReply(i, { embeds: [embed] }, true);
+        }
+
+        if (i.customId === 'admin_announce') {
+          if (!isAdmin(uid)) return safeReply(i, 'You do not have permission to use this command.', true);
+          return i.showModal(buildAdminAnnouncementModal('admin_announce_modal', 'Send Public Announcement')).catch(() => {});
+        }
+
+        if (i.customId === 'admin_announce_test') {
+          if (!isAdmin(uid)) return safeReply(i, 'You do not have permission to use this command.', true);
+          return i.showModal(buildAdminAnnouncementModal('admin_announce_test_modal', 'Test Announcement (DM to you)')).catch(() => {});
         }
 
         // ==================== USER PANEL GUARDS ====================
@@ -2349,6 +2531,55 @@ async function runParent() {
           await stopAllSessionsForUser(targetUid);
 
           return safeReply(i, `Access removed for <@${targetUid}>`, true);
+        }
+
+        // Admin announcement (public)
+        if (i.customId === 'admin_announce_modal' || i.customId === 'admin_announce_test_modal') {
+          if (!isAdmin(uid)) return safeReply(i, 'You do not have permission to use this command.', true);
+
+          const isTest = i.customId === 'admin_announce_test_modal';
+
+          const rawTitle = (i.fields?.getTextInputValue('ann_title') || '').trim();
+          const rawMessage = (i.fields?.getTextInputValue('ann_message') || '').trim();
+          const rawUrl = (i.fields?.getTextInputValue('ann_url') || '').trim();
+          const rawFooter = (i.fields?.getTextInputValue('ann_footer') || '').trim();
+
+          if (!rawMessage) return safeReply(i, 'Announcement message cannot be empty.', true);
+
+          let url = null;
+          if (rawUrl) {
+            url = normalizeHttpsUrl(rawUrl);
+            if (!url) return safeReply(i, 'Invalid URL. It must start with https:// and contain no spaces.', true);
+          }
+
+          // Defer quickly so the modal submit doesn’t time out.
+          try {
+            if (!i.deferred && !i.replied) {
+              await i.deferReply({ flags: MessageFlags.Ephemeral });
+            }
+          } catch (_) {}
+
+          const embed = new EmbedBuilder().setColor('#5865F2').setTimestamp();
+          if (rawTitle) embed.setTitle(rawTitle.slice(0, 256));
+          embed.setDescription(rawMessage.slice(0, 4096));
+
+          if (url) embed.setURL(url);
+
+          const footer = rawFooter ? rawFooter.slice(0, 128) : 'AFKBot Announcement';
+          embed.setFooter({ text: footer });
+
+          const payload = { embeds: [embed] };
+
+          // Queue the actual send so large lists don’t risk interaction expiry.
+          const targetCount = isTest
+            ? 1
+            : Object.keys(users || {}).filter((id) => /^[0-9]+$/.test(id) && users[id]?.access?.enabled && hasAccess(id)).length;
+
+          const modeLabel = isTest ? 'TEST' : 'PUBLIC';
+          await safeReply(i, `Queued ${modeLabel} announcement to ${targetCount} user(s). I will DM you the final report.`, true);
+
+          queueAnnouncementJob(() => runAnnouncementJob({ adminUid: uid, payload, isTest }));
+          return;
         }
 
         // Server add
