@@ -1,24 +1,30 @@
-# Use a lightweight Node image
-FROM node:18-alpine
+# Use Debian-based Node (glibc compatible)
+FROM node:18-bullseye
 
 # Create app directory
 WORKDIR /app
 
-# Install build tools required for bedrock-protocol (raknet-native)
-# Alpine Linux needs these to compile C++ bindings
-RUN apk add --no-cache python3 make g++ gcc cmake git
+# Install build tools required for native modules
+RUN apt-get update && apt-get install -y \
+    python3 \
+    make \
+    g++ \
+    gcc \
+    cmake \
+    git \
+    && rm -rf /var/lib/apt/lists/*
 
-# Copy package config
-COPY package.json ./
+# Copy package files
+COPY package*.json ./
 
-# Install dependencies (now with compiler support)
-RUN npm install bedrock-protocol@latest
+# Install dependencies (this will correctly build raknet-node)
+RUN npm install --production
 
-# Copy your bot script (specifically named bot.js as requested)
-COPY bot.js ./
+# Copy project files
+COPY . .
 
-# Expose the HTTP port (for health checks)
+# Expose port for Fly health checks
 EXPOSE 8080
 
-# Start the bot
-CMD [ "node", "bot.js" ]
+# Start bot
+CMD ["node", "bot.js"]
