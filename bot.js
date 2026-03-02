@@ -31,13 +31,13 @@ const CONFIG = {
   // Reconnect:
   // - Set MAX_RECONNECT_ATTEMPTS <= 0 for unlimited reconnect attempts (recommended for production).
   MAX_RECONNECT_ATTEMPTS: 0,
-  RECONNECT_BASE_DELAY_MS: 5_000,
-  RECONNECT_MAX_DELAY_MS: 60_000,
+  RECONNECT_BASE_DELAY_MS: 10_000,
+  RECONNECT_MAX_DELAY_MS: 300_000,
   // Cap exponential growth to avoid huge Math.pow() exponents; delay is still capped by RECONNECT_MAX_DELAY_MS.
-  RECONNECT_EXPONENT_CAP: 6,
+  RECONNECT_EXPONENT_CAP: 20,
 
   CONNECTION_TIMEOUT_MS: 30_000,
-  KEEPALIVE_INTERVAL_MS: 10_000,
+  KEEPALIVE_INTERVAL_MS: 15_000,
 
   // "Stale" means we didn't see any packets/keepalives for STALE_CONNECTION_TIMEOUT_MS.
   // Increase this for production to avoid false-positives during lag/maintenance.
@@ -58,9 +58,9 @@ const CONFIG = {
   AFK_MAX_DELAY_MS: 20_000,
 
   // Misc
-  SESSION_RESTORE_DELAY_MS: 5_000,
+  SESSION_RESTORE_DELAY_MS: 8_000,
   // Periodically ensure sessions listed in rejoin.json are actually running.
-  SESSION_WATCHDOG_INTERVAL_MS: 5 * 60_000,
+  SESSION_WATCHDOG_INTERVAL_MS: 10 * 60_000,
 };
 
 // Determine base path for persisting user and session data. Fly.io exposes
@@ -376,10 +376,9 @@ async function runWorker() {
       });
 
       mc.on('disconnect', (packet) => {
-  const reason = packet?.reason || 'Unknown reason';
-  send({ type: 'mc_disconnect', uid: state.uid, reason });
-  shutdown(0, 'DISCONNECT'); // <-- TÄRKEÄ: parent aloittaa reconnectin heti
-});
+        const reason = packet?.reason || 'Unknown reason';
+        send({ type: 'mc_disconnect', uid: state.uid, reason });
+      });
 
       mc.on('close', () => {
         send({ type: 'mc_close', uid: state.uid });
@@ -1166,11 +1165,9 @@ async function runParent() {
       keepAlive: true,
       viewDistance: 1,
       profilesFolder: authDir,
-      
-      raknetBackend: 'raknet-node',
-      
       username: ownerUid,
       offline: false,
+      skipPing: true,
       autoInitPlayer: true,
       // IMPORTANT: bedrock-protocol's built-in timeout logic has been observed
       // to trigger native aborts in some environments. We disable it and rely
