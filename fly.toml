@@ -22,6 +22,3 @@ primary_region = 'ams'
   cpus = 1
   memory_mb = 512
 
-[mounts]
-  source = "data"
-  destination = "/data"
