@@ -7,7 +7,7 @@
     "check": "node --check bot.js"
   },
   "dependencies": {
-    "bedrock-protocol": "^3.0.0",
+    "bedrock-protocol": "latest",
     "discord.js": "latest",
     "prismarine-auth": "^2.4.0",
     "prismarine-chunk": "^1.36.0"
