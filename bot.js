@@ -31,8 +31,8 @@ const CONFIG = {
   // Reconnect:
   // - Set MAX_RECONNECT_ATTEMPTS <= 0 for unlimited reconnect attempts (recommended for production).
   MAX_RECONNECT_ATTEMPTS: 0,
-  RECONNECT_BASE_DELAY_MS: 10_000,
-  RECONNECT_MAX_DELAY_MS: 300_000,
+  RECONNECT_BASE_DELAY_MS: 500,
+  RECONNECT_MAX_DELAY_MS: 30_000,
   // Cap exponential growth to avoid huge Math.pow() exponents; delay is still capped by RECONNECT_MAX_DELAY_MS.
   RECONNECT_EXPONENT_CAP: 20,
 
@@ -184,7 +184,7 @@ async function runWorker() {
       if (state.stopping || !state.connected || !state.client || state.runId !== runId) return;
       try {
         safeQueue('client_cache_status', { enabled: false });
-        state.lastKeepalive = Date.now();
+        // state.lastKeepalive = Date.now(); // pois: ei saa feikata aktiivisuutta
       } catch (_) {}
     }, CONFIG.KEEPALIVE_INTERVAL_MS);
     keepalive.unref?.();
@@ -193,11 +193,11 @@ async function runWorker() {
     const stale = addInterval(() => {
       if (state.stopping || !state.client || state.runId !== runId) return;
       if (!state.connected) return;
-      const lastActivity = Math.max(state.lastPacketTime || 0, state.lastKeepalive || 0);
-      if (Date.now() - lastActivity > CONFIG.STALE_CONNECTION_TIMEOUT_MS) {
-        send({ type: 'mc_stale', uid: state.uid });
-        shutdown(0, 'STALE');
-      }
+      const lastActivity = state.lastPacketTime || 0; // vain sisääntuleva data
+if (Date.now() - lastActivity > CONFIG.STALE_CONNECTION_TIMEOUT_MS) {
+  send({ type: 'mc_stale', uid: state.uid });
+  shutdown(0, 'STALE');
+}
     }, CONFIG.STALE_CHECK_INTERVAL_MS);
     stale.unref?.();
   }
@@ -376,9 +376,13 @@ async function runWorker() {
       });
 
       mc.on('disconnect', (packet) => {
-        const reason = packet?.reason || 'Unknown reason';
-        send({ type: 'mc_disconnect', uid: state.uid, reason });
-      });
+  const reason = packet?.reason || 'Unknown reason';
+  send({ type: 'mc_disconnect', uid: state.uid, reason });
+
+  // TÄRKEÄ: älä jää odottamaan 'close' eventtiä / socket-timeoutteja.
+  // Sulje worker heti => parentin reconnect käynnistyy heti worker exitistä.
+  shutdown(0, 'DISCONNECT');
+});
 
       mc.on('close', () => {
         send({ type: 'mc_close', uid: state.uid });
@@ -1111,13 +1115,18 @@ async function runParent() {
   }
 
   function computeReconnectDelayMs(attempt) {
-    const expCap = Number.isFinite(CONFIG.RECONNECT_EXPONENT_CAP) ? CONFIG.RECONNECT_EXPONENT_CAP : 20;
-    const exp = Math.min(Math.max(0, attempt - 1), expCap);
-    const baseDelay = CONFIG.RECONNECT_BASE_DELAY_MS * Math.pow(1.5, exp);
-    const capped = Math.min(baseDelay, CONFIG.RECONNECT_MAX_DELAY_MS);
-    const jitter = Math.random() * 5000;
-    return capped + jitter;
-  }
+  // Fast path: 1. yritys lähes heti (0.8–1.5s)
+  if (attempt <= 1) return 800 + Math.random() * 700;
+
+  // Sen jälkeen maltillinen kasvu (nopeampi kuin 1.5^n)
+  const expCap = Number.isFinite(CONFIG.RECONNECT_EXPONENT_CAP) ? CONFIG.RECONNECT_EXPONENT_CAP : 20;
+  const exp = Math.min(Math.max(0, attempt - 2), expCap);
+
+  const baseDelay = 2000 * Math.pow(1.4, exp); // 2s -> kasvaa
+  const capped = Math.min(baseDelay, 60_000);  // max 60s (voit nostaa jos haluat)
+  const jitter = Math.random() * 1000;         // pienempi jitter
+  return capped + jitter;
+}
 
   // ==================== SESSION STORE ====================
 
