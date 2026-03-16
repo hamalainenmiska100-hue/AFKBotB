@@ -28,7 +28,7 @@ const CONFIG = {
   SAVE_DEBOUNCE_MS: 100,
 
   // API
-  PORT: parseInt(process.env.PORT || '3000', 10),
+  PORT: parseInt(process.env.PORT || '8080', 10),
   BODY_LIMIT_BYTES: 16 * 1024,
   CORS_ORIGIN: process.env.CORS_ORIGIN || '*',
 
