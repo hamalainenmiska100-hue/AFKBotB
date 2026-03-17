@@ -654,8 +654,118 @@ async function runParent() {
     }
   }
 
+  function getLiveSessionIdsForOwner(ownerUid) {
+    const out = [];
+    for (const [sid, session] of sessions.entries()) {
+      if (session && session.ownerUid === ownerUid) out.push(sid);
+    }
+    return out;
+  }
+
+  function getStoredSessionIdsForOwner(ownerUid) {
+    const out = [];
+    for (const sid of Object.keys(activeSessionsStore || {})) {
+      const entry = activeSessionsStore[sid];
+      if (entry && entry.ownerUid === ownerUid) out.push(sid);
+    }
+    return out;
+  }
+
+  async function clearStoredSessionsForOwner(ownerUid) {
+    if (!ownerUid) return;
+    let changed = false;
+    for (const sid of getStoredSessionIdsForOwner(ownerUid)) {
+      delete activeSessionsStore[sid];
+      changed = true;
+    }
+    if (changed) {
+      sessionStore.data = activeSessionsStore;
+      await sessionStore.save(true);
+    }
+  }
+
   function getOwnerSessionId(ownerUid) {
-    return sessionsByOwner.get(ownerUid) || null;
+    const mapped = sessionsByOwner.get(ownerUid) || null;
+    if (mapped && sessions.has(mapped)) return mapped;
+    const liveIds = getLiveSessionIdsForOwner(ownerUid);
+    if (liveIds.length > 0) {
+      const preferred = liveIds.sort((a, b) => {
+        const sa = sessions.get(a);
+        const sb = sessions.get(b);
+        return Number((sb && sb.startedAt) || 0) - Number((sa && sa.startedAt) || 0);
+      })[0];
+      sessionsByOwner.set(ownerUid, preferred);
+      return preferred;
+    }
+    sessionsByOwner.delete(ownerUid);
+    return null;
+  }
+
+  function normalizeStoredOwnerSessionsSync() {
+    const byOwner = new Map();
+    for (const sid of Object.keys(activeSessionsStore || {})) {
+      const entry = activeSessionsStore[sid];
+      if (!entry || !entry.ownerUid) continue;
+      const existing = byOwner.get(entry.ownerUid);
+      if (!existing) {
+        byOwner.set(entry.ownerUid, sid);
+        continue;
+      }
+      const existingEntry = activeSessionsStore[existing];
+      const existingTime = Number((existingEntry && existingEntry.startedAt) || 0);
+      const currentTime = Number((entry && entry.startedAt) || 0);
+      if (currentTime >= existingTime) {
+        delete activeSessionsStore[existing];
+        byOwner.set(entry.ownerUid, sid);
+      } else {
+        delete activeSessionsStore[sid];
+      }
+    }
+  }
+
+  async function enforceSingleBotPerUser(ownerUid, preferredSessionId = null) {
+    if (!ownerUid) return;
+
+    const liveIds = getLiveSessionIdsForOwner(ownerUid).sort((a, b) => {
+      const sa = sessions.get(a);
+      const sb = sessions.get(b);
+      return Number((sb && sb.startedAt) || 0) - Number((sa && sa.startedAt) || 0);
+    });
+
+    const keepLiveId = preferredSessionId && liveIds.includes(preferredSessionId)
+      ? preferredSessionId
+      : (liveIds[0] || null);
+
+    for (const sid of liveIds) {
+      if (keepLiveId && sid === keepLiveId) continue;
+      await cleanupSession(sid);
+    }
+
+    const storedIds = getStoredSessionIdsForOwner(ownerUid).sort((a, b) => {
+      const sa = activeSessionsStore[a];
+      const sb = activeSessionsStore[b];
+      return Number((sb && sb.startedAt) || 0) - Number((sa && sa.startedAt) || 0);
+    });
+
+    const keepStoredId = preferredSessionId && storedIds.includes(preferredSessionId)
+      ? preferredSessionId
+      : (storedIds[0] || null);
+
+    let changed = false;
+    for (const sid of storedIds) {
+      if (keepStoredId && sid === keepStoredId) continue;
+      delete activeSessionsStore[sid];
+      changed = true;
+    }
+
+    if (changed) {
+      sessionStore.data = activeSessionsStore;
+      await sessionStore.save(true);
+    }
+
+    const finalLiveId = keepLiveId || getLiveSessionIdsForOwner(ownerUid)[0] || null;
+    if (finalLiveId) sessionsByOwner.set(ownerUid, finalLiveId);
+    else sessionsByOwner.delete(ownerUid);
   }
 
   function hasAccess(uid) {
@@ -681,6 +791,8 @@ async function runParent() {
         access: { enabled: false },
         microsoftAccounts: [],
         servers: [],
+        ipHistory: [],
+        knownClients: [],
         _temp: true,
       };
     }
@@ -694,6 +806,8 @@ async function runParent() {
         access: { enabled: false },
         microsoftAccounts: [],
         servers: [],
+        ipHistory: [],
+        knownClients: [],
         apiTokenHash: null,
       };
       userStore.data = users;
@@ -709,7 +823,11 @@ async function runParent() {
     if (typeof u.access.enabled !== 'boolean') u.access.enabled = u.access.enabled === true;
     if (!Array.isArray(u.microsoftAccounts)) u.microsoftAccounts = [];
     if (!Array.isArray(u.servers)) u.servers = [];
+    if (!Array.isArray(u.ipHistory)) u.ipHistory = [];
+    if (!Array.isArray(u.knownClients)) u.knownClients = [];
     if (typeof u.apiTokenHash !== 'string') u.apiTokenHash = null;
+    if (typeof u.lastKnownIp !== 'string') u.lastKnownIp = null;
+    if (!u.lastKnownClient || typeof u.lastKnownClient !== 'object') u.lastKnownClient = null;
 
     if (u.server && u.server.ip && u.server.port && u.servers.length === 0) {
       u.servers.push({
@@ -774,6 +892,8 @@ async function runParent() {
         }
       }
 
+      normalizeStoredOwnerSessionsSync();
+
       if (!codesData || typeof codesData !== 'object') codesData = { codes: {}, meta: {} };
       if (!codesData.codes || typeof codesData.codes !== 'object') codesData.codes = {};
       if (!codesData.meta || typeof codesData.meta !== 'object') codesData.meta = {};
@@ -813,6 +933,133 @@ async function runParent() {
     return addr;
   }
 
+  function normalizeHeaderValue(value, maxLen = 256) {
+    if (value === undefined || value === null) return '';
+    return String(value).trim().slice(0, maxLen);
+  }
+
+  function getClientDetails(req) {
+    const ip = getRequestIp(req);
+    const userAgent = normalizeHeaderValue(req && req.headers ? req.headers['user-agent'] : '', 512);
+    const acceptLanguage = normalizeHeaderValue(req && req.headers ? req.headers['accept-language'] : '', 128);
+    const deviceId = normalizeHeaderValue(req && req.headers ? (req.headers['x-client-device-id'] || req.headers['x-device-id']) : '', 128);
+    const deviceName = normalizeHeaderValue(req && req.headers ? (req.headers['x-client-device-name'] || req.headers['x-device-name']) : '', 128);
+    const platform = normalizeHeaderValue(req && req.headers ? (req.headers['x-client-platform'] || req.headers['x-platform']) : '', 64);
+    const model = normalizeHeaderValue(req && req.headers ? (req.headers['x-client-model'] || req.headers['x-device-model']) : '', 128);
+    const fingerprintSource = [deviceId || '', deviceName || '', platform || '', model || '', userAgent || '', acceptLanguage || ''].join('|');
+    return {
+      ip,
+      userAgent,
+      acceptLanguage,
+      deviceId: deviceId || null,
+      deviceName: deviceName || null,
+      platform: platform || null,
+      model: model || null,
+      fingerprint: sha256(fingerprintSource || ip || 'unknown-client'),
+      observedAt: nowMs(),
+    };
+  }
+
+  function rememberClientForUser(uid, client, reason = 'request') {
+    if (!uid || !client || !client.ip) return null;
+    const u = ensureUserObject(uid);
+    if (!u || u._temp) return null;
+
+    if (!Array.isArray(u.ipHistory)) u.ipHistory = [];
+    if (!Array.isArray(u.knownClients)) u.knownClients = [];
+
+    const seenAt = nowMs();
+    const existingIp = u.ipHistory.find((entry) => entry && entry.ip === client.ip);
+    if (existingIp) {
+      existingIp.lastSeenAt = seenAt;
+      existingIp.hits = Number(existingIp.hits || 0) + 1;
+      if (reason) existingIp.lastReason = reason;
+    } else {
+      u.ipHistory.unshift({
+        ip: client.ip,
+        firstSeenAt: seenAt,
+        lastSeenAt: seenAt,
+        hits: 1,
+        lastReason: reason,
+      });
+      if (u.ipHistory.length > 20) u.ipHistory.length = 20;
+    }
+
+    const existingClient = u.knownClients.find((entry) => entry && entry.fingerprint === client.fingerprint);
+    if (existingClient) {
+      existingClient.lastSeenAt = seenAt;
+      existingClient.hits = Number(existingClient.hits || 0) + 1;
+      existingClient.lastIp = client.ip;
+      if (reason) existingClient.lastReason = reason;
+      if (client.deviceId) existingClient.deviceId = client.deviceId;
+      if (client.deviceName) existingClient.deviceName = client.deviceName;
+      if (client.platform) existingClient.platform = client.platform;
+      if (client.model) existingClient.model = client.model;
+      if (client.userAgent) existingClient.userAgent = client.userAgent;
+    } else {
+      u.knownClients.unshift({
+        fingerprint: client.fingerprint,
+        deviceId: client.deviceId,
+        deviceName: client.deviceName,
+        platform: client.platform,
+        model: client.model,
+        userAgent: client.userAgent,
+        firstSeenAt: seenAt,
+        lastSeenAt: seenAt,
+        lastIp: client.ip,
+        hits: 1,
+        lastReason: reason,
+      });
+      if (u.knownClients.length > 12) u.knownClients.length = 12;
+    }
+
+    u.lastKnownIp = client.ip;
+    u.lastKnownClient = {
+      fingerprint: client.fingerprint,
+      deviceId: client.deviceId,
+      deviceName: client.deviceName,
+      platform: client.platform,
+      model: client.model,
+      userAgent: client.userAgent,
+      lastIp: client.ip,
+      lastSeenAt: seenAt,
+      lastReason: reason,
+    };
+
+    userStore.data = users;
+    userStore.save();
+    return u.lastKnownClient;
+  }
+
+  function isSameTrustedClient(user, client) {
+    if (!user || !client || !client.ip || !client.fingerprint) return false;
+    const ipMatch = user.lastKnownIp === client.ip || (Array.isArray(user.ipHistory) && user.ipHistory.some((entry) => entry && entry.ip === client.ip));
+    const fpMatch = (user.lastKnownClient && user.lastKnownClient.fingerprint === client.fingerprint)
+      || (Array.isArray(user.knownClients) && user.knownClients.some((entry) => entry && entry.fingerprint === client.fingerprint));
+    return !!(ipMatch && fpMatch);
+  }
+
+  function issueFreshTokenForUser(uid) {
+    const u = ensureUserObject(uid);
+    if (!u || u._temp) return null;
+    if (u.apiTokenHash) tokenIndex.delete(u.apiTokenHash);
+    const token = makeAccessToken();
+    u.apiTokenHash = sha256(token);
+    u.lastTokenIssuedAt = nowMs();
+    tokenIndex.set(u.apiTokenHash, uid);
+    userStore.data = users;
+    return token;
+  }
+
+  function clearUserToken(uid) {
+    const u = ensureUserObject(uid);
+    if (!u || u._temp) return;
+    if (u.apiTokenHash) tokenIndex.delete(u.apiTokenHash);
+    u.apiTokenHash = null;
+    u.lastTokenRevokedAt = nowMs();
+    userStore.data = users;
+  }
+
   function authenticateRequest(req) {
     const token = parseAuthHeader(req);
     if (!token) return null;
@@ -820,9 +1067,11 @@ async function runParent() {
     if (!uid) return null;
     const u = ensureUserObject(uid);
     if (!hasAccess(uid)) return null;
+    const client = getClientDetails(req);
+    rememberClientForUser(uid, client, 'auth');
     u.lastActive = nowMs();
     u.lastTokenUseAt = nowMs();
-    return { uid, user: u, token };
+    return { uid, user: u, token, client };
   }
 
   function buildPublicAccount(account, idx) {
@@ -842,7 +1091,7 @@ async function runParent() {
     res.setHeader('Content-Type', 'application/json; charset=utf-8');
     res.setHeader('Content-Length', Buffer.byteLength(body));
     res.setHeader('Access-Control-Allow-Origin', CONFIG.CORS_ORIGIN);
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Client-Device-ID, X-Client-Device-Name, X-Client-Platform, X-Client-Model');
     res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
     res.end(body);
   }
@@ -1387,8 +1636,11 @@ async function runParent() {
     if (!storesInitialized) return null;
     if (!hasAccess(ownerUid)) return null;
 
+    await enforceSingleBotPerUser(ownerUid, existingSessionId || null);
+
     const currentSessionId = getOwnerSessionId(ownerUid);
-    if (!isReconnect && currentSessionId) {
+    const storedSessionIds = getStoredSessionIdsForOwner(ownerUid).filter((sid) => sid !== existingSessionId);
+    if (!isReconnect && (currentSessionId || storedSessionIds.length > 0)) {
       return null;
     }
 
@@ -1605,26 +1857,60 @@ async function runParent() {
       return fail(res, 400, 'Invalid code format.');
     }
 
+    const client = getClientDetails(req);
     const entry = codesData.codes[code];
     if (!entry || typeof entry !== 'object') {
       return fail(res, 403, 'Invalid code.');
     }
-    if (entry.used) {
-      return fail(res, 403, 'Code already used.');
-    }
 
     const expiresAt = typeof entry.expiresAt === 'number' ? entry.expiresAt : (entry.createdAt || 0) + CONFIG.CODE_TTL_MS;
-    if (expiresAt && nowMs() >= expiresAt) {
+    if (!entry.used && expiresAt && nowMs() >= expiresAt) {
       delete codesData.codes[code];
       codesStore.data = codesData;
       await codesStore.save(true);
       return fail(res, 403, 'Code expired.');
     }
 
-    const userId = makeNumericUserId();
-    const token = makeAccessToken();
-    const tokenHash = sha256(token);
+    if (entry.used) {
+      const existingUid = entry.userId ? String(entry.userId) : null;
+      const existingUser = existingUid ? ensureUserObject(existingUid) : null;
+      if (!existingUid || !existingUser || existingUser._temp) {
+        return fail(res, 403, 'Code already used.');
+      }
+      if (!isSameTrustedClient(existingUser, client)) {
+        return fail(res, 403, 'Code already used on another device or IP.');
+      }
 
+      const token = issueFreshTokenForUser(existingUid);
+      if (!token) {
+        return fail(res, 500, 'Failed to restore access.');
+      }
+
+      existingUser.lastActive = nowMs();
+      existingUser.redeemedAt = nowMs();
+      existingUser.redeemedCode = code;
+      if (!existingUser.access || typeof existingUser.access !== 'object') existingUser.access = { enabled: true };
+      existingUser.access.enabled = true;
+      existingUser.access.lastResumeAt = nowMs();
+      rememberClientForUser(existingUid, client, 'redeem_resume');
+
+      entry.lastResumeAt = nowMs();
+      entry.lastResumeIp = client.ip;
+      entry.lastResumeFingerprint = client.fingerprint;
+
+      userStore.data = users;
+      codesStore.data = codesData;
+      await Promise.all([userStore.save(true), codesStore.save(true)]);
+
+      return ok(res, {
+        token,
+        userId: existingUid,
+        linkedAccounts: listAccounts(existingUid).map(buildPublicAccount),
+        resumed: true,
+      });
+    }
+
+    const userId = makeNumericUserId();
     users[userId] = {
       connectionType: 'online',
       bedrockVersion: 'auto',
@@ -1637,15 +1923,21 @@ async function runParent() {
       },
       microsoftAccounts: [],
       servers: [],
-      apiTokenHash: tokenHash,
+      ipHistory: [],
+      knownClients: [],
+      apiTokenHash: null,
       redeemedCode: code,
       redeemedAt: nowMs(),
     };
-    tokenIndex.set(tokenHash, userId);
+
+    const token = issueFreshTokenForUser(userId);
+    rememberClientForUser(userId, client, 'redeem_new');
 
     entry.used = true;
     entry.userId = userId;
     entry.usedAt = nowMs();
+    entry.firstIp = client.ip;
+    entry.firstFingerprint = client.fingerprint;
 
     userStore.data = users;
     codesStore.data = codesData;
@@ -1655,6 +1947,7 @@ async function runParent() {
       token,
       userId,
       linkedAccounts: [],
+      resumed: false,
     });
   }
 
@@ -1670,6 +1963,8 @@ async function runParent() {
       connectionType: u.connectionType || 'online',
       bedrockVersion: u.bedrockVersion || 'auto',
       linkedAccounts: listAccounts(auth.uid).map(buildPublicAccount),
+      lastKnownIp: u.lastKnownIp || null,
+      knownIps: Array.isArray(u.ipHistory) ? u.ipHistory.map((entry) => entry.ip).filter(Boolean).slice(0, 10) : [],
       bot: session
         ? {
             sessionId: session.sessionId,
@@ -1680,6 +1975,32 @@ async function runParent() {
             uptimeMs: session.startedAt ? nowMs() - session.startedAt : 0,
           }
         : null,
+    });
+  }
+
+  async function handleAuthLogout(req, res, auth) {
+    const client = auth && auth.client ? auth.client : getClientDetails(req);
+    rememberClientForUser(auth.uid, client, 'logout');
+
+    const stopped = await stopBotForUser(auth.uid);
+    await clearStoredSessionsForOwner(auth.uid);
+    clearUserToken(auth.uid);
+
+    const u = ensureUserObject(auth.uid);
+    u.lastLogoutAt = nowMs();
+    u.lastLogoutIp = client.ip;
+    if (u.access && typeof u.access === 'object') {
+      u.access.lastLogoutAt = u.lastLogoutAt;
+    }
+
+    userStore.data = users;
+    await userStore.save(true);
+
+    return ok(res, {
+      signedOut: true,
+      stopped,
+      reusableOnSameClient: true,
+      reusableCode: u.redeemedCode || null,
     });
   }
 
@@ -1854,6 +2175,8 @@ async function runParent() {
       return fail(res, e.message === 'BODY_TOO_LARGE' ? 413 : 400, e.message === 'BODY_TOO_LARGE' ? 'Request body too large.' : 'Invalid JSON body.');
     }
 
+    await enforceSingleBotPerUser(auth.uid);
+
     const existingSessionId = getOwnerSessionId(auth.uid);
     if (existingSessionId && sessions.has(existingSessionId)) {
       const existing = sessions.get(existingSessionId);
@@ -1862,6 +2185,18 @@ async function runParent() {
           sessionId: existing.sessionId,
           status: existing.status,
           server: formatServerLabel(existing.server),
+        },
+      });
+    }
+
+    const storedSessionIds = getStoredSessionIdsForOwner(auth.uid);
+    if (!existingSessionId && storedSessionIds.length > 0) {
+      const stored = activeSessionsStore[storedSessionIds[0]];
+      return fail(res, 409, 'Bot already running.', {
+        data: {
+          sessionId: storedSessionIds[0],
+          status: 'restoring',
+          server: formatServerLabel(stored && stored.server),
         },
       });
     }
@@ -1966,7 +2301,7 @@ async function runParent() {
         if (req.method === 'OPTIONS') {
           res.statusCode = 204;
           res.setHeader('Access-Control-Allow-Origin', CONFIG.CORS_ORIGIN);
-          res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+          res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Client-Device-ID, X-Client-Device-Name, X-Client-Platform, X-Client-Model');
           res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
           return res.end();
         }
@@ -1981,6 +2316,7 @@ async function runParent() {
             endpoints: [
               'POST /auth/redeem',
               'GET /auth/me',
+              'POST /auth/logout',
               'GET /accounts',
               'POST /accounts/link/start',
               'GET /accounts/link/status',
@@ -2015,6 +2351,9 @@ async function runParent() {
 
         if (req.method === 'GET' && pathname === '/auth/me') {
           return handleAuthMe(req, res, auth);
+        }
+        if (req.method === 'POST' && pathname === '/auth/logout') {
+          return handleAuthLogout(req, res, auth);
         }
         if (req.method === 'GET' && pathname === '/accounts') {
           return handleAccountsList(req, res, auth);
