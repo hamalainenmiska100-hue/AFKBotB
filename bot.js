@@ -1451,7 +1451,7 @@ async function runParent() {
       connectionType: u.connectionType,
       bedrockVersion: u.bedrockVersion,
       offlineUsername: u.offlineUsername,
-      status: isReconnect ? 'reconnecting' : 'starting',
+      status: isReconnect ? 'reconnecting' : 'connected',
       lastError: null,
       lastDisconnectReason: null,
       lastConnectedAt: null,
