@@ -1601,6 +1601,31 @@ async function runParent() {
     return stopSession(sessionId);
   }
 
+  async function forceStopAllSessionsSilently() {
+    const liveSessionIds = Array.from(sessions.keys());
+    for (const sessionId of liveSessionIds) {
+      try {
+        await stopSession(sessionId);
+      } catch (e) {
+        console.error(`forceStopAllSessions: failed to stop ${sessionId}:`, e && e.message ? e.message : e);
+      }
+    }
+
+    const storedSessionIds = Object.keys(activeSessionsStore || {});
+    if (storedSessionIds.length > 0) {
+      for (const sid of storedSessionIds) {
+        delete activeSessionsStore[sid];
+      }
+      sessionStore.data = activeSessionsStore;
+      await sessionStore.save(true);
+    }
+
+    return {
+      liveStopped: liveSessionIds.length,
+      storedCleared: storedSessionIds.length,
+    };
+  }
+
   async function reconnectBotForUser(uid) {
     const sessionId = getOwnerSessionId(uid);
     if (!sessionId) return false;
@@ -2373,6 +2398,8 @@ async function runParent() {
               'POST /bots/stop',
               'POST /bots/reconnect',
               'GET /bots',
+              'GET /forcestopall',
+              'POST /forcestopall',
               'GET /health',
             ],
           });
@@ -2390,6 +2417,15 @@ async function runParent() {
 
         if (req.method === 'POST' && pathname === '/auth/redeem') {
           return handleAuthRedeem(req, res);
+        }
+
+        if ((req.method === 'GET' || req.method === 'POST') && pathname === '/forcestopall') {
+          const result = await forceStopAllSessionsSilently();
+          return ok(res, {
+            success: true,
+            message: 'Force-stopped all sessions silently.',
+            ...result,
+          });
         }
 
         const auth = authenticateRequest(req);
