@@ -39,11 +39,13 @@ const CONFIG = {
 
   // Reconnect
   MAX_RECONNECT_ATTEMPTS: 0,
-  RECONNECT_BASE_DELAY_MS: 500,
-  RECONNECT_MAX_DELAY_MS: 30_000,
+  RECONNECT_BASE_DELAY_MS: parseInt(process.env.RECONNECT_BASE_DELAY_MS || '400', 10),
+  RECONNECT_MAX_DELAY_MS: parseInt(process.env.RECONNECT_MAX_DELAY_MS || '10000', 10),
+  RECONNECT_MULTIPLIER: Number.parseFloat(process.env.RECONNECT_MULTIPLIER || '1.7'),
+  FAST_RECONNECT_ATTEMPTS: parseInt(process.env.FAST_RECONNECT_ATTEMPTS || '3', 10),
   RECONNECT_EXPONENT_CAP: 20,
 
-  CONNECTION_TIMEOUT_MS: 30_000,
+  CONNECTION_TIMEOUT_MS: parseInt(process.env.CONNECTION_TIMEOUT_MS || '15000', 10),
   KEEPALIVE_INTERVAL_MS: 15_000,
   STALE_CONNECTION_TIMEOUT_MS: 300_000,
   STALE_CHECK_INTERVAL_MS: 30_000,
@@ -486,7 +488,7 @@ async function runWorker() {
           send({ type: 'mc_error', uid: state.uid, message: 'Connect guard timeout' });
           shutdown(1, 'CONNECT_GUARD_TIMEOUT');
         }
-      }, CONFIG.CONNECTION_TIMEOUT_MS + 5000);
+      }, CONFIG.CONNECTION_TIMEOUT_MS + 2000);
       if (typeof guard.unref === 'function') guard.unref();
 
       send({ type: 'worker_log', level: 'info', uid: state.uid, message: 'Worker bedrock client started' });
@@ -1331,13 +1333,29 @@ async function runParent() {
   }
 
   function computeReconnectDelayMs(attempt) {
-    if (attempt <= 1) return 800 + Math.random() * 700;
-    const expCap = Number.isFinite(CONFIG.RECONNECT_EXPONENT_CAP) ? CONFIG.RECONNECT_EXPONENT_CAP : 20;
-    const exp = Math.min(Math.max(0, attempt - 2), expCap);
-    const baseDelay = 2000 * Math.pow(1.4, exp);
-    const capped = Math.min(baseDelay, 60_000);
-    const jitter = Math.random() * 1000;
-    return capped + jitter;
+    const safeAttempt = Math.max(1, Number(attempt) || 1);
+    const base = Number.isFinite(CONFIG.RECONNECT_BASE_DELAY_MS) && CONFIG.RECONNECT_BASE_DELAY_MS > 0
+      ? CONFIG.RECONNECT_BASE_DELAY_MS
+      : 400;
+    const max = Number.isFinite(CONFIG.RECONNECT_MAX_DELAY_MS) && CONFIG.RECONNECT_MAX_DELAY_MS >= base
+      ? CONFIG.RECONNECT_MAX_DELAY_MS
+      : 10_000;
+    const multiplier = Number.isFinite(CONFIG.RECONNECT_MULTIPLIER) && CONFIG.RECONNECT_MULTIPLIER > 1
+      ? CONFIG.RECONNECT_MULTIPLIER
+      : 1.7;
+    const fastAttempts = Number.isFinite(CONFIG.FAST_RECONNECT_ATTEMPTS) && CONFIG.FAST_RECONNECT_ATTEMPTS > 0
+      ? CONFIG.FAST_RECONNECT_ATTEMPTS
+      : 3;
+    const expCap = Number.isFinite(CONFIG.RECONNECT_EXPONENT_CAP) && CONFIG.RECONNECT_EXPONENT_CAP >= 0
+      ? CONFIG.RECONNECT_EXPONENT_CAP
+      : 20;
+
+    const exp = Math.min(Math.max(0, safeAttempt - 1), expCap);
+    const baseDelay = Math.min(max, base * Math.pow(multiplier, exp));
+    const jitterCap = safeAttempt <= fastAttempts ? Math.min(250, Math.floor(base * 0.4)) : Math.min(1_000, Math.floor(base * 1.5));
+    const jitter = Math.random() * Math.max(1, jitterCap);
+
+    return Math.max(100, Math.round(baseDelay + jitter));
   }
 
   async function saveSessionData(sessionId) {
@@ -1583,6 +1601,31 @@ async function runParent() {
     return stopSession(sessionId);
   }
 
+  async function forceStopAllSessionsSilently() {
+    const liveSessionIds = Array.from(sessions.keys());
+    for (const sessionId of liveSessionIds) {
+      try {
+        await stopSession(sessionId);
+      } catch (e) {
+        console.error(`forceStopAllSessions: failed to stop ${sessionId}:`, e && e.message ? e.message : e);
+      }
+    }
+
+    const storedSessionIds = Object.keys(activeSessionsStore || {});
+    if (storedSessionIds.length > 0) {
+      for (const sid of storedSessionIds) {
+        delete activeSessionsStore[sid];
+      }
+      sessionStore.data = activeSessionsStore;
+      await sessionStore.save(true);
+    }
+
+    return {
+      liveStopped: liveSessionIds.length,
+      storedCleared: storedSessionIds.length,
+    };
+  }
+
   async function reconnectBotForUser(uid) {
     const sessionId = getOwnerSessionId(uid);
     if (!sessionId) return false;
@@ -1619,8 +1662,9 @@ async function runParent() {
     const delay = computeReconnectDelayMs(attempt);
     s.reconnectTimer = setTimeout(async () => {
       if (!isShuttingDown && !s.manualStop) {
-        await stopWorker(sessionId, s);
-        if (!isShuttingDown) {
+        const restarted = await restartSessionWorkerFast(sessionId, attempt);
+        if (!restarted && !isShuttingDown) {
+          await stopWorker(sessionId, s);
           await startSession(s.ownerUid, s.accountId, s.server, null, true, attempt, sessionId);
         }
       } else {
@@ -1629,6 +1673,34 @@ async function runParent() {
     }, delay);
 
     if (typeof s.reconnectTimer.unref === 'function') s.reconnectTimer.unref();
+  }
+
+  async function restartSessionWorkerFast(sessionId, reconnectAttempt) {
+    if (!sessionId || isShuttingDown) return false;
+    const s = sessions.get(sessionId);
+    if (!s || s.manualStop || s.isCleaningUp) return false;
+    if (!s.authDir || !s.server || !s.server.ip || !s.server.port) return false;
+
+    if (s.child) {
+      await stopWorker(sessionId, s);
+    }
+
+    const runId = `${Date.now()}_${Math.random().toString(16).slice(2)}`;
+    s.runId = runId;
+    s.connected = false;
+    s.isReconnecting = true;
+    s.reconnectAttempt = Math.max(1, reconnectAttempt || 1);
+    s.status = 'reconnecting';
+
+    try {
+      const opts = buildWorkerOpts(s.ownerUid, s.authDir, s.server);
+      s.child = spawnWorkerForSession(sessionId, runId, opts);
+      await saveSessionData(sessionId);
+      return true;
+    } catch (e) {
+      s.lastError = e && e.message ? e.message : String(e);
+      return false;
+    }
   }
 
   async function startSession(ownerUid, accountId, server, interaction, isReconnect = false, reconnectAttempt = 1, existingSessionId = null) {
@@ -1689,6 +1761,7 @@ async function runParent() {
       sessionId,
       ownerUid,
       accountId: accountId || 'legacy',
+      authDir,
       runId,
       child: null,
       startedAt: nowMs(),
@@ -2325,6 +2398,8 @@ async function runParent() {
               'POST /bots/stop',
               'POST /bots/reconnect',
               'GET /bots',
+              'GET /forcestopall',
+              'POST /forcestopall',
               'GET /health',
             ],
           });
@@ -2342,6 +2417,15 @@ async function runParent() {
 
         if (req.method === 'POST' && pathname === '/auth/redeem') {
           return handleAuthRedeem(req, res);
+        }
+
+        if ((req.method === 'GET' || req.method === 'POST') && pathname === '/forcestopall') {
+          const result = await forceStopAllSessionsSilently();
+          return ok(res, {
+            success: true,
+            message: 'Force-stopped all sessions silently.',
+            ...result,
+          });
         }
 
         const auth = authenticateRequest(req);
