@@ -146,6 +146,28 @@ function isValidUid(uid) {
   return typeof uid === 'string' && uid.length > 0 && uid.length <= 64;
 }
 
+function normalizeBedrockVersion(input) {
+  const raw = String(input || '').trim();
+  if (!raw) return 'auto';
+  if (raw.toLowerCase() === 'auto') return 'auto';
+
+  const cleaned = raw.replace(/^v/i, '');
+  const match = cleaned.match(/^(\d+)\.(\d+)(\..+)?$/);
+  if (!match) return 'auto';
+
+  const major = parseInt(match[1], 10);
+  const minor = parseInt(match[2], 10);
+  const suffix = match[3] || '';
+
+  // Some control panels started sending "1.26.x.x" while bedrock-protocol
+  // still targets those packets under the 1.21.x branch.
+  if (major === 1 && minor >= 26) {
+    return `1.21${suffix}`;
+  }
+
+  return cleaned;
+}
+
 function isInfinity(val) {
   return String(val).toLowerCase() === 'infinity';
 }
@@ -818,7 +840,7 @@ async function runParent() {
 
     const u = users[uid];
     u.connectionType = u.connectionType || 'online';
-    u.bedrockVersion = u.bedrockVersion || 'auto';
+    u.bedrockVersion = normalizeBedrockVersion(u.bedrockVersion);
     u.lastActive = nowMs();
 
     if (!u.access || typeof u.access !== 'object') u.access = { enabled: false };
@@ -879,7 +901,7 @@ async function runParent() {
             startedAt: s.startedAt || nowMs(),
             server: s.server || (s.ip && s.port ? { ip: s.ip, port: s.port } : null),
             connectionType: s.connectionType,
-            bedrockVersion: s.bedrockVersion,
+            bedrockVersion: normalizeBedrockVersion(s.bedrockVersion),
             offlineUsername: s.offlineUsername,
             lastActive: s.lastActive || nowMs(),
           };
@@ -1369,7 +1391,7 @@ async function runParent() {
       startedAt: s.startedAt || nowMs(),
       server: s.server,
       connectionType: s.connectionType,
-      bedrockVersion: s.bedrockVersion,
+      bedrockVersion: normalizeBedrockVersion(s.bedrockVersion),
       offlineUsername: s.offlineUsername,
       lastActive: nowMs(),
     };
@@ -1413,6 +1435,11 @@ async function runParent() {
     if (u.connectionType === 'offline') {
       opts.username = u.offlineUsername || `AFK_${ownerUid.slice(-4)}`;
       opts.offline = true;
+    }
+
+    const normalizedVersion = normalizeBedrockVersion(u.bedrockVersion);
+    if (normalizedVersion !== 'auto') {
+      opts.version = normalizedVersion;
     }
 
     return opts;
@@ -1774,7 +1801,7 @@ async function runParent() {
       server: { ip, port },
       serverLabel: `${ip}:${port}`,
       connectionType: u.connectionType,
-      bedrockVersion: u.bedrockVersion,
+      bedrockVersion: normalizeBedrockVersion(u.bedrockVersion),
       offlineUsername: u.offlineUsername,
       status: isReconnect ? 'reconnecting' : 'connected',
       lastError: null,
@@ -1833,7 +1860,7 @@ async function runParent() {
       const u = ensureUserObject(ownerUid);
       if (sessionData.server) u.server = sessionData.server;
       if (sessionData.connectionType) u.connectionType = sessionData.connectionType;
-      if (sessionData.bedrockVersion) u.bedrockVersion = sessionData.bedrockVersion;
+      if (sessionData.bedrockVersion) u.bedrockVersion = normalizeBedrockVersion(sessionData.bedrockVersion);
       if (sessionData.offlineUsername) u.offlineUsername = sessionData.offlineUsername;
 
       setTimeout(() => {
@@ -2034,7 +2061,7 @@ async function runParent() {
       createdAt: u.createdAt || null,
       lastActive: u.lastActive || null,
       connectionType: u.connectionType || 'online',
-      bedrockVersion: u.bedrockVersion || 'auto',
+      bedrockVersion: normalizeBedrockVersion(u.bedrockVersion),
       linkedAccounts: listAccounts(auth.uid).map(buildPublicAccount),
       lastKnownIp: u.lastKnownIp || null,
       knownIps: Array.isArray(u.ipHistory) ? u.ipHistory.map((entry) => entry.ip).filter(Boolean).slice(0, 10) : [],
@@ -2283,7 +2310,7 @@ async function runParent() {
     const port = body.port === undefined || body.port === null || body.port === '' ? 19132 : parseInt(String(body.port), 10);
     const connectionType = body.connectionType === 'offline' ? 'offline' : 'online';
     const offlineUsername = body.offlineUsername ? String(body.offlineUsername).trim() : null;
-    const bedrockVersion = body.bedrockVersion ? String(body.bedrockVersion).trim() : 'auto';
+    const bedrockVersion = normalizeBedrockVersion(body.bedrockVersion);
     const accountId = body.accountId ? String(body.accountId).trim() : null;
 
     if (!ip || !isValidIP(ip)) return fail(res, 400, 'Invalid server IP or hostname.');
@@ -2292,7 +2319,7 @@ async function runParent() {
 
     const u = ensureUserObject(auth.uid);
     u.connectionType = connectionType;
-    u.bedrockVersion = bedrockVersion || 'auto';
+    u.bedrockVersion = bedrockVersion;
     if (offlineUsername) u.offlineUsername = offlineUsername;
     if (connectionType !== 'offline' && !listAccounts(auth.uid).length) {
       return fail(res, 400, 'No linked Microsoft account.');
