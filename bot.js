@@ -39,13 +39,11 @@ const CONFIG = {
 
   // Reconnect
   MAX_RECONNECT_ATTEMPTS: 0,
-  RECONNECT_BASE_DELAY_MS: parseInt(process.env.RECONNECT_BASE_DELAY_MS || '400', 10),
-  RECONNECT_MAX_DELAY_MS: parseInt(process.env.RECONNECT_MAX_DELAY_MS || '10000', 10),
-  RECONNECT_MULTIPLIER: Number.parseFloat(process.env.RECONNECT_MULTIPLIER || '1.7'),
-  FAST_RECONNECT_ATTEMPTS: parseInt(process.env.FAST_RECONNECT_ATTEMPTS || '3', 10),
+  RECONNECT_BASE_DELAY_MS: 500,
+  RECONNECT_MAX_DELAY_MS: 30_000,
   RECONNECT_EXPONENT_CAP: 20,
 
-  CONNECTION_TIMEOUT_MS: parseInt(process.env.CONNECTION_TIMEOUT_MS || '15000', 10),
+  CONNECTION_TIMEOUT_MS: 30_000,
   KEEPALIVE_INTERVAL_MS: 15_000,
   STALE_CONNECTION_TIMEOUT_MS: 300_000,
   STALE_CHECK_INTERVAL_MS: 30_000,
@@ -144,28 +142,6 @@ function isValidCodeFormat(input) {
 
 function isValidUid(uid) {
   return typeof uid === 'string' && uid.length > 0 && uid.length <= 64;
-}
-
-function normalizeBedrockVersion(input) {
-  const raw = String(input || '').trim();
-  if (!raw) return 'auto';
-  if (raw.toLowerCase() === 'auto') return 'auto';
-
-  const cleaned = raw.replace(/^v/i, '');
-  const match = cleaned.match(/^(\d+)\.(\d+)(\..+)?$/);
-  if (!match) return 'auto';
-
-  const major = parseInt(match[1], 10);
-  const minor = parseInt(match[2], 10);
-  const suffix = match[3] || '';
-
-  // Some control panels started sending "1.26.x.x" while bedrock-protocol
-  // still targets those packets under the 1.21.x branch.
-  if (major === 1 && minor >= 26) {
-    return `1.21${suffix}`;
-  }
-
-  return cleaned;
 }
 
 function isInfinity(val) {
@@ -510,7 +486,7 @@ async function runWorker() {
           send({ type: 'mc_error', uid: state.uid, message: 'Connect guard timeout' });
           shutdown(1, 'CONNECT_GUARD_TIMEOUT');
         }
-      }, CONFIG.CONNECTION_TIMEOUT_MS + 2000);
+      }, CONFIG.CONNECTION_TIMEOUT_MS + 5000);
       if (typeof guard.unref === 'function') guard.unref();
 
       send({ type: 'worker_log', level: 'info', uid: state.uid, message: 'Worker bedrock client started' });
@@ -678,118 +654,8 @@ async function runParent() {
     }
   }
 
-  function getLiveSessionIdsForOwner(ownerUid) {
-    const out = [];
-    for (const [sid, session] of sessions.entries()) {
-      if (session && session.ownerUid === ownerUid) out.push(sid);
-    }
-    return out;
-  }
-
-  function getStoredSessionIdsForOwner(ownerUid) {
-    const out = [];
-    for (const sid of Object.keys(activeSessionsStore || {})) {
-      const entry = activeSessionsStore[sid];
-      if (entry && entry.ownerUid === ownerUid) out.push(sid);
-    }
-    return out;
-  }
-
-  async function clearStoredSessionsForOwner(ownerUid) {
-    if (!ownerUid) return;
-    let changed = false;
-    for (const sid of getStoredSessionIdsForOwner(ownerUid)) {
-      delete activeSessionsStore[sid];
-      changed = true;
-    }
-    if (changed) {
-      sessionStore.data = activeSessionsStore;
-      await sessionStore.save(true);
-    }
-  }
-
   function getOwnerSessionId(ownerUid) {
-    const mapped = sessionsByOwner.get(ownerUid) || null;
-    if (mapped && sessions.has(mapped)) return mapped;
-    const liveIds = getLiveSessionIdsForOwner(ownerUid);
-    if (liveIds.length > 0) {
-      const preferred = liveIds.sort((a, b) => {
-        const sa = sessions.get(a);
-        const sb = sessions.get(b);
-        return Number((sb && sb.startedAt) || 0) - Number((sa && sa.startedAt) || 0);
-      })[0];
-      sessionsByOwner.set(ownerUid, preferred);
-      return preferred;
-    }
-    sessionsByOwner.delete(ownerUid);
-    return null;
-  }
-
-  function normalizeStoredOwnerSessionsSync() {
-    const byOwner = new Map();
-    for (const sid of Object.keys(activeSessionsStore || {})) {
-      const entry = activeSessionsStore[sid];
-      if (!entry || !entry.ownerUid) continue;
-      const existing = byOwner.get(entry.ownerUid);
-      if (!existing) {
-        byOwner.set(entry.ownerUid, sid);
-        continue;
-      }
-      const existingEntry = activeSessionsStore[existing];
-      const existingTime = Number((existingEntry && existingEntry.startedAt) || 0);
-      const currentTime = Number((entry && entry.startedAt) || 0);
-      if (currentTime >= existingTime) {
-        delete activeSessionsStore[existing];
-        byOwner.set(entry.ownerUid, sid);
-      } else {
-        delete activeSessionsStore[sid];
-      }
-    }
-  }
-
-  async function enforceSingleBotPerUser(ownerUid, preferredSessionId = null) {
-    if (!ownerUid) return;
-
-    const liveIds = getLiveSessionIdsForOwner(ownerUid).sort((a, b) => {
-      const sa = sessions.get(a);
-      const sb = sessions.get(b);
-      return Number((sb && sb.startedAt) || 0) - Number((sa && sa.startedAt) || 0);
-    });
-
-    const keepLiveId = preferredSessionId && liveIds.includes(preferredSessionId)
-      ? preferredSessionId
-      : (liveIds[0] || null);
-
-    for (const sid of liveIds) {
-      if (keepLiveId && sid === keepLiveId) continue;
-      await cleanupSession(sid);
-    }
-
-    const storedIds = getStoredSessionIdsForOwner(ownerUid).sort((a, b) => {
-      const sa = activeSessionsStore[a];
-      const sb = activeSessionsStore[b];
-      return Number((sb && sb.startedAt) || 0) - Number((sa && sa.startedAt) || 0);
-    });
-
-    const keepStoredId = preferredSessionId && storedIds.includes(preferredSessionId)
-      ? preferredSessionId
-      : (storedIds[0] || null);
-
-    let changed = false;
-    for (const sid of storedIds) {
-      if (keepStoredId && sid === keepStoredId) continue;
-      delete activeSessionsStore[sid];
-      changed = true;
-    }
-
-    if (changed) {
-      sessionStore.data = activeSessionsStore;
-      await sessionStore.save(true);
-    }
-
-    const finalLiveId = keepLiveId || getLiveSessionIdsForOwner(ownerUid)[0] || null;
-    if (finalLiveId) sessionsByOwner.set(ownerUid, finalLiveId);
-    else sessionsByOwner.delete(ownerUid);
+    return sessionsByOwner.get(ownerUid) || null;
   }
 
   function hasAccess(uid) {
@@ -815,8 +681,6 @@ async function runParent() {
         access: { enabled: false },
         microsoftAccounts: [],
         servers: [],
-        ipHistory: [],
-        knownClients: [],
         _temp: true,
       };
     }
@@ -830,8 +694,6 @@ async function runParent() {
         access: { enabled: false },
         microsoftAccounts: [],
         servers: [],
-        ipHistory: [],
-        knownClients: [],
         apiTokenHash: null,
       };
       userStore.data = users;
@@ -840,18 +702,14 @@ async function runParent() {
 
     const u = users[uid];
     u.connectionType = u.connectionType || 'online';
-    u.bedrockVersion = normalizeBedrockVersion(u.bedrockVersion);
+    u.bedrockVersion = u.bedrockVersion || 'auto';
     u.lastActive = nowMs();
 
     if (!u.access || typeof u.access !== 'object') u.access = { enabled: false };
     if (typeof u.access.enabled !== 'boolean') u.access.enabled = u.access.enabled === true;
     if (!Array.isArray(u.microsoftAccounts)) u.microsoftAccounts = [];
     if (!Array.isArray(u.servers)) u.servers = [];
-    if (!Array.isArray(u.ipHistory)) u.ipHistory = [];
-    if (!Array.isArray(u.knownClients)) u.knownClients = [];
     if (typeof u.apiTokenHash !== 'string') u.apiTokenHash = null;
-    if (typeof u.lastKnownIp !== 'string') u.lastKnownIp = null;
-    if (!u.lastKnownClient || typeof u.lastKnownClient !== 'object') u.lastKnownClient = null;
 
     if (u.server && u.server.ip && u.server.port && u.servers.length === 0) {
       u.servers.push({
@@ -901,7 +759,7 @@ async function runParent() {
             startedAt: s.startedAt || nowMs(),
             server: s.server || (s.ip && s.port ? { ip: s.ip, port: s.port } : null),
             connectionType: s.connectionType,
-            bedrockVersion: normalizeBedrockVersion(s.bedrockVersion),
+            bedrockVersion: s.bedrockVersion,
             offlineUsername: s.offlineUsername,
             lastActive: s.lastActive || nowMs(),
           };
@@ -915,8 +773,6 @@ async function runParent() {
           if (!s.ownerUid && s.uid) s.ownerUid = s.uid;
         }
       }
-
-      normalizeStoredOwnerSessionsSync();
 
       if (!codesData || typeof codesData !== 'object') codesData = { codes: {}, meta: {} };
       if (!codesData.codes || typeof codesData.codes !== 'object') codesData.codes = {};
@@ -957,133 +813,6 @@ async function runParent() {
     return addr;
   }
 
-  function normalizeHeaderValue(value, maxLen = 256) {
-    if (value === undefined || value === null) return '';
-    return String(value).trim().slice(0, maxLen);
-  }
-
-  function getClientDetails(req) {
-    const ip = getRequestIp(req);
-    const userAgent = normalizeHeaderValue(req && req.headers ? req.headers['user-agent'] : '', 512);
-    const acceptLanguage = normalizeHeaderValue(req && req.headers ? req.headers['accept-language'] : '', 128);
-    const deviceId = normalizeHeaderValue(req && req.headers ? (req.headers['x-client-device-id'] || req.headers['x-device-id']) : '', 128);
-    const deviceName = normalizeHeaderValue(req && req.headers ? (req.headers['x-client-device-name'] || req.headers['x-device-name']) : '', 128);
-    const platform = normalizeHeaderValue(req && req.headers ? (req.headers['x-client-platform'] || req.headers['x-platform']) : '', 64);
-    const model = normalizeHeaderValue(req && req.headers ? (req.headers['x-client-model'] || req.headers['x-device-model']) : '', 128);
-    const fingerprintSource = [deviceId || '', deviceName || '', platform || '', model || '', userAgent || '', acceptLanguage || ''].join('|');
-    return {
-      ip,
-      userAgent,
-      acceptLanguage,
-      deviceId: deviceId || null,
-      deviceName: deviceName || null,
-      platform: platform || null,
-      model: model || null,
-      fingerprint: sha256(fingerprintSource || ip || 'unknown-client'),
-      observedAt: nowMs(),
-    };
-  }
-
-  function rememberClientForUser(uid, client, reason = 'request') {
-    if (!uid || !client || !client.ip) return null;
-    const u = ensureUserObject(uid);
-    if (!u || u._temp) return null;
-
-    if (!Array.isArray(u.ipHistory)) u.ipHistory = [];
-    if (!Array.isArray(u.knownClients)) u.knownClients = [];
-
-    const seenAt = nowMs();
-    const existingIp = u.ipHistory.find((entry) => entry && entry.ip === client.ip);
-    if (existingIp) {
-      existingIp.lastSeenAt = seenAt;
-      existingIp.hits = Number(existingIp.hits || 0) + 1;
-      if (reason) existingIp.lastReason = reason;
-    } else {
-      u.ipHistory.unshift({
-        ip: client.ip,
-        firstSeenAt: seenAt,
-        lastSeenAt: seenAt,
-        hits: 1,
-        lastReason: reason,
-      });
-      if (u.ipHistory.length > 20) u.ipHistory.length = 20;
-    }
-
-    const existingClient = u.knownClients.find((entry) => entry && entry.fingerprint === client.fingerprint);
-    if (existingClient) {
-      existingClient.lastSeenAt = seenAt;
-      existingClient.hits = Number(existingClient.hits || 0) + 1;
-      existingClient.lastIp = client.ip;
-      if (reason) existingClient.lastReason = reason;
-      if (client.deviceId) existingClient.deviceId = client.deviceId;
-      if (client.deviceName) existingClient.deviceName = client.deviceName;
-      if (client.platform) existingClient.platform = client.platform;
-      if (client.model) existingClient.model = client.model;
-      if (client.userAgent) existingClient.userAgent = client.userAgent;
-    } else {
-      u.knownClients.unshift({
-        fingerprint: client.fingerprint,
-        deviceId: client.deviceId,
-        deviceName: client.deviceName,
-        platform: client.platform,
-        model: client.model,
-        userAgent: client.userAgent,
-        firstSeenAt: seenAt,
-        lastSeenAt: seenAt,
-        lastIp: client.ip,
-        hits: 1,
-        lastReason: reason,
-      });
-      if (u.knownClients.length > 12) u.knownClients.length = 12;
-    }
-
-    u.lastKnownIp = client.ip;
-    u.lastKnownClient = {
-      fingerprint: client.fingerprint,
-      deviceId: client.deviceId,
-      deviceName: client.deviceName,
-      platform: client.platform,
-      model: client.model,
-      userAgent: client.userAgent,
-      lastIp: client.ip,
-      lastSeenAt: seenAt,
-      lastReason: reason,
-    };
-
-    userStore.data = users;
-    userStore.save();
-    return u.lastKnownClient;
-  }
-
-  function isSameTrustedClient(user, client) {
-    if (!user || !client || !client.ip || !client.fingerprint) return false;
-    const ipMatch = user.lastKnownIp === client.ip || (Array.isArray(user.ipHistory) && user.ipHistory.some((entry) => entry && entry.ip === client.ip));
-    const fpMatch = (user.lastKnownClient && user.lastKnownClient.fingerprint === client.fingerprint)
-      || (Array.isArray(user.knownClients) && user.knownClients.some((entry) => entry && entry.fingerprint === client.fingerprint));
-    return !!(ipMatch && fpMatch);
-  }
-
-  function issueFreshTokenForUser(uid) {
-    const u = ensureUserObject(uid);
-    if (!u || u._temp) return null;
-    if (u.apiTokenHash) tokenIndex.delete(u.apiTokenHash);
-    const token = makeAccessToken();
-    u.apiTokenHash = sha256(token);
-    u.lastTokenIssuedAt = nowMs();
-    tokenIndex.set(u.apiTokenHash, uid);
-    userStore.data = users;
-    return token;
-  }
-
-  function clearUserToken(uid) {
-    const u = ensureUserObject(uid);
-    if (!u || u._temp) return;
-    if (u.apiTokenHash) tokenIndex.delete(u.apiTokenHash);
-    u.apiTokenHash = null;
-    u.lastTokenRevokedAt = nowMs();
-    userStore.data = users;
-  }
-
   function authenticateRequest(req) {
     const token = parseAuthHeader(req);
     if (!token) return null;
@@ -1091,11 +820,9 @@ async function runParent() {
     if (!uid) return null;
     const u = ensureUserObject(uid);
     if (!hasAccess(uid)) return null;
-    const client = getClientDetails(req);
-    rememberClientForUser(uid, client, 'auth');
     u.lastActive = nowMs();
     u.lastTokenUseAt = nowMs();
-    return { uid, user: u, token, client };
+    return { uid, user: u, token };
   }
 
   function buildPublicAccount(account, idx) {
@@ -1115,7 +842,7 @@ async function runParent() {
     res.setHeader('Content-Type', 'application/json; charset=utf-8');
     res.setHeader('Content-Length', Buffer.byteLength(body));
     res.setHeader('Access-Control-Allow-Origin', CONFIG.CORS_ORIGIN);
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Client-Device-ID, X-Client-Device-Name, X-Client-Platform, X-Client-Model');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
     res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
     res.end(body);
   }
@@ -1355,29 +1082,13 @@ async function runParent() {
   }
 
   function computeReconnectDelayMs(attempt) {
-    const safeAttempt = Math.max(1, Number(attempt) || 1);
-    const base = Number.isFinite(CONFIG.RECONNECT_BASE_DELAY_MS) && CONFIG.RECONNECT_BASE_DELAY_MS > 0
-      ? CONFIG.RECONNECT_BASE_DELAY_MS
-      : 400;
-    const max = Number.isFinite(CONFIG.RECONNECT_MAX_DELAY_MS) && CONFIG.RECONNECT_MAX_DELAY_MS >= base
-      ? CONFIG.RECONNECT_MAX_DELAY_MS
-      : 10_000;
-    const multiplier = Number.isFinite(CONFIG.RECONNECT_MULTIPLIER) && CONFIG.RECONNECT_MULTIPLIER > 1
-      ? CONFIG.RECONNECT_MULTIPLIER
-      : 1.7;
-    const fastAttempts = Number.isFinite(CONFIG.FAST_RECONNECT_ATTEMPTS) && CONFIG.FAST_RECONNECT_ATTEMPTS > 0
-      ? CONFIG.FAST_RECONNECT_ATTEMPTS
-      : 3;
-    const expCap = Number.isFinite(CONFIG.RECONNECT_EXPONENT_CAP) && CONFIG.RECONNECT_EXPONENT_CAP >= 0
-      ? CONFIG.RECONNECT_EXPONENT_CAP
-      : 20;
-
-    const exp = Math.min(Math.max(0, safeAttempt - 1), expCap);
-    const baseDelay = Math.min(max, base * Math.pow(multiplier, exp));
-    const jitterCap = safeAttempt <= fastAttempts ? Math.min(250, Math.floor(base * 0.4)) : Math.min(1_000, Math.floor(base * 1.5));
-    const jitter = Math.random() * Math.max(1, jitterCap);
-
-    return Math.max(100, Math.round(baseDelay + jitter));
+    if (attempt <= 1) return 800 + Math.random() * 700;
+    const expCap = Number.isFinite(CONFIG.RECONNECT_EXPONENT_CAP) ? CONFIG.RECONNECT_EXPONENT_CAP : 20;
+    const exp = Math.min(Math.max(0, attempt - 2), expCap);
+    const baseDelay = 2000 * Math.pow(1.4, exp);
+    const capped = Math.min(baseDelay, 60_000);
+    const jitter = Math.random() * 1000;
+    return capped + jitter;
   }
 
   async function saveSessionData(sessionId) {
@@ -1391,7 +1102,7 @@ async function runParent() {
       startedAt: s.startedAt || nowMs(),
       server: s.server,
       connectionType: s.connectionType,
-      bedrockVersion: normalizeBedrockVersion(s.bedrockVersion),
+      bedrockVersion: s.bedrockVersion,
       offlineUsername: s.offlineUsername,
       lastActive: nowMs(),
     };
@@ -1435,11 +1146,6 @@ async function runParent() {
     if (u.connectionType === 'offline') {
       opts.username = u.offlineUsername || `AFK_${ownerUid.slice(-4)}`;
       opts.offline = true;
-    }
-
-    const normalizedVersion = normalizeBedrockVersion(u.bedrockVersion);
-    if (normalizedVersion !== 'auto') {
-      opts.version = normalizedVersion;
     }
 
     return opts;
@@ -1628,31 +1334,6 @@ async function runParent() {
     return stopSession(sessionId);
   }
 
-  async function forceStopAllSessionsSilently() {
-    const liveSessionIds = Array.from(sessions.keys());
-    for (const sessionId of liveSessionIds) {
-      try {
-        await stopSession(sessionId);
-      } catch (e) {
-        console.error(`forceStopAllSessions: failed to stop ${sessionId}:`, e && e.message ? e.message : e);
-      }
-    }
-
-    const storedSessionIds = Object.keys(activeSessionsStore || {});
-    if (storedSessionIds.length > 0) {
-      for (const sid of storedSessionIds) {
-        delete activeSessionsStore[sid];
-      }
-      sessionStore.data = activeSessionsStore;
-      await sessionStore.save(true);
-    }
-
-    return {
-      liveStopped: liveSessionIds.length,
-      storedCleared: storedSessionIds.length,
-    };
-  }
-
   async function reconnectBotForUser(uid) {
     const sessionId = getOwnerSessionId(uid);
     if (!sessionId) return false;
@@ -1689,9 +1370,8 @@ async function runParent() {
     const delay = computeReconnectDelayMs(attempt);
     s.reconnectTimer = setTimeout(async () => {
       if (!isShuttingDown && !s.manualStop) {
-        const restarted = await restartSessionWorkerFast(sessionId, attempt);
-        if (!restarted && !isShuttingDown) {
-          await stopWorker(sessionId, s);
+        await stopWorker(sessionId, s);
+        if (!isShuttingDown) {
           await startSession(s.ownerUid, s.accountId, s.server, null, true, attempt, sessionId);
         }
       } else {
@@ -1702,44 +1382,13 @@ async function runParent() {
     if (typeof s.reconnectTimer.unref === 'function') s.reconnectTimer.unref();
   }
 
-  async function restartSessionWorkerFast(sessionId, reconnectAttempt) {
-    if (!sessionId || isShuttingDown) return false;
-    const s = sessions.get(sessionId);
-    if (!s || s.manualStop || s.isCleaningUp) return false;
-    if (!s.authDir || !s.server || !s.server.ip || !s.server.port) return false;
-
-    if (s.child) {
-      await stopWorker(sessionId, s);
-    }
-
-    const runId = `${Date.now()}_${Math.random().toString(16).slice(2)}`;
-    s.runId = runId;
-    s.connected = false;
-    s.isReconnecting = true;
-    s.reconnectAttempt = Math.max(1, reconnectAttempt || 1);
-    s.status = 'reconnecting';
-
-    try {
-      const opts = buildWorkerOpts(s.ownerUid, s.authDir, s.server);
-      s.child = spawnWorkerForSession(sessionId, runId, opts);
-      await saveSessionData(sessionId);
-      return true;
-    } catch (e) {
-      s.lastError = e && e.message ? e.message : String(e);
-      return false;
-    }
-  }
-
   async function startSession(ownerUid, accountId, server, interaction, isReconnect = false, reconnectAttempt = 1, existingSessionId = null) {
     if (!ownerUid || isShuttingDown) return null;
     if (!storesInitialized) return null;
     if (!hasAccess(ownerUid)) return null;
 
-    await enforceSingleBotPerUser(ownerUid, existingSessionId || null);
-
     const currentSessionId = getOwnerSessionId(ownerUid);
-    const storedSessionIds = getStoredSessionIdsForOwner(ownerUid).filter((sid) => sid !== existingSessionId);
-    if (!isReconnect && (currentSessionId || storedSessionIds.length > 0)) {
+    if (!isReconnect && currentSessionId) {
       return null;
     }
 
@@ -1788,7 +1437,6 @@ async function runParent() {
       sessionId,
       ownerUid,
       accountId: accountId || 'legacy',
-      authDir,
       runId,
       child: null,
       startedAt: nowMs(),
@@ -1801,9 +1449,9 @@ async function runParent() {
       server: { ip, port },
       serverLabel: `${ip}:${port}`,
       connectionType: u.connectionType,
-      bedrockVersion: normalizeBedrockVersion(u.bedrockVersion),
+      bedrockVersion: u.bedrockVersion,
       offlineUsername: u.offlineUsername,
-      status: isReconnect ? 'reconnecting' : 'connected',
+      status: isReconnect ? 'reconnecting' : 'starting',
       lastError: null,
       lastDisconnectReason: null,
       lastConnectedAt: null,
@@ -1860,7 +1508,7 @@ async function runParent() {
       const u = ensureUserObject(ownerUid);
       if (sessionData.server) u.server = sessionData.server;
       if (sessionData.connectionType) u.connectionType = sessionData.connectionType;
-      if (sessionData.bedrockVersion) u.bedrockVersion = normalizeBedrockVersion(sessionData.bedrockVersion);
+      if (sessionData.bedrockVersion) u.bedrockVersion = sessionData.bedrockVersion;
       if (sessionData.offlineUsername) u.offlineUsername = sessionData.offlineUsername;
 
       setTimeout(() => {
@@ -1957,60 +1605,26 @@ async function runParent() {
       return fail(res, 400, 'Invalid code format.');
     }
 
-    const client = getClientDetails(req);
     const entry = codesData.codes[code];
     if (!entry || typeof entry !== 'object') {
       return fail(res, 403, 'Invalid code.');
     }
+    if (entry.used) {
+      return fail(res, 403, 'Code already used.');
+    }
 
     const expiresAt = typeof entry.expiresAt === 'number' ? entry.expiresAt : (entry.createdAt || 0) + CONFIG.CODE_TTL_MS;
-    if (!entry.used && expiresAt && nowMs() >= expiresAt) {
+    if (expiresAt && nowMs() >= expiresAt) {
       delete codesData.codes[code];
       codesStore.data = codesData;
       await codesStore.save(true);
       return fail(res, 403, 'Code expired.');
     }
 
-    if (entry.used) {
-      const existingUid = entry.userId ? String(entry.userId) : null;
-      const existingUser = existingUid ? ensureUserObject(existingUid) : null;
-      if (!existingUid || !existingUser || existingUser._temp) {
-        return fail(res, 403, 'Code already used.');
-      }
-      if (!isSameTrustedClient(existingUser, client)) {
-        return fail(res, 403, 'Code already used on another device or IP.');
-      }
-
-      const token = issueFreshTokenForUser(existingUid);
-      if (!token) {
-        return fail(res, 500, 'Failed to restore access.');
-      }
-
-      existingUser.lastActive = nowMs();
-      existingUser.redeemedAt = nowMs();
-      existingUser.redeemedCode = code;
-      if (!existingUser.access || typeof existingUser.access !== 'object') existingUser.access = { enabled: true };
-      existingUser.access.enabled = true;
-      existingUser.access.lastResumeAt = nowMs();
-      rememberClientForUser(existingUid, client, 'redeem_resume');
-
-      entry.lastResumeAt = nowMs();
-      entry.lastResumeIp = client.ip;
-      entry.lastResumeFingerprint = client.fingerprint;
-
-      userStore.data = users;
-      codesStore.data = codesData;
-      await Promise.all([userStore.save(true), codesStore.save(true)]);
-
-      return ok(res, {
-        token,
-        userId: existingUid,
-        linkedAccounts: listAccounts(existingUid).map(buildPublicAccount),
-        resumed: true,
-      });
-    }
-
     const userId = makeNumericUserId();
+    const token = makeAccessToken();
+    const tokenHash = sha256(token);
+
     users[userId] = {
       connectionType: 'online',
       bedrockVersion: 'auto',
@@ -2023,21 +1637,15 @@ async function runParent() {
       },
       microsoftAccounts: [],
       servers: [],
-      ipHistory: [],
-      knownClients: [],
-      apiTokenHash: null,
+      apiTokenHash: tokenHash,
       redeemedCode: code,
       redeemedAt: nowMs(),
     };
-
-    const token = issueFreshTokenForUser(userId);
-    rememberClientForUser(userId, client, 'redeem_new');
+    tokenIndex.set(tokenHash, userId);
 
     entry.used = true;
     entry.userId = userId;
     entry.usedAt = nowMs();
-    entry.firstIp = client.ip;
-    entry.firstFingerprint = client.fingerprint;
 
     userStore.data = users;
     codesStore.data = codesData;
@@ -2047,7 +1655,6 @@ async function runParent() {
       token,
       userId,
       linkedAccounts: [],
-      resumed: false,
     });
   }
 
@@ -2061,10 +1668,8 @@ async function runParent() {
       createdAt: u.createdAt || null,
       lastActive: u.lastActive || null,
       connectionType: u.connectionType || 'online',
-      bedrockVersion: normalizeBedrockVersion(u.bedrockVersion),
+      bedrockVersion: u.bedrockVersion || 'auto',
       linkedAccounts: listAccounts(auth.uid).map(buildPublicAccount),
-      lastKnownIp: u.lastKnownIp || null,
-      knownIps: Array.isArray(u.ipHistory) ? u.ipHistory.map((entry) => entry.ip).filter(Boolean).slice(0, 10) : [],
       bot: session
         ? {
             sessionId: session.sessionId,
@@ -2075,32 +1680,6 @@ async function runParent() {
             uptimeMs: session.startedAt ? nowMs() - session.startedAt : 0,
           }
         : null,
-    });
-  }
-
-  async function handleAuthLogout(req, res, auth) {
-    const client = auth && auth.client ? auth.client : getClientDetails(req);
-    rememberClientForUser(auth.uid, client, 'logout');
-
-    const stopped = await stopBotForUser(auth.uid);
-    await clearStoredSessionsForOwner(auth.uid);
-    clearUserToken(auth.uid);
-
-    const u = ensureUserObject(auth.uid);
-    u.lastLogoutAt = nowMs();
-    u.lastLogoutIp = client.ip;
-    if (u.access && typeof u.access === 'object') {
-      u.access.lastLogoutAt = u.lastLogoutAt;
-    }
-
-    userStore.data = users;
-    await userStore.save(true);
-
-    return ok(res, {
-      signedOut: true,
-      stopped,
-      reusableOnSameClient: true,
-      reusableCode: u.redeemedCode || null,
     });
   }
 
@@ -2275,8 +1854,6 @@ async function runParent() {
       return fail(res, e.message === 'BODY_TOO_LARGE' ? 413 : 400, e.message === 'BODY_TOO_LARGE' ? 'Request body too large.' : 'Invalid JSON body.');
     }
 
-    await enforceSingleBotPerUser(auth.uid);
-
     const existingSessionId = getOwnerSessionId(auth.uid);
     if (existingSessionId && sessions.has(existingSessionId)) {
       const existing = sessions.get(existingSessionId);
@@ -2285,18 +1862,6 @@ async function runParent() {
           sessionId: existing.sessionId,
           status: existing.status,
           server: formatServerLabel(existing.server),
-        },
-      });
-    }
-
-    const storedSessionIds = getStoredSessionIdsForOwner(auth.uid);
-    if (!existingSessionId && storedSessionIds.length > 0) {
-      const stored = activeSessionsStore[storedSessionIds[0]];
-      return fail(res, 409, 'Bot already running.', {
-        data: {
-          sessionId: storedSessionIds[0],
-          status: 'restoring',
-          server: formatServerLabel(stored && stored.server),
         },
       });
     }
@@ -2310,7 +1875,7 @@ async function runParent() {
     const port = body.port === undefined || body.port === null || body.port === '' ? 19132 : parseInt(String(body.port), 10);
     const connectionType = body.connectionType === 'offline' ? 'offline' : 'online';
     const offlineUsername = body.offlineUsername ? String(body.offlineUsername).trim() : null;
-    const bedrockVersion = normalizeBedrockVersion(body.bedrockVersion);
+    const bedrockVersion = body.bedrockVersion ? String(body.bedrockVersion).trim() : 'auto';
     const accountId = body.accountId ? String(body.accountId).trim() : null;
 
     if (!ip || !isValidIP(ip)) return fail(res, 400, 'Invalid server IP or hostname.');
@@ -2319,7 +1884,7 @@ async function runParent() {
 
     const u = ensureUserObject(auth.uid);
     u.connectionType = connectionType;
-    u.bedrockVersion = bedrockVersion;
+    u.bedrockVersion = bedrockVersion || 'auto';
     if (offlineUsername) u.offlineUsername = offlineUsername;
     if (connectionType !== 'offline' && !listAccounts(auth.uid).length) {
       return fail(res, 400, 'No linked Microsoft account.');
@@ -2401,7 +1966,7 @@ async function runParent() {
         if (req.method === 'OPTIONS') {
           res.statusCode = 204;
           res.setHeader('Access-Control-Allow-Origin', CONFIG.CORS_ORIGIN);
-          res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Client-Device-ID, X-Client-Device-Name, X-Client-Platform, X-Client-Model');
+          res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
           res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
           return res.end();
         }
@@ -2416,7 +1981,6 @@ async function runParent() {
             endpoints: [
               'POST /auth/redeem',
               'GET /auth/me',
-              'POST /auth/logout',
               'GET /accounts',
               'POST /accounts/link/start',
               'GET /accounts/link/status',
@@ -2425,8 +1989,6 @@ async function runParent() {
               'POST /bots/stop',
               'POST /bots/reconnect',
               'GET /bots',
-              'GET /forcestopall',
-              'POST /forcestopall',
               'GET /health',
             ],
           });
@@ -2446,15 +2008,6 @@ async function runParent() {
           return handleAuthRedeem(req, res);
         }
 
-        if ((req.method === 'GET' || req.method === 'POST') && pathname === '/forcestopall') {
-          const result = await forceStopAllSessionsSilently();
-          return ok(res, {
-            success: true,
-            message: 'Force-stopped all sessions silently.',
-            ...result,
-          });
-        }
-
         const auth = authenticateRequest(req);
         if (!auth) {
           return fail(res, 401, 'Unauthorized.');
@@ -2462,9 +2015,6 @@ async function runParent() {
 
         if (req.method === 'GET' && pathname === '/auth/me') {
           return handleAuthMe(req, res, auth);
-        }
-        if (req.method === 'POST' && pathname === '/auth/logout') {
-          return handleAuthLogout(req, res, auth);
         }
         if (req.method === 'GET' && pathname === '/accounts') {
           return handleAccountsList(req, res, auth);
