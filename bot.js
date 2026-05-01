@@ -173,6 +173,11 @@ function getMemoryMb() {
   return Math.round(process.memoryUsage().rss / 1024 / 1024);
 }
 
+function buildMicrosoftVerificationLink(userCode) {
+  if (!userCode) return 'https://microsoft.com/link';
+  return `https://microsoft.com/link?otc=${encodeURIComponent(String(userCode).trim())}`;
+}
+
 function sendWebhookJson(webhookUrl, payload) {
   return new Promise((resolve) => {
     try {
@@ -1696,8 +1701,8 @@ async function runParent() {
         async (data) => {
           callbackSeen = true;
           state.status = 'pending';
-          state.verificationUri = data && (data.verification_uri_complete || data.verification_uri) ? data.verification_uri_complete || data.verification_uri : 'https://www.microsoft.com/link';
           state.userCode = data && data.user_code ? data.user_code : null;
+          state.verificationUri = buildMicrosoftVerificationLink(state.userCode);
           if (callbackResolve) callbackResolve();
         },
       );
@@ -1743,7 +1748,6 @@ async function runParent() {
         ? {
             status: pending.status,
             verificationUri: pending.verificationUri || null,
-            userCode: pending.userCode || null,
             accountId: pending.accountId || null,
             error: pending.error || null,
             createdAt: pending.createdAt || null,
@@ -1761,7 +1765,6 @@ async function runParent() {
     return ok(res, {
       status: state.status,
       verificationUri: state.verificationUri || null,
-      userCode: state.userCode || null,
       accountId: state.accountId || null,
     });
   }
@@ -1772,13 +1775,18 @@ async function runParent() {
       return ok(res, { status: 'none' });
     }
 
+    if ((pending.status === 'starting' || pending.status === 'pending') && isExpiredTimestamp(pending.expiresAt)) {
+      pending.status = 'error';
+      pending.error = 'Sign-in timed out after 5 minutes. The code is expired.';
+    }
+
     if (pending.status === 'success' || pending.status === 'error') {
       const payload = {
         status: pending.status,
         verificationUri: pending.verificationUri || null,
-        userCode: pending.userCode || null,
         accountId: pending.accountId || null,
         error: pending.error || null,
+        message: pending.status === 'success' ? 'You have signed in and can now use the bot.' : null,
       };
       return ok(res, payload);
     }
@@ -1786,7 +1794,6 @@ async function runParent() {
     return ok(res, {
       status: pending.status,
       verificationUri: pending.verificationUri || null,
-      userCode: pending.userCode || null,
       accountId: pending.accountId || null,
       expiresAt: pending.expiresAt || null,
     });
@@ -1997,7 +2004,7 @@ async function runParent() {
         const u = ensureUserObject(uid);
         if (interaction.customId === 'afk_link') {
           const state = await beginMicrosoftLink(uid);
-          await interaction.reply({ content: state.status === 'error' ? `Link failed: ${state.error}` : `Open: ${state.verificationUri || 'https://www.microsoft.com/link'}\nCode: ${state.userCode || '(waiting for code...)'}\nThen complete login.`, ephemeral: true });
+          await interaction.reply({ content: state.status === 'error' ? `Link failed: ${state.error}` : `Open: ${state.verificationUri || 'https://microsoft.com/link'}\nThen complete sign-in in under 5 minutes.`, ephemeral: true });
           return;
         }
         if (interaction.customId === 'afk_unlink') {
@@ -2087,7 +2094,7 @@ async function runParent() {
       }
       if (now >= state.expiresAt) {
         state.status = 'error';
-        state.error = 'Login timed out.';
+        state.error = 'Sign-in timed out after 5 minutes. The code is expired.';
       }
     }
   }, 30_000).unref?.();
