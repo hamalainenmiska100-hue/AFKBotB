@@ -18,7 +18,20 @@ const path = require('path');
 const crypto = require('crypto');
 const https = require('https');
 const { fork } = require('child_process');
-const { Client, GatewayIntentBits, Partials, ActionRowBuilder, ButtonBuilder, ButtonStyle, SlashCommandBuilder, REST, Routes } = require('discord.js');
+const {
+  Client,
+  GatewayIntentBits,
+  Partials,
+  ActionRowBuilder,
+  ButtonBuilder,
+  ButtonStyle,
+  SlashCommandBuilder,
+  REST,
+  Routes,
+  ModalBuilder,
+  TextInputBuilder,
+  TextInputStyle,
+} = require('discord.js');
 
 const IS_WORKER = process.env.AFKBOT_WORKER === '1';
 
@@ -628,6 +641,7 @@ async function runParent() {
         access: { enabled: false },
         microsoftAccounts: [],
         servers: [],
+        panelSettings: { ip: '', port: 19132 },
         apiTokenHash: null,
       };
       userStore.data = users;
@@ -643,6 +657,9 @@ async function runParent() {
     if (typeof u.access.enabled !== 'boolean') u.access.enabled = u.access.enabled === true;
     if (!Array.isArray(u.microsoftAccounts)) u.microsoftAccounts = [];
     if (!Array.isArray(u.servers)) u.servers = [];
+    if (!u.panelSettings || typeof u.panelSettings !== 'object') u.panelSettings = { ip: '', port: 19132 };
+    if (typeof u.panelSettings.ip !== 'string') u.panelSettings.ip = '';
+    if (!isValidPort(u.panelSettings.port)) u.panelSettings.port = 19132;
     if (typeof u.apiTokenHash !== 'string') u.apiTokenHash = null;
 
     if (u.server && u.server.ip && u.server.port && u.servers.length === 0) {
@@ -1937,26 +1954,68 @@ async function runParent() {
     client.on('interactionCreate', async (interaction) => {
       try {
         if (interaction.isChatInputCommand() && interaction.commandName === 'panel') {
-          const row = new ActionRowBuilder().addComponents(
-            new ButtonBuilder().setCustomId('afk_status').setLabel('Status').setStyle(ButtonStyle.Secondary),
-            new ButtonBuilder().setCustomId('afk_stop').setLabel('Stop Bot').setStyle(ButtonStyle.Danger),
+          const row1 = new ActionRowBuilder().addComponents(
+            new ButtonBuilder().setCustomId('afk_link').setLabel('🔗 Link Microsoft').setStyle(ButtonStyle.Primary),
+            new ButtonBuilder().setCustomId('afk_unlink').setLabel('🔗 Unlink').setStyle(ButtonStyle.Secondary),
+          );
+          const row2 = new ActionRowBuilder().addComponents(
+            new ButtonBuilder().setCustomId('afk_start').setLabel('▶️ Start').setStyle(ButtonStyle.Success),
+            new ButtonBuilder().setCustomId('afk_stop').setLabel('⏹️ Stop').setStyle(ButtonStyle.Danger),
+            new ButtonBuilder().setCustomId('afk_settings').setLabel('⚙️ Settings').setStyle(ButtonStyle.Secondary),
           );
           await interaction.reply({
-            content: 'AFK Bot Control Panel (public):',
-            components: [row],
+            content: '**Bedrock AFKBot Panel**\nUse the buttons below to control your bot.',
+            components: [row1, row2],
             ephemeral: false,
           });
           return;
         }
 
+        if (interaction.isModalSubmit() && interaction.customId === 'afk_settings_modal') {
+          const uid = interaction.user.id;
+          const u = ensureUserObject(uid);
+          const ip = interaction.fields.getTextInputValue('ip').trim();
+          const portRaw = interaction.fields.getTextInputValue('port').trim();
+          const port = parseInt(portRaw || '19132', 10);
+          if (!ip || !isValidIP(ip) || !isValidPort(port)) {
+            await interaction.reply({ content: 'Invalid IP or port.', ephemeral: true });
+            return;
+          }
+          u.panelSettings = { ip, port };
+          userStore.data = users;
+          userStore.save();
+          await interaction.reply({ content: `Saved settings: ${ip}:${port}`, ephemeral: true });
+          return;
+        }
+
         if (!interaction.isButton()) return;
         const uid = interaction.user.id;
-        if (interaction.customId === 'afk_status') {
-          const s = getSessionByOwner(uid);
-          await interaction.reply({
-            content: s ? `Status: ${s.status} | ${formatServerLabel(s.server)} | version=${s.bedrockVersion || 'auto'}` : 'No active bot.',
-            ephemeral: true,
-          });
+        const u = ensureUserObject(uid);
+        if (interaction.customId === 'afk_link') {
+          const state = await beginMicrosoftLink(uid);
+          await interaction.reply({ content: state.status === 'error' ? `Link failed: ${state.error}` : `Open: ${state.verificationUri}\nThen complete login.`, ephemeral: true });
+          return;
+        }
+        if (interaction.customId === 'afk_unlink') {
+          const accounts = listAccounts(uid);
+          if (!accounts.length) {
+            await interaction.reply({ content: 'No linked account.', ephemeral: true });
+            return;
+          }
+          const removed = await unlinkMicrosoftAccount(uid, accounts[0].id);
+          await interaction.reply({ content: removed ? 'Unlinked first account.' : 'Unlink failed.', ephemeral: true });
+          return;
+        }
+        if (interaction.customId === 'afk_start') {
+          const settings = u.panelSettings || { ip: '', port: 19132 };
+          if (!settings.ip || !isValidIP(settings.ip) || !isValidPort(settings.port)) {
+            await interaction.reply({ content: 'Set valid IP/Port first in ⚙️ Settings.', ephemeral: true });
+            return;
+          }
+          const accountId = listAccounts(uid).length ? listAccounts(uid)[0].id : 'offline';
+          u.connectionType = accountId === 'offline' ? 'offline' : 'online';
+          const sid = await startSession(uid, accountId, { ip: settings.ip, port: settings.port }, null, false, 1, null);
+          await interaction.reply({ content: sid ? `Starting on ${settings.ip}:${settings.port}` : 'Failed to start bot.', ephemeral: true });
           return;
         }
         if (interaction.customId === 'afk_stop') {
@@ -1965,6 +2024,15 @@ async function runParent() {
             content: stopped ? 'Stopped.' : 'No active bot.',
             ephemeral: true,
           });
+          return;
+        }
+        if (interaction.customId === 'afk_settings') {
+          const settings = u.panelSettings || { ip: '', port: 19132 };
+          const modal = new ModalBuilder().setCustomId('afk_settings_modal').setTitle('AFK Bot Settings');
+          const ipInput = new TextInputBuilder().setCustomId('ip').setLabel('Server IP / Hostname').setStyle(TextInputStyle.Short).setRequired(true).setValue(settings.ip || '');
+          const portInput = new TextInputBuilder().setCustomId('port').setLabel('Port').setStyle(TextInputStyle.Short).setRequired(true).setValue(String(settings.port || 19132));
+          modal.addComponents(new ActionRowBuilder().addComponents(ipInput), new ActionRowBuilder().addComponents(portInput));
+          await interaction.showModal(modal);
         }
       } catch (_) {}
     });
@@ -2046,3 +2114,41 @@ async function runParent() {
     await runParent();
   }
 })();
+    async function beginMicrosoftLink(uid) {
+      const u = ensureUserObject(uid);
+      const accountId = makeId('acc_');
+      const authDir = await getUserAuthDir(uid, accountId);
+      await ensureDir(authDir);
+      const state = {
+        status: 'pending',
+        createdAt: nowMs(),
+        expiresAt: nowMs() + CONFIG.LINK_TIMEOUT_MS,
+        accountId,
+        verificationUri: 'https://www.microsoft.com/link',
+        userCode: null,
+      };
+      pendingLink.set(uid, state);
+
+      try {
+        const PrismarineAuth = require('prismarine-auth');
+        const flow = new PrismarineAuth.Authflow(undefined, authDir, { flow: 'live', authTitle: 'MinecraftNintendoSwitch' });
+        flow.getXboxToken().then(() => {
+          if (state.status !== 'pending') return;
+          state.status = 'success';
+          const user = ensureUserObject(uid);
+          if (!user.microsoftAccounts.some((a) => a && a.id === accountId)) {
+            user.microsoftAccounts.push({ id: accountId, createdAt: nowMs(), tokenAcquiredAt: nowMs(), lastUsedAt: null });
+          }
+          user.linked = true;
+          userStore.data = users;
+          userStore.save();
+        }).catch((e) => {
+          state.status = 'error';
+          state.error = e && e.message ? e.message : 'Authentication failed';
+        });
+      } catch (e) {
+        state.status = 'error';
+        state.error = `prismarine-auth is not installed: ${e && e.message ? e.message : e}`;
+      }
+      return state;
+    }
