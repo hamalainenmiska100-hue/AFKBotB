@@ -18,7 +18,20 @@ const path = require('path');
 const crypto = require('crypto');
 const https = require('https');
 const { fork } = require('child_process');
-const { Client, GatewayIntentBits, Partials } = require('discord.js');
+const {
+  Client,
+  GatewayIntentBits,
+  Partials,
+  ActionRowBuilder,
+  ButtonBuilder,
+  ButtonStyle,
+  SlashCommandBuilder,
+  REST,
+  Routes,
+  ModalBuilder,
+  TextInputBuilder,
+  TextInputStyle,
+} = require('discord.js');
 
 const IS_WORKER = process.env.AFKBOT_WORKER === '1';
 
@@ -29,7 +42,7 @@ const CONFIG = {
 
   // Discord
   DISCORD_PREFIX: process.env.DISCORD_PREFIX || '!',
-  DISCORD_TOKEN: process.env.DISCORD_TOKEN || '',
+  DISCORD_TOKEN: process.env.DISCORD || '',
 
   // Bot limits / memory
   GLOBAL_MAX_BOTS: parseInt(process.env.GLOBAL_MAX_BOTS || '20', 10),
@@ -306,89 +319,24 @@ async function runWorker() {
       }
 
       try {
-        const r = Math.random();
+        const dx = (Math.random() - 0.5) * 0.2;
+        const dz = (Math.random() - 0.5) * 0.2;
+        const yawDelta = (Math.random() - 0.5) * 8;
+        state.position.x += dx;
+        state.position.z += dz;
+        state.yaw = ((state.yaw || 0) + yawDelta + 360) % 360;
+        state.tick = (state.tick || 0) + 1;
 
-        if (r < 0.4) {
-          safeWrite('animate', { action_id: 1, runtime_entity_id: state.entityId });
-        } else if (r < 0.6) {
-          safeWrite('player_action', {
-            runtime_entity_id: state.entityId,
-            action: 11,
-            position: state.position,
-            result_position: state.position,
-            face: 0,
-          });
-
-          const stopDelay = 2000 + Math.random() * 2000;
-          const t = addTimeout(() => {
-            if (state.stopping || !state.connected || !state.client || state.runId !== runId || !state.entityId) return;
-            safeWrite('player_action', {
-              runtime_entity_id: state.entityId,
-              action: 12,
-              position: state.position,
-              result_position: state.position,
-              face: 0,
-            });
-          }, stopDelay);
-          if (typeof t.unref === 'function') t.unref();
-        } else if (r < 0.8) {
-          safeWrite('player_action', {
-            runtime_entity_id: state.entityId,
-            action: 8,
-            position: state.position,
-            result_position: state.position,
-            face: 0,
-          });
-
-          const original = { x: state.position.x, y: state.position.y, z: state.position.z };
-          const jumpPos = { x: original.x, y: original.y + 0.5, z: original.z };
-
-          state.tick = (state.tick || 0) + 1;
-          safeQueue('move_player', {
-            runtime_entity_id: state.entityId,
-            position: jumpPos,
-            pitch: state.pitch || 0,
-            yaw: state.yaw || 0,
-            head_yaw: state.yaw || 0,
-            on_ground: false,
-            mode: 0,
-            tick: state.tick,
-          });
-
-          const t = addTimeout(() => {
-            if (state.stopping || !state.connected || !state.client || state.runId !== runId || !state.entityId) return;
-            state.tick = (state.tick || 0) + 1;
-            safeQueue('move_player', {
-              runtime_entity_id: state.entityId,
-              position: original,
-              pitch: state.pitch || 0,
-              yaw: state.yaw || 0,
-              head_yaw: state.yaw || 0,
-              on_ground: true,
-              mode: 0,
-              tick: state.tick,
-            });
-            state.position = { x: original.x, y: original.y, z: original.z };
-          }, 400 + Math.random() * 200);
-          if (typeof t.unref === 'function') t.unref();
-        } else {
-          const dx = (Math.random() - 0.5) * 0.5;
-          const dz = (Math.random() - 0.5) * 0.5;
-          state.position.x += dx;
-          state.position.z += dz;
-
-          state.tick = (state.tick || 0) + 1;
-          safeQueue('move_player', {
-            runtime_entity_id: state.entityId,
-            position: { x: state.position.x, y: state.position.y, z: state.position.z },
-            pitch: state.pitch || 0,
-            yaw: state.yaw || 0,
-            head_yaw: state.yaw || 0,
-            on_ground: true,
-            mode: 0,
-            tick: state.tick,
-          });
-        }
+        safeQueue('move_player', {
+          runtime_entity_id: state.entityId,
+          position: { x: state.position.x, y: state.position.y, z: state.position.z },
+          pitch: state.pitch || 0,
+          yaw: state.yaw || 0,
+          head_yaw: state.yaw || 0,
+          on_ground: true,
+          mode: 0,
+          tick: state.tick,
+        });
       } catch (_) {}
 
       const nextDelay = CONFIG.AFK_MIN_DELAY_MS + Math.random() * (CONFIG.AFK_MAX_DELAY_MS - CONFIG.AFK_MIN_DELAY_MS);
@@ -693,6 +641,7 @@ async function runParent() {
         access: { enabled: false },
         microsoftAccounts: [],
         servers: [],
+        panelSettings: { ip: '', port: 19132 },
         apiTokenHash: null,
       };
       userStore.data = users;
@@ -708,6 +657,9 @@ async function runParent() {
     if (typeof u.access.enabled !== 'boolean') u.access.enabled = u.access.enabled === true;
     if (!Array.isArray(u.microsoftAccounts)) u.microsoftAccounts = [];
     if (!Array.isArray(u.servers)) u.servers = [];
+    if (!u.panelSettings || typeof u.panelSettings !== 'object') u.panelSettings = { ip: '', port: 19132 };
+    if (typeof u.panelSettings.ip !== 'string') u.panelSettings.ip = '';
+    if (!isValidPort(u.panelSettings.port)) u.panelSettings.port = 19132;
     if (typeof u.apiTokenHash !== 'string') u.apiTokenHash = null;
 
     if (u.server && u.server.ip && u.server.port && u.servers.length === 0) {
@@ -1967,7 +1919,7 @@ async function runParent() {
   }
 
   async function startDiscordBot() {
-    if (!CONFIG.DISCORD_TOKEN) throw new Error('Missing DISCORD_TOKEN');
+    if (!CONFIG.DISCORD_TOKEN) throw new Error('Missing DISCORD');
     const client = new Client({
       intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent],
       partials: [Partials.Channel],
@@ -1998,6 +1950,100 @@ async function runParent() {
         return message.reply(sid ? `Starting AFK bot on ${ip}:${port} (v=${version})` : 'Failed to start bot.');
       }
     });
+
+    client.on('interactionCreate', async (interaction) => {
+      try {
+        if (interaction.isChatInputCommand() && interaction.commandName === 'panel') {
+          const row1 = new ActionRowBuilder().addComponents(
+            new ButtonBuilder().setCustomId('afk_link').setLabel('🔗 Link Microsoft').setStyle(ButtonStyle.Primary),
+            new ButtonBuilder().setCustomId('afk_unlink').setLabel('🔗 Unlink').setStyle(ButtonStyle.Secondary),
+          );
+          const row2 = new ActionRowBuilder().addComponents(
+            new ButtonBuilder().setCustomId('afk_start').setLabel('▶️ Start').setStyle(ButtonStyle.Success),
+            new ButtonBuilder().setCustomId('afk_stop').setLabel('⏹️ Stop').setStyle(ButtonStyle.Danger),
+            new ButtonBuilder().setCustomId('afk_settings').setLabel('⚙️ Settings').setStyle(ButtonStyle.Secondary),
+          );
+          await interaction.reply({
+            content: '**Bedrock AFKBot Panel**\nUse the buttons below to control your bot.',
+            components: [row1, row2],
+            ephemeral: false,
+          });
+          return;
+        }
+
+        if (interaction.isModalSubmit() && interaction.customId === 'afk_settings_modal') {
+          const uid = interaction.user.id;
+          const u = ensureUserObject(uid);
+          const ip = interaction.fields.getTextInputValue('ip').trim();
+          const portRaw = interaction.fields.getTextInputValue('port').trim();
+          const port = parseInt(portRaw || '19132', 10);
+          if (!ip || !isValidIP(ip) || !isValidPort(port)) {
+            await interaction.reply({ content: 'Invalid IP or port.', ephemeral: true });
+            return;
+          }
+          u.panelSettings = { ip, port };
+          userStore.data = users;
+          userStore.save();
+          await interaction.reply({ content: `Saved settings: ${ip}:${port}`, ephemeral: true });
+          return;
+        }
+
+        if (!interaction.isButton()) return;
+        const uid = interaction.user.id;
+        const u = ensureUserObject(uid);
+        if (interaction.customId === 'afk_link') {
+          const state = await beginMicrosoftLink(uid);
+          await interaction.reply({ content: state.status === 'error' ? `Link failed: ${state.error}` : `Open: ${state.verificationUri}\nThen complete login.`, ephemeral: true });
+          return;
+        }
+        if (interaction.customId === 'afk_unlink') {
+          const accounts = listAccounts(uid);
+          if (!accounts.length) {
+            await interaction.reply({ content: 'No linked account.', ephemeral: true });
+            return;
+          }
+          const removed = await unlinkMicrosoftAccount(uid, accounts[0].id);
+          await interaction.reply({ content: removed ? 'Unlinked first account.' : 'Unlink failed.', ephemeral: true });
+          return;
+        }
+        if (interaction.customId === 'afk_start') {
+          const settings = u.panelSettings || { ip: '', port: 19132 };
+          if (!settings.ip || !isValidIP(settings.ip) || !isValidPort(settings.port)) {
+            await interaction.reply({ content: 'Set valid IP/Port first in ⚙️ Settings.', ephemeral: true });
+            return;
+          }
+          const accountId = listAccounts(uid).length ? listAccounts(uid)[0].id : 'offline';
+          u.connectionType = accountId === 'offline' ? 'offline' : 'online';
+          const sid = await startSession(uid, accountId, { ip: settings.ip, port: settings.port }, null, false, 1, null);
+          await interaction.reply({ content: sid ? `Starting on ${settings.ip}:${settings.port}` : 'Failed to start bot.', ephemeral: true });
+          return;
+        }
+        if (interaction.customId === 'afk_stop') {
+          const stopped = await stopBotForUser(uid);
+          await interaction.reply({
+            content: stopped ? 'Stopped.' : 'No active bot.',
+            ephemeral: true,
+          });
+          return;
+        }
+        if (interaction.customId === 'afk_settings') {
+          const settings = u.panelSettings || { ip: '', port: 19132 };
+          const modal = new ModalBuilder().setCustomId('afk_settings_modal').setTitle('AFK Bot Settings');
+          const ipInput = new TextInputBuilder().setCustomId('ip').setLabel('Server IP / Hostname').setStyle(TextInputStyle.Short).setRequired(true).setValue(settings.ip || '');
+          const portInput = new TextInputBuilder().setCustomId('port').setLabel('Port').setStyle(TextInputStyle.Short).setRequired(true).setValue(String(settings.port || 19132));
+          modal.addComponents(new ActionRowBuilder().addComponents(ipInput), new ActionRowBuilder().addComponents(portInput));
+          await interaction.showModal(modal);
+        }
+      } catch (_) {}
+    });
+
+    const appId = process.env.DISCORD_APP_ID || process.env.APPLICATION_ID || '';
+    if (appId) {
+      const rest = new REST({ version: '10' }).setToken(CONFIG.DISCORD_TOKEN);
+      await rest.put(Routes.applicationCommands(appId), {
+        body: [new SlashCommandBuilder().setName('panel').setDescription('Post AFK bot control panel').toJSON()],
+      });
+    }
     await client.login(CONFIG.DISCORD_TOKEN);
     console.log('Discord bot connected.');
   }
@@ -2068,3 +2114,41 @@ async function runParent() {
     await runParent();
   }
 })();
+    async function beginMicrosoftLink(uid) {
+      const u = ensureUserObject(uid);
+      const accountId = makeId('acc_');
+      const authDir = await getUserAuthDir(uid, accountId);
+      await ensureDir(authDir);
+      const state = {
+        status: 'pending',
+        createdAt: nowMs(),
+        expiresAt: nowMs() + CONFIG.LINK_TIMEOUT_MS,
+        accountId,
+        verificationUri: 'https://www.microsoft.com/link',
+        userCode: null,
+      };
+      pendingLink.set(uid, state);
+
+      try {
+        const PrismarineAuth = require('prismarine-auth');
+        const flow = new PrismarineAuth.Authflow(undefined, authDir, { flow: 'live', authTitle: 'MinecraftNintendoSwitch' });
+        flow.getXboxToken().then(() => {
+          if (state.status !== 'pending') return;
+          state.status = 'success';
+          const user = ensureUserObject(uid);
+          if (!user.microsoftAccounts.some((a) => a && a.id === accountId)) {
+            user.microsoftAccounts.push({ id: accountId, createdAt: nowMs(), tokenAcquiredAt: nowMs(), lastUsedAt: null });
+          }
+          user.linked = true;
+          userStore.data = users;
+          userStore.save();
+        }).catch((e) => {
+          state.status = 'error';
+          state.error = e && e.message ? e.message : 'Authentication failed';
+        });
+      } catch (e) {
+        state.status = 'error';
+        state.error = `prismarine-auth is not installed: ${e && e.message ? e.message : e}`;
+      }
+      return state;
+    }
