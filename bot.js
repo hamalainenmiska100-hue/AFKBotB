@@ -1350,7 +1350,6 @@ async function runParent() {
   async function startSessionDetailed(ownerUid, accountId, server, interaction, isReconnect = false, reconnectAttempt = 1, existingSessionId = null) {
     if (!ownerUid || isShuttingDown) return { sessionId: null, error: 'Service is shutting down. Try again in a moment.' };
     if (!storesInitialized) return { sessionId: null, error: 'Storage is not initialized yet. Please retry shortly.' };
-    if (!hasAccess(ownerUid)) return { sessionId: null, error: 'You do not have access to start a bot session.' };
 
     const currentSessionId = getOwnerSessionId(ownerUid);
     if (!isReconnect && currentSessionId) {
