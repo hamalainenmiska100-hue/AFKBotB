@@ -46,6 +46,8 @@ The bot creates lightweight Minecraft Bedrock clients through Discord commands. 
 
 ### Admin Panel
 
+No permission gate is required to start a personal bot session.
+
 Admin users (configured via `ADMIN_ID`) access:
 - Real-time RAM/Heap monitoring
 - Active session registry with connection status
