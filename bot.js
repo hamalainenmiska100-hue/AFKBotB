@@ -16,9 +16,9 @@
 const fs = require('fs').promises;
 const path = require('path');
 const crypto = require('crypto');
-const http = require('http');
 const https = require('https');
 const { fork } = require('child_process');
+const { Client, GatewayIntentBits, Partials } = require('discord.js');
 
 const IS_WORKER = process.env.AFKBOT_WORKER === '1';
 
@@ -27,10 +27,9 @@ const IS_WORKER = process.env.AFKBOT_WORKER === '1';
 const CONFIG = {
   SAVE_DEBOUNCE_MS: 100,
 
-  // API
-  PORT: parseInt(process.env.PORT || '8080', 10),
-  BODY_LIMIT_BYTES: 16 * 1024,
-  CORS_ORIGIN: process.env.CORS_ORIGIN || '*',
+  // Discord
+  DISCORD_PREFIX: process.env.DISCORD_PREFIX || '!',
+  DISCORD_TOKEN: process.env.DISCORD_TOKEN || '',
 
   // Bot limits / memory
   GLOBAL_MAX_BOTS: parseInt(process.env.GLOBAL_MAX_BOTS || '20', 10),
@@ -1147,9 +1146,18 @@ async function runParent() {
       opts.username = u.offlineUsername || `AFK_${ownerUid.slice(-4)}`;
       opts.offline = true;
     }
+    if (u.bedrockVersion && u.bedrockVersion !== 'auto') {
+      opts.version = u.bedrockVersion;
+    }
 
     return opts;
   }
+  const SUPPORTED_BEDROCK_VERSIONS = String(
+    process.env.SUPPORTED_BEDROCK_VERSIONS || 'auto,1.21.90,1.21.80,1.21.70,1.21.60,1.21.50',
+  )
+    .split(',')
+    .map((v) => v.trim())
+    .filter(Boolean);
 
   function spawnWorkerForSession(sessionId, runId, opts) {
     const child = fork(__filename, [], {
@@ -1958,117 +1966,44 @@ async function runParent() {
     });
   }
 
-  function createApiServer() {
-    const server = http.createServer(async (req, res) => {
-      try {
-        if (!req || !req.url) return fail(res, 400, 'Bad request.');
-
-        if (req.method === 'OPTIONS') {
-          res.statusCode = 204;
-          res.setHeader('Access-Control-Allow-Origin', CONFIG.CORS_ORIGIN);
-          res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
-          res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-          return res.end();
-        }
-
-        const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
-        const pathname = url.pathname;
-
-        if (req.method === 'GET' && pathname === '/') {
-          return ok(res, {
-            name: 'AFKBot API',
-            version: 1,
-            endpoints: [
-              'POST /auth/redeem',
-              'GET /auth/me',
-              'GET /accounts',
-              'POST /accounts/link/start',
-              'GET /accounts/link/status',
-              'POST /accounts/unlink',
-              'POST /bots/start',
-              'POST /bots/stop',
-              'POST /bots/reconnect',
-              'GET /bots',
-              'GET /health',
-            ],
-          });
-        }
-
-        if (req.method === 'GET' && pathname === '/health') {
-          return ok(res, {
-            status: 'ok',
-            uptimeSec: Math.floor(process.uptime()),
-            bots: sessions.size,
-            memoryMb: getMemoryMb(),
-            maxBots: CONFIG.GLOBAL_MAX_BOTS,
-          });
-        }
-
-        if (req.method === 'POST' && pathname === '/auth/redeem') {
-          return handleAuthRedeem(req, res);
-        }
-
-        const auth = authenticateRequest(req);
-        if (!auth) {
-          return fail(res, 401, 'Unauthorized.');
-        }
-
-        if (req.method === 'GET' && pathname === '/auth/me') {
-          return handleAuthMe(req, res, auth);
-        }
-        if (req.method === 'GET' && pathname === '/accounts') {
-          return handleAccountsList(req, res, auth);
-        }
-        if (req.method === 'POST' && pathname === '/accounts/link/start') {
-          return handleAccountLinkStart(req, res, auth);
-        }
-        if (req.method === 'GET' && pathname === '/accounts/link/status') {
-          return handleAccountLinkStatus(req, res, auth);
-        }
-        if (req.method === 'POST' && pathname === '/accounts/unlink') {
-          return handleAccountUnlink(req, res, auth);
-        }
-        if (req.method === 'POST' && pathname === '/bots/start') {
-          return handleBotStart(req, res, auth);
-        }
-        if (req.method === 'POST' && pathname === '/bots/stop') {
-          return handleBotStop(req, res, auth);
-        }
-        if (req.method === 'POST' && pathname === '/bots/reconnect') {
-          return handleBotReconnect(req, res, auth);
-        }
-        if (req.method === 'GET' && pathname === '/bots') {
-          return handleBotStatus(req, res, auth);
-        }
-
-        return fail(res, 404, 'Not found.');
-      } catch (e) {
-        console.error('HTTP handler error:', e && (e.stack || e.message) ? e.stack || e.message : e);
-        return fail(res, 500, 'Internal server error.');
+  async function startDiscordBot() {
+    if (!CONFIG.DISCORD_TOKEN) throw new Error('Missing DISCORD_TOKEN');
+    const client = new Client({
+      intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent],
+      partials: [Partials.Channel],
+    });
+    client.on('messageCreate', async (message) => {
+      if (!message || !message.content || message.author.bot) return;
+      if (!message.content.startsWith(CONFIG.DISCORD_PREFIX)) return;
+      const [command, ...args] = message.content.slice(CONFIG.DISCORD_PREFIX.length).trim().split(/\s+/);
+      const uid = message.author.id;
+      const u = ensureUserObject(uid);
+      u.access = { enabled: true, grantedAt: nowMs(), source: 'discord_user' };
+      if (command === 'versions') return message.reply(`Supported: ${SUPPORTED_BEDROCK_VERSIONS.join(', ')}`);
+      if (command === 'status') {
+        const sid = getOwnerSessionId(uid);
+        const s = sid ? sessions.get(sid) : null;
+        return message.reply(s ? `Status: ${s.status} | ${formatServerLabel(s.server)} | version=${s.bedrockVersion || 'auto'}` : 'No active bot.');
+      }
+      if (command === 'stop') return message.reply((await stopBotForUser(uid)) ? 'Stopped.' : 'No active bot.');
+      if (command === 'start') {
+        const ip = String(args[0] || '');
+        const port = args[1] ? parseInt(args[1], 10) : 19132;
+        const version = args[2] || 'auto';
+        if (!ip || !isValidIP(ip) || !isValidPort(port)) return message.reply('Usage: !start <ip> [port] [version]');
+        if (!SUPPORTED_BEDROCK_VERSIONS.includes(version)) return message.reply(`Version must be one of: ${SUPPORTED_BEDROCK_VERSIONS.join(', ')}`);
+        u.connectionType = 'offline';
+        u.bedrockVersion = version;
+        const sid = await startSession(uid, 'offline', { ip, port });
+        return message.reply(sid ? `Starting AFK bot on ${ip}:${port} (v=${version})` : 'Failed to start bot.');
       }
     });
-
-    server.keepAliveTimeout = 5000;
-    server.headersTimeout = 10_000;
-    server.requestTimeout = 15_000;
-    server.maxRequestsPerSocket = 100;
-    return server;
-  }
-
-  async function startApiServer() {
-    apiServer = createApiServer();
-    await new Promise((resolve, reject) => {
-      apiServer.once('error', reject);
-      apiServer.listen(CONFIG.PORT, '0.0.0.0', () => {
-        apiServer.off('error', reject);
-        resolve();
-      });
-    });
-    console.log(`AFKBot API listening on :${CONFIG.PORT}`);
+    await client.login(CONFIG.DISCORD_TOKEN);
+    console.log('Discord bot connected.');
   }
 
   await initializeStores();
-  await startApiServer();
+  await startDiscordBot();
 
   setInterval(() => {
     const mem = getMemoryMb();
