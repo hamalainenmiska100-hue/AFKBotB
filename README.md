@@ -1,6 +1,6 @@
 # Bedrock AFK Bot
 
-A Discord bot that manages persistent AFK (Away From Keyboard) sessions for Minecraft Bedrock Edition servers. The bot maintains 24/7 connections to Minecraft servers with automatic reconnection, anti-AFK mechanics, and Microsoft account integration.
+A Discord bot that manages persistent AFK (Away From Keyboard) sessions for Minecraft Bedrock Edition servers.
 
 ## How It Works
 
@@ -82,5 +82,25 @@ Admin users (configured via `ADMIN_ID`) access:
 1. **Clone and install**
 ```bash
 git clone <repo>
-cd bedrock-afk-bot
-npm install discord.js bedrock-protocol prismarine-auth
+cd AFKBotB
+npm install
+```
+
+2. **Set environment variables**
+```bash
+export DISCORD_TOKEN=your_bot_token
+export DISCORD_PREFIX=!
+# Optional, comma-separated:
+export SUPPORTED_BEDROCK_VERSIONS=auto,1.21.90,1.21.80,1.21.70,1.21.60,1.21.50
+```
+
+3. **Run**
+```bash
+npm start
+```
+
+### Discord commands
+- `!start <ip> [port] [version]` start an AFK session (offline mode)
+- `!stop` stop your session
+- `!status` view your session status
+- `!versions` list allowed Bedrock versions
