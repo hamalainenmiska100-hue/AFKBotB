@@ -90,7 +90,7 @@ const CONFIG = {
   LINK_TIMEOUT_MS: 5 * 60_000,
 };
 
-const DATA = process.env.FLY_VOLUME_PATH || '/data';
+const DATA = process.env.FLY_VOLUME_PATH || process.env.DATA_DIR || (require('fs').existsSync('/data') ? '/data' : '/mnt/data');
 const AUTH_ROOT = path.join(DATA, 'auth');
 const STORE = path.join(DATA, 'users.json');
 const REJOIN_STORE = path.join(DATA, 'rejoin.json');
@@ -1643,49 +1643,26 @@ async function runParent() {
     });
   }
 
-  async function handleAccountsList(req, res, auth) {
-    const pending = pendingLink.get(auth.uid) || null;
-    return ok(res, {
-      linked: listAccounts(auth.uid).map(buildPublicAccount),
-      pendingLink: pending
-        ? {
-            status: pending.status,
-            verificationUri: pending.verificationUri || null,
-            userCode: pending.userCode || null,
-            accountId: pending.accountId || null,
-            error: pending.error || null,
-            createdAt: pending.createdAt || null,
-            expiresAt: pending.expiresAt || null,
-          }
-        : null,
-    });
-  }
 
-  async function handleAccountLinkStart(req, res, auth) {
-    const existing = pendingLink.get(auth.uid);
+  async function beginMicrosoftLink(uid) {
+    const existing = pendingLink.get(uid);
     if (existing && (existing.status === 'starting' || existing.status === 'pending')) {
-      return ok(res, {
-        status: existing.status,
-        verificationUri: existing.verificationUri || null,
-        userCode: existing.userCode || null,
-        accountId: existing.accountId || null,
-      });
+      return existing;
     }
 
     let prismarineAuth;
     try {
       prismarineAuth = require('prismarine-auth');
     } catch (e) {
-      return fail(res, 500, `prismarine-auth is not installed: ${e && e.message ? e.message : e}`);
+      return { status: 'error', error: `prismarine-auth is not installed: ${e && e.message ? e.message : e}` };
     }
 
     const Authflow = prismarineAuth.Authflow;
     const Titles = prismarineAuth.Titles;
-
     const accountId = makeId('acc_');
-    const authDir = await getUserAuthDir(auth.uid, accountId);
+    const authDir = await getUserAuthDir(uid, accountId);
     if (!authDir) {
-      return fail(res, 500, 'Could not create auth directory.');
+      return { status: 'error', error: 'Could not create auth directory.' };
     }
 
     const state = {
@@ -1697,7 +1674,7 @@ async function runParent() {
       expiresAt: nowMs() + CONFIG.LINK_TIMEOUT_MS,
       error: null,
     };
-    pendingLink.set(auth.uid, state);
+    pendingLink.set(uid, state);
 
     let callbackSeen = false;
     let callbackResolve;
@@ -1707,7 +1684,7 @@ async function runParent() {
 
     try {
       const flow = new Authflow(
-        auth.uid,
+        uid,
         authDir,
         {
           flow: 'live',
@@ -1726,7 +1703,7 @@ async function runParent() {
       flow
         .getMsaToken()
         .then(async () => {
-          const u = ensureUserObject(auth.uid);
+          const u = ensureUserObject(uid);
           if (!Array.isArray(u.microsoftAccounts)) u.microsoftAccounts = [];
           if (!u.microsoftAccounts.some((a) => a && a.id === accountId)) {
             u.microsoftAccounts.push({
@@ -1749,17 +1726,40 @@ async function runParent() {
         });
 
       await Promise.race([callbackPromise, sleep(3000)]);
-
-      return ok(res, {
-        status: state.status,
-        verificationUri: state.verificationUri,
-        userCode: state.userCode,
-        accountId: state.accountId,
-      });
+      return state;
     } catch (e) {
-      pendingLink.delete(auth.uid);
-      return fail(res, 500, callbackSeen ? 'Failed to continue login.' : `Failed to start login: ${e && e.message ? e.message : e}`);
+      pendingLink.delete(uid);
+      return { status: 'error', error: callbackSeen ? 'Failed to continue login.' : `Failed to start login: ${e && e.message ? e.message : e}` };
     }
+  }
+
+  async function handleAccountsList(req, res, auth) {
+    const pending = pendingLink.get(auth.uid) || null;
+    return ok(res, {
+      linked: listAccounts(auth.uid).map(buildPublicAccount),
+      pendingLink: pending
+        ? {
+            status: pending.status,
+            verificationUri: pending.verificationUri || null,
+            userCode: pending.userCode || null,
+            accountId: pending.accountId || null,
+            error: pending.error || null,
+            createdAt: pending.createdAt || null,
+            expiresAt: pending.expiresAt || null,
+          }
+        : null,
+    });
+  }
+
+  async function handleAccountLinkStart(req, res, auth) {
+    const state = await beginMicrosoftLink(auth.uid);
+    if (state.status === 'error') return fail(res, 500, state.error || 'Failed to start link.');
+    return ok(res, {
+      status: state.status,
+      verificationUri: state.verificationUri || null,
+      userCode: state.userCode || null,
+      accountId: state.accountId || null,
+    });
   }
 
   async function handleAccountLinkStatus(req, res, auth) {
@@ -1993,7 +1993,7 @@ async function runParent() {
         const u = ensureUserObject(uid);
         if (interaction.customId === 'afk_link') {
           const state = await beginMicrosoftLink(uid);
-          await interaction.reply({ content: state.status === 'error' ? `Link failed: ${state.error}` : `Open: ${state.verificationUri}\nThen complete login.`, ephemeral: true });
+          await interaction.reply({ content: state.status === 'error' ? `Link failed: ${state.error}` : `Open: ${state.verificationUri || 'https://www.microsoft.com/link'}\nCode: ${state.userCode || '(waiting for code...)'}\nThen complete login.`, ephemeral: true });
           return;
         }
         if (interaction.customId === 'afk_unlink') {
@@ -2114,41 +2114,3 @@ async function runParent() {
     await runParent();
   }
 })();
-    async function beginMicrosoftLink(uid) {
-      const u = ensureUserObject(uid);
-      const accountId = makeId('acc_');
-      const authDir = await getUserAuthDir(uid, accountId);
-      await ensureDir(authDir);
-      const state = {
-        status: 'pending',
-        createdAt: nowMs(),
-        expiresAt: nowMs() + CONFIG.LINK_TIMEOUT_MS,
-        accountId,
-        verificationUri: 'https://www.microsoft.com/link',
-        userCode: null,
-      };
-      pendingLink.set(uid, state);
-
-      try {
-        const PrismarineAuth = require('prismarine-auth');
-        const flow = new PrismarineAuth.Authflow(undefined, authDir, { flow: 'live', authTitle: 'MinecraftNintendoSwitch' });
-        flow.getXboxToken().then(() => {
-          if (state.status !== 'pending') return;
-          state.status = 'success';
-          const user = ensureUserObject(uid);
-          if (!user.microsoftAccounts.some((a) => a && a.id === accountId)) {
-            user.microsoftAccounts.push({ id: accountId, createdAt: nowMs(), tokenAcquiredAt: nowMs(), lastUsedAt: null });
-          }
-          user.linked = true;
-          userStore.data = users;
-          userStore.save();
-        }).catch((e) => {
-          state.status = 'error';
-          state.error = e && e.message ? e.message : 'Authentication failed';
-        });
-      } catch (e) {
-        state.status = 'error';
-        state.error = `prismarine-auth is not installed: ${e && e.message ? e.message : e}`;
-      }
-      return state;
-    }
