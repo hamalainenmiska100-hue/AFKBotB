@@ -1644,9 +1644,9 @@ async function runParent() {
   }
 
 
-  async function beginMicrosoftLink(uid) {
+  async function beginMicrosoftLink(uid, forceNew = false) {
     const existing = pendingLink.get(uid);
-    if (existing && (existing.status === 'starting' || existing.status === 'pending')) {
+    if (!forceNew && existing && (existing.status === 'starting' || existing.status === 'pending')) {
       return existing;
     }
 
@@ -1660,6 +1660,7 @@ async function runParent() {
     const Authflow = prismarineAuth.Authflow;
     const Titles = prismarineAuth.Titles;
     const accountId = makeId('acc_');
+    const flowUserKey = `${uid}:${accountId}`;
     const authDir = await getUserAuthDir(uid, accountId);
     if (!authDir) {
       return { status: 'error', error: 'Could not create auth directory.' };
@@ -1684,12 +1685,13 @@ async function runParent() {
 
     try {
       const flow = new Authflow(
-        uid,
+        flowUserKey,
         authDir,
         {
           flow: 'live',
           authTitle: Titles && Titles.MinecraftNintendoSwitch ? Titles.MinecraftNintendoSwitch : 'Bedrock AFK Bot',
           deviceType: 'Nintendo',
+          doSisuAuth: true,
         },
         async (data) => {
           callbackSeen = true;
@@ -1752,7 +1754,9 @@ async function runParent() {
   }
 
   async function handleAccountLinkStart(req, res, auth) {
-    const state = await beginMicrosoftLink(auth.uid);
+    const body = await parseJsonBody(req).catch(() => ({}));
+    const forceNew = !!(body && body.forceNew);
+    const state = await beginMicrosoftLink(auth.uid, forceNew);
     if (state.status === 'error') return fail(res, 500, state.error || 'Failed to start link.');
     return ok(res, {
       status: state.status,
