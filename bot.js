@@ -1347,19 +1347,19 @@ async function runParent() {
     if (typeof s.reconnectTimer.unref === 'function') s.reconnectTimer.unref();
   }
 
-  async function startSession(ownerUid, accountId, server, interaction, isReconnect = false, reconnectAttempt = 1, existingSessionId = null) {
-    if (!ownerUid || isShuttingDown) return null;
-    if (!storesInitialized) return null;
-    if (!hasAccess(ownerUid)) return null;
+  async function startSessionDetailed(ownerUid, accountId, server, interaction, isReconnect = false, reconnectAttempt = 1, existingSessionId = null) {
+    if (!ownerUid || isShuttingDown) return { sessionId: null, error: 'Service is shutting down. Try again in a moment.' };
+    if (!storesInitialized) return { sessionId: null, error: 'Storage is not initialized yet. Please retry shortly.' };
+    if (!hasAccess(ownerUid)) return { sessionId: null, error: 'You do not have access to start a bot session.' };
 
     const currentSessionId = getOwnerSessionId(ownerUid);
     if (!isReconnect && currentSessionId) {
-      return null;
+      return { sessionId: null, error: 'Bot already running.' };
     }
 
     const capacity = canAcceptNewBot();
     if (!isReconnect && !capacity.ok) {
-      return null;
+      return { sessionId: null, error: capacity.error || 'Bot capacity reached. Try again later.' };
     }
 
     if (existingSessionId && cleanupLocks.has(existingSessionId)) {
@@ -1374,26 +1374,26 @@ async function runParent() {
     const accounts = listAccounts(ownerUid);
 
     if (u.connectionType !== 'offline') {
-      if (!accounts.length) return null;
+      if (!accounts.length) return { sessionId: null, error: 'No linked Microsoft account.' };
       if (!accountId) accountId = accounts[0].id;
     } else if (!accountId) {
       accountId = 'offline';
     }
 
-    if (!server || !server.ip) return null;
+    if (!server || !server.ip) return { sessionId: null, error: 'Missing server IP/hostname.' };
     const ip = String(server.ip || '').trim();
     const port = parseInt(String(server.port || 19132), 10);
 
-    if (!isValidIP(ip) || !isValidPort(port) || isPrivateOrLocalHost(ip)) {
-      return null;
-    }
+    if (!isValidIP(ip)) return { sessionId: null, error: 'Invalid server IP or hostname.' };
+    if (!isValidPort(port)) return { sessionId: null, error: 'Invalid server port.' };
+    if (isPrivateOrLocalHost(ip)) return { sessionId: null, error: 'Private or local server targets are not allowed.' };
 
     if (isReconnect && existingSessionId && sessions.has(existingSessionId)) {
       await cleanupSession(existingSessionId);
     }
 
     const authDir = await getUserAuthDir(ownerUid, accountId || 'legacy');
-    if (!authDir) return null;
+    if (!authDir) return { sessionId: null, error: 'Failed to initialize authentication directory.' };
 
     const runId = `${Date.now()}_${Math.random().toString(16).slice(2)}`;
     const sessionId = existingSessionId || makeId(`s_${ownerUid}_`);
@@ -1440,7 +1440,12 @@ async function runParent() {
     const opts = buildWorkerOpts(ownerUid, authDir, server);
     session.child = spawnWorkerForSession(sessionId, runId, opts);
 
-    return sessionId;
+    return { sessionId, error: null };
+  }
+
+  async function startSession(ownerUid, accountId, server, interaction, isReconnect = false, reconnectAttempt = 1, existingSessionId = null) {
+    const result = await startSessionDetailed(ownerUid, accountId, server, interaction, isReconnect, reconnectAttempt, existingSessionId);
+    return result.sessionId;
   }
 
   async function restoreSessions() {
@@ -1861,10 +1866,12 @@ async function runParent() {
       return fail(res, 400, 'No linked Microsoft account.');
     }
 
-    const sessionId = await startSession(auth.uid, accountId, { ip, port }, null, false, 1, null);
-    if (!sessionId) {
-      return fail(res, 500, 'Failed to start bot.');
+    const startResult = await startSessionDetailed(auth.uid, accountId, { ip, port }, null, false, 1, null);
+    if (!startResult.sessionId) {
+      return fail(res, 400, startResult.error || 'Failed to start bot.');
     }
+
+    const sessionId = startResult.sessionId;
 
     const s = sessions.get(sessionId);
     return ok(res, {
@@ -1957,8 +1964,8 @@ async function runParent() {
         if (!SUPPORTED_BEDROCK_VERSIONS.includes(version)) return message.reply(`Version must be one of: ${SUPPORTED_BEDROCK_VERSIONS.join(', ')}`);
         u.connectionType = 'offline';
         u.bedrockVersion = version;
-        const sid = await startSession(uid, 'offline', { ip, port });
-        return message.reply(sid ? `Starting AFK bot on ${ip}:${port} (v=${version})` : 'Failed to start bot.');
+        const startResult = await startSessionDetailed(uid, 'offline', { ip, port });
+        return message.reply(startResult.sessionId ? `Starting AFK bot on ${ip}:${port} (v=${version})` : `Failed to start bot: ${startResult.error || 'Unknown error'}`);
       }
     });
 
@@ -2025,8 +2032,8 @@ async function runParent() {
           }
           const accountId = listAccounts(uid).length ? listAccounts(uid)[0].id : 'offline';
           u.connectionType = accountId === 'offline' ? 'offline' : 'online';
-          const sid = await startSession(uid, accountId, { ip: settings.ip, port: settings.port }, null, false, 1, null);
-          await interaction.reply({ content: sid ? `Starting on ${settings.ip}:${settings.port}` : 'Failed to start bot.', ephemeral: true });
+          const startResult = await startSessionDetailed(uid, accountId, { ip: settings.ip, port: settings.port }, null, false, 1, null);
+          await interaction.reply({ content: startResult.sessionId ? `Starting on ${settings.ip}:${settings.port}` : `Failed to start bot: ${startResult.error || 'Unknown error'}`, ephemeral: true });
           return;
         }
         if (interaction.customId === 'afk_stop') {
