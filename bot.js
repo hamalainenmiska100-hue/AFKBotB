@@ -18,7 +18,7 @@ const path = require('path');
 const crypto = require('crypto');
 const https = require('https');
 const { fork } = require('child_process');
-const { Client, GatewayIntentBits, Partials } = require('discord.js');
+const { Client, GatewayIntentBits, Partials, ActionRowBuilder, ButtonBuilder, ButtonStyle, SlashCommandBuilder, REST, Routes } = require('discord.js');
 
 const IS_WORKER = process.env.AFKBOT_WORKER === '1';
 
@@ -29,7 +29,7 @@ const CONFIG = {
 
   // Discord
   DISCORD_PREFIX: process.env.DISCORD_PREFIX || '!',
-  DISCORD_TOKEN: process.env.DISCORD_TOKEN || '',
+  DISCORD_TOKEN: process.env.DISCORD || '',
 
   // Bot limits / memory
   GLOBAL_MAX_BOTS: parseInt(process.env.GLOBAL_MAX_BOTS || '20', 10),
@@ -306,89 +306,24 @@ async function runWorker() {
       }
 
       try {
-        const r = Math.random();
+        const dx = (Math.random() - 0.5) * 0.2;
+        const dz = (Math.random() - 0.5) * 0.2;
+        const yawDelta = (Math.random() - 0.5) * 8;
+        state.position.x += dx;
+        state.position.z += dz;
+        state.yaw = ((state.yaw || 0) + yawDelta + 360) % 360;
+        state.tick = (state.tick || 0) + 1;
 
-        if (r < 0.4) {
-          safeWrite('animate', { action_id: 1, runtime_entity_id: state.entityId });
-        } else if (r < 0.6) {
-          safeWrite('player_action', {
-            runtime_entity_id: state.entityId,
-            action: 11,
-            position: state.position,
-            result_position: state.position,
-            face: 0,
-          });
-
-          const stopDelay = 2000 + Math.random() * 2000;
-          const t = addTimeout(() => {
-            if (state.stopping || !state.connected || !state.client || state.runId !== runId || !state.entityId) return;
-            safeWrite('player_action', {
-              runtime_entity_id: state.entityId,
-              action: 12,
-              position: state.position,
-              result_position: state.position,
-              face: 0,
-            });
-          }, stopDelay);
-          if (typeof t.unref === 'function') t.unref();
-        } else if (r < 0.8) {
-          safeWrite('player_action', {
-            runtime_entity_id: state.entityId,
-            action: 8,
-            position: state.position,
-            result_position: state.position,
-            face: 0,
-          });
-
-          const original = { x: state.position.x, y: state.position.y, z: state.position.z };
-          const jumpPos = { x: original.x, y: original.y + 0.5, z: original.z };
-
-          state.tick = (state.tick || 0) + 1;
-          safeQueue('move_player', {
-            runtime_entity_id: state.entityId,
-            position: jumpPos,
-            pitch: state.pitch || 0,
-            yaw: state.yaw || 0,
-            head_yaw: state.yaw || 0,
-            on_ground: false,
-            mode: 0,
-            tick: state.tick,
-          });
-
-          const t = addTimeout(() => {
-            if (state.stopping || !state.connected || !state.client || state.runId !== runId || !state.entityId) return;
-            state.tick = (state.tick || 0) + 1;
-            safeQueue('move_player', {
-              runtime_entity_id: state.entityId,
-              position: original,
-              pitch: state.pitch || 0,
-              yaw: state.yaw || 0,
-              head_yaw: state.yaw || 0,
-              on_ground: true,
-              mode: 0,
-              tick: state.tick,
-            });
-            state.position = { x: original.x, y: original.y, z: original.z };
-          }, 400 + Math.random() * 200);
-          if (typeof t.unref === 'function') t.unref();
-        } else {
-          const dx = (Math.random() - 0.5) * 0.5;
-          const dz = (Math.random() - 0.5) * 0.5;
-          state.position.x += dx;
-          state.position.z += dz;
-
-          state.tick = (state.tick || 0) + 1;
-          safeQueue('move_player', {
-            runtime_entity_id: state.entityId,
-            position: { x: state.position.x, y: state.position.y, z: state.position.z },
-            pitch: state.pitch || 0,
-            yaw: state.yaw || 0,
-            head_yaw: state.yaw || 0,
-            on_ground: true,
-            mode: 0,
-            tick: state.tick,
-          });
-        }
+        safeQueue('move_player', {
+          runtime_entity_id: state.entityId,
+          position: { x: state.position.x, y: state.position.y, z: state.position.z },
+          pitch: state.pitch || 0,
+          yaw: state.yaw || 0,
+          head_yaw: state.yaw || 0,
+          on_ground: true,
+          mode: 0,
+          tick: state.tick,
+        });
       } catch (_) {}
 
       const nextDelay = CONFIG.AFK_MIN_DELAY_MS + Math.random() * (CONFIG.AFK_MAX_DELAY_MS - CONFIG.AFK_MIN_DELAY_MS);
@@ -1967,7 +1902,7 @@ async function runParent() {
   }
 
   async function startDiscordBot() {
-    if (!CONFIG.DISCORD_TOKEN) throw new Error('Missing DISCORD_TOKEN');
+    if (!CONFIG.DISCORD_TOKEN) throw new Error('Missing DISCORD');
     const client = new Client({
       intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent],
       partials: [Partials.Channel],
@@ -1998,6 +1933,49 @@ async function runParent() {
         return message.reply(sid ? `Starting AFK bot on ${ip}:${port} (v=${version})` : 'Failed to start bot.');
       }
     });
+
+    client.on('interactionCreate', async (interaction) => {
+      try {
+        if (interaction.isChatInputCommand() && interaction.commandName === 'panel') {
+          const row = new ActionRowBuilder().addComponents(
+            new ButtonBuilder().setCustomId('afk_status').setLabel('Status').setStyle(ButtonStyle.Secondary),
+            new ButtonBuilder().setCustomId('afk_stop').setLabel('Stop Bot').setStyle(ButtonStyle.Danger),
+          );
+          await interaction.reply({
+            content: 'AFK Bot Control Panel (public):',
+            components: [row],
+            ephemeral: false,
+          });
+          return;
+        }
+
+        if (!interaction.isButton()) return;
+        const uid = interaction.user.id;
+        if (interaction.customId === 'afk_status') {
+          const s = getSessionByOwner(uid);
+          await interaction.reply({
+            content: s ? `Status: ${s.status} | ${formatServerLabel(s.server)} | version=${s.bedrockVersion || 'auto'}` : 'No active bot.',
+            ephemeral: true,
+          });
+          return;
+        }
+        if (interaction.customId === 'afk_stop') {
+          const stopped = await stopBotForUser(uid);
+          await interaction.reply({
+            content: stopped ? 'Stopped.' : 'No active bot.',
+            ephemeral: true,
+          });
+        }
+      } catch (_) {}
+    });
+
+    const appId = process.env.DISCORD_APP_ID || process.env.APPLICATION_ID || '';
+    if (appId) {
+      const rest = new REST({ version: '10' }).setToken(CONFIG.DISCORD_TOKEN);
+      await rest.put(Routes.applicationCommands(appId), {
+        body: [new SlashCommandBuilder().setName('panel').setDescription('Post AFK bot control panel').toJSON()],
+      });
+    }
     await client.login(CONFIG.DISCORD_TOKEN);
     console.log('Discord bot connected.');
   }
